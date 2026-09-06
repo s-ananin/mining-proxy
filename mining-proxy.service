@@ -1,0 +1,45 @@
+# systemd unit для mining-proxy.
+# Копируется в /etc/systemd/system/mining-proxy.service скриптом scripts/setup.sh.
+#
+# Управление:
+#   systemctl start mining-proxy    — запустить
+#   systemctl enable mining-proxy   — автозапуск при загрузке
+#   systemctl status mining-proxy   — статус
+#   journalctl -u mining-proxy -f   — логи
+
+[Unit]
+Description=Mining Proxy — Stratum Share Redirector
+# Запускаемся только после поднятия сети.
+After=network.target
+Wants=network-online.target
+
+[Service]
+# Процесс запускается напрямую (не fork-демон).
+Type=simple
+# Команда запуска: бинарник + путь к конфигу.
+ExecStart=/usr/local/bin/mining-proxy --config /etc/mining-proxy/config.yaml
+# Если процесс упадёт — systemd перезапустит его всегда.
+Restart=always
+# Пауза между перезапусками (чтобы не было цикла рестартов).
+RestartSec=5
+# Лимит открытых файловых дескрипторов: 65536.
+# Нужно для обслуживания тысяч одновременных TCP-соединений от ASIC.
+LimitNOFILE=65536
+
+# --- Безопасность (systemd hardening) ---
+# Запрет поднятия привилегий через setuid-бинарники (не мешает iptables,
+# т.к. прокси не выполняет команды с повышенными правами).
+NoNewPrivileges=no
+# Защита системных директорий от записи (/usr, /boot, /etc).
+# Конфиг читается, а не пишется — полный доступ к записи не нужен.
+ProtectSystem=full
+
+# --- Логи ---
+# Логи пишем в journald (перехваты: journalctl -u mining-proxy -f).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mining-proxy
+
+[Install]
+# Сервис запускается в многопользовательском режиме (обычная загрузка).
+WantedBy=multi-user.target
