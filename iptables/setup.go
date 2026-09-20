@@ -70,15 +70,16 @@ func Setup(subnets []string, listenAddr, upstreamPort string, captureAllTCP bool
 	// --- 4. DNAT для каждой разрешённой подсети ---
 	// Ключевая деталь: в старом режиме фильтр --dport upstreamPort — только
 	// трафик, СЛУШАЮЩИЙ пул, попадает в прокси. DNS (53), NTP (123),
-	// DHCP (67/68) идёт мимо. При captureAllTCP=true ловим весь TCP подсети
-	// (воронка), а прокси сам решает: стратум — разбирать, иначе — пропускать.
+	// DHCP (67/68) идёт мимо. При captureAllTCP=true (или пустом upstreamPort
+	// в pass-through режиме) ловим весь TCP подсети (воронка), а прокси сам
+	// решает: стратум — разбирать, иначе — пропускать.
 	for _, subnet := range subnets {
 		args := []string{
 			"-t", "nat", "-A", chainName,
 			"-s", subnet, // источник — разрешённая подсеть
 			"-p", "tcp", // только TCP
 		}
-		if !captureAllTCP {
+		if !captureAllTCP && upstreamPort != "" {
 			args = append(args, "--dport", upstreamPort) // только порт пула
 		}
 		args = append(args,
@@ -88,8 +89,8 @@ func Setup(subnets []string, listenAddr, upstreamPort string, captureAllTCP bool
 		if err := runCmd("iptables", args...); err != nil {
 			return fmt.Errorf("add DNAT rule for %s: %w", subnet, err)
 		}
-		if captureAllTCP {
-			log.Printf("[IPTABLES] DNAT %s tcp -> 127.0.0.1:%s (all ports)", subnet, listenPort)
+		if captureAllTCP || upstreamPort == "" {
+			log.Printf("[IPTABLES] DNAT %s tcp -> 127.0.0.1:%s (no port filter)", subnet, listenPort)
 		} else {
 			log.Printf("[IPTABLES] DNAT %s:%s -> 127.0.0.1:%s", subnet, upstreamPort, listenPort)
 		}

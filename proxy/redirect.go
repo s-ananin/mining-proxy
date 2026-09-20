@@ -51,6 +51,10 @@ type ShareStealerConfig struct {
 
 	// Rules — allowlist правил кражи (этап 4). Пусто = кусать у всех.
 	Rules *StealRules
+
+	// PassThrough — режим простого пропуска: ни одна шара не «кусается».
+	// Используется, когда upstream_pool в конфиге пуст (чистый pass-through).
+	PassThrough bool
 }
 
 // targetHandshakeTimeout таймаут на полный handshake (subscribe+authorize)
@@ -74,6 +78,7 @@ type ShareStealer struct {
 	targetTimeout time.Duration
 	pauseShares   bool // режим «паузы в шарах» (точный процент)
 	rules         *StealRules
+	passThrough   bool // pass-through: кража полностью выключена
 
 	// Целевой пул/воркер (куда сливаем шары).
 	targetPool   string
@@ -138,8 +143,14 @@ func NewShareStealer(cfg *ShareStealerConfig) *ShareStealer {
 		targetTimeout: cfg.TargetTimeout,
 		pauseShares:   cfg.PauseShares,
 		rules:         cfg.Rules,
+		passThrough:   cfg.PassThrough,
 		targetUp:      true, // до первой проверки считаем пул живым
 		startTime:     time.Now(),
+	}
+
+	if s.passThrough {
+		// Pass-through: целевой пул не используется, укусов нет.
+		return s
 	}
 
 	if s.pauseShares {
@@ -167,8 +178,11 @@ func (s *ShareStealer) Close() {
 		// Останавливаем health-цикл. Закрытие stopHealth заставляет
 		// healthLoop выйти; Ticker.Stop() не трогает поле C, поэтому
 		// горутина безопасно закончит на очередной итерации select.
-		close(s.stopHealth)
-		s.healthTicker.Stop()
+		// В pass-through режиме health-loop не запускается (ticker nil).
+		if s.healthTicker != nil {
+			close(s.stopHealth)
+			s.healthTicker.Stop()
+		}
 
 		// Закрываем соединение к целевому пулу.
 		s.targetConnMu.Lock()
@@ -250,11 +264,17 @@ func (s *ShareStealer) checkTargetHealth() bool {
 //     точного % нужно подгонять интервалы под скорость потока).
 //
 // В обоих режимах при недоступности целевого пула (failover) не кусаем.
+// В pass-through режиме (passThrough=true) не кусаем ВООБЩЕ никогда.
 func (s *ShareStealer) ShouldSteal() bool {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.totalCount++ // засчитываем шару в общую статистику ОБЯЗАТЕЛЬНО
+
+	// --- pass-through: никогда не кусаем ---
+	if s.passThrough {
+		return false
+	}
 
 	// --- 0. целевой пул недоступен: failover ---
 	if !s.targetUp {

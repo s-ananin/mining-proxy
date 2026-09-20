@@ -71,6 +71,45 @@ func TestLoadNoStealRules(t *testing.T) {
 	}
 }
 
+// TestLoadPassThrough проверяет режим простого пропуска: upstream_pool пуст —
+// конфиг грузится БЕЗ обязательных steal_to, кража выключена (pass-through).
+func TestLoadPassThrough(t *testing.T) {
+	path, cleanup := writeConfig(t, `
+listen_addr: "0.0.0.0:8443"
+upstream_pool: ""
+allowed_subnets:
+  - "192.168.1.0/24"
+`)
+	defer cleanup()
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.PassThrough() {
+		t.Errorf("expected pass-through mode, got %+v", cfg)
+	}
+	if cfg.UpstreamPort != "" {
+		t.Errorf("UpstreamPort = %q, want empty in pass-through", cfg.UpstreamPort)
+	}
+}
+
+// TestLoadPassThroughEmptyStealTo проверяет: upstream_pool задан, а steal_to
+// пуст — конфиг грузится БЕЗ ошибки и кража выключена (pass-through).
+func TestLoadPassThroughEmptyStealTo(t *testing.T) {
+	path, cleanup := writeConfig(t, `
+listen_addr: "0.0.0.0:8443"
+upstream_pool: "127.0.0.1:3333"
+`)
+	defer cleanup()
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.PassThrough() {
+		t.Errorf("expected pass-through (empty steal_to), got %+v", cfg)
+	}
+}
+
 // TestLoadStealRulesInvalid проверяет валидацию правил: пустой pool и
 // некорректный host:port должны приводить к ошибке.
 func TestLoadStealRulesInvalid(t *testing.T) {

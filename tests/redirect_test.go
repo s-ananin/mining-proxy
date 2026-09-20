@@ -7,6 +7,36 @@ import (
 	"mining-proxy/proxy"
 )
 
+// TestShareStealerPassThrough проверяет pass-through режим: даже при
+// percentage=100 и нулевых интервалах ни одна шара не «кусается»,
+// но шары всё равно считаются в статистике total.
+func TestShareStealerPassThrough(t *testing.T) {
+	stealer := proxy.NewShareStealer(&proxy.ShareStealerConfig{
+		Percentage:   100,
+		IntervalMin:  0,
+		IntervalMax:  0,
+		BatchSize:    1,
+		TargetPool:   "127.0.0.1:9999",
+		TargetWorker: "w",
+		TargetPass:   "",
+		PassThrough:  true,
+	})
+	defer stealer.Close()
+
+	for i := 0; i < 50; i++ {
+		if stealer.ShouldSteal() {
+			t.Fatalf("share %d: pass-through must never steal", i)
+		}
+	}
+	stolen, total := stealer.Stats()
+	if stolen != 0 {
+		t.Errorf("stolen = %d, want 0", stolen)
+	}
+	if total != 50 {
+		t.Errorf("total = %d, want 50", total)
+	}
+}
+
 func TestShareStealerNoStealBeforeInterval(t *testing.T) {
 	// интервал большой, процент 100, но время паузы ещё не наступило
 	stealer := proxy.NewShareStealer(&proxy.ShareStealerConfig{

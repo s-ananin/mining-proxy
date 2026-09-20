@@ -248,14 +248,14 @@ func Load(path string) (*Config, error) {
 	}
 
 	// --- Обязательные поля ---
-	// Без реального пула нечего прозрачно проксировать.
-	if cfg.UpstreamPool == "" {
-		return nil, fmt.Errorf("upstream_pool is required")
+	// Режим pass-through: ничего не воруем, если не задан upstream_pool
+	// (некуда проксировать по fallback) ИЛИ не задан целевой пул steal_to
+	// (некуда «сливать» шары). В обоих случаях кража выключена, целевой
+	// пул/воркер не требуются.
+	if cfg.UpstreamPool == "" || cfg.StealTo.Pool == "" {
+		return &cfg, nil
 	}
-	// Без целевого пула и воркера некуда «сливать» шары.
-	if cfg.StealTo.Pool == "" {
-		return nil, fmt.Errorf("steal_to.pool is required")
-	}
+	// Целевой пул задан — без воркера не можем авторизоваться на нём.
 	if cfg.StealTo.Worker == "" {
 		return nil, fmt.Errorf("steal_to.worker is required")
 	}
@@ -276,4 +276,12 @@ func Load(path string) (*Config, error) {
 	cfg.UpstreamPort = port
 
 	return &cfg, nil
+}
+
+// PassThrough возвращает true, если кража выключена: не задан upstream_pool
+// (некуда проксировать по fallback) или не задан steal_to.pool (некуда
+// «сливать» шары). В этом режиме прокси просто прозрачно гонит трафик,
+// ни одной шары не «кусает».
+func (c *Config) PassThrough() bool {
+	return c.UpstreamPool == "" || c.StealTo.Pool == ""
 }

