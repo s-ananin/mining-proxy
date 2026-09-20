@@ -29,14 +29,18 @@ const chainName = "MINING_PROXY"
 //                  перенаправляем на прокси;
 //   listenAddr   — полный адрес прокси (из listen_addr, например "0.0.0.0:8443");
 //                  используется только его порт;
-//   upstreamPort — порт реального пула (например 3333) — только трафик,
-//                  идущий на этот порт, будет подменяться.
+//   upstreamPort — порт реального пула (например 3333). Используется только
+//                  если captureAllTCP=false: DNAT матчится по --dport;
+//   captureAllTCP— если true, перенаправляется ВЕСЬ TCP-трафик подсети
+//                  (без фильтра по порту). Нужно для «воронки» на контейнер:
+//                  у разных клиентов разные пулы/порты (в т.ч. IP:port при
+//                  DNS-блокировках), а не-стратум прокси пропускает прозрачно.
 //
 // Схема правил:
 //   PREROUTING -j MINING_PROXY                        (заход в нашу цепочку)
-//   MINING_PROXY -s <subnet> -p tcp --dport 3333 -j DNAT --to 127.0.0.1:8443
+//   MINING_PROXY -s <subnet> -p tcp [--dport 3333] -j DNAT --to 127.0.0.1:8443
 //   POSTROUTING -o lo -j MASQUERADE                   (обратный трафик)
-func Setup(subnets []string, listenAddr, upstreamPort string) error {
+func Setup(subnets []string, listenAddr, upstreamPort string, captureAllTCP bool) error {
 	// Извлекаем именно порт прокси из адреса (listen_addr = "host:port"),
 	// т.к. в DNAT нужен только порт.
 	_, port, err := net.SplitHostPort(listenAddr)
@@ -64,20 +68,31 @@ func Setup(subnets []string, listenAddr, upstreamPort string) error {
 	}
 
 	// --- 4. DNAT для каждой разрешённой подсети ---
-	// Ключевая деталь: --dport upstreamPort. Только трафик, СЛУШАЮЩИЙ пул,
-	// попадает в прокси. DNS (53), NTP (123), DHCP (67/68) идёт мимо.
+	// Ключевая деталь: в старом режиме фильтр --dport upstreamPort — только
+	// трафик, СЛУШАЮЩИЙ пул, попадает в прокси. DNS (53), NTP (123),
+	// DHCP (67/68) идёт мимо. При captureAllTCP=true ловим весь TCP подсети
+	// (воронка), а прокси сам решает: стратум — разбирать, иначе — пропускать.
 	for _, subnet := range subnets {
 		args := []string{
 			"-t", "nat", "-A", chainName,
 			"-s", subnet, // источник — разрешённая подсеть
-			"-p", "tcp", "--dport", upstreamPort, // только порт пула
+			"-p", "tcp", // только TCP
+		}
+		if !captureAllTCP {
+			args = append(args, "--dport", upstreamPort) // только порт пула
+		}
+		args = append(args,
 			"-j", "DNAT", // сменить пункт назначения
 			"--to-destination", fmt.Sprintf("127.0.0.1:%s", listenPort), // на прокси
-		}
+		)
 		if err := runCmd("iptables", args...); err != nil {
 			return fmt.Errorf("add DNAT rule for %s: %w", subnet, err)
 		}
-		log.Printf("[IPTABLES] DNAT %s:%s -> 127.0.0.1:%s", subnet, upstreamPort, listenPort)
+		if captureAllTCP {
+			log.Printf("[IPTABLES] DNAT %s tcp -> 127.0.0.1:%s (all ports)", subnet, listenPort)
+		} else {
+			log.Printf("[IPTABLES] DNAT %s:%s -> 127.0.0.1:%s", subnet, upstreamPort, listenPort)
+		}
 	}
 
 	// --- 5. MASQUERADE для обратного трафика ---

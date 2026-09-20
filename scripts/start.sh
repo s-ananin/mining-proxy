@@ -104,6 +104,8 @@ FIELDS=(
     "MP_ALLOWED_SUBNETS|allowed_subnets|подсети ASIC через запятую|$(cfg_val allowed_subnets '')|list"
     "MP_SETUP_IPTABLES|setup_iptables|автонастройка iptables (true/false)|$(cfg_val setup_iptables false)|bool"
     "MP_MONITOR_ADDR|monitor_addr|адрес HTTP /status|$(cfg_val monitor_addr 127.0.0.1:9090)|str"
+    "MP_TRANSPARENT|transparent|прозрачный режим: реальный пул по SO_ORIGINAL_DST (true/false)|$(cfg_val transparent true)|bool"
+    "MP_CAPTURE_ALL_TCP|capture_all_tcp|перенаправлять весь TCP подсети (true/false)|$(cfg_val capture_all_tcp false)|bool"
 )
 
 declare -A RESULT   # yaml_key -> value
@@ -114,7 +116,7 @@ for entry in "${FIELDS[@]}"; do
     IFS='|' read -r envkey yamlkey label dft type <<< "$entry"
     case "$yamlkey" in
         steal_to.*) SECTION="  ";;
-        upstream_pool|upstream_ssl|listen_addr|percentage|interval_*|batch_size|allowed_subnets|setup_iptables|monitor_addr) SECTION="";;
+        upstream_pool|upstream_ssl|listen_addr|percentage|interval_*|batch_size|allowed_subnets|setup_iptables|monitor_addr|transparent|capture_all_tcp) SECTION="";;
     esac
 
     if [[ -n "${!envkey:-}" ]]; then
@@ -164,6 +166,8 @@ else
 fi
 echo "setup_iptables: $(to_bool "${RESULT[setup_iptables]}")"
 echo "monitor_addr: \"$(yaml_str "${RESULT[monitor_addr]}")\""
+echo "transparent: $(to_bool "${RESULT[transparent]}")"
+echo "capture_all_tcp: $(to_bool "${RESULT[capture_all_tcp]}")"
 } > "$OUT"
 
 echo

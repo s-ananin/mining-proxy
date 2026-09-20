@@ -32,6 +32,16 @@ type StealTo struct {
 	SSL bool `yaml:"ssl"`
 }
 
+// StealRule — одно правило allowlist (этап 4): кого «кусать».
+type StealRule struct {
+	// Pool адрес пула (IP:port или host:port). Удобно копировать из поля
+	// discovery эндпоинта /status. Обязателен.
+	Pool string `yaml:"pool"`
+
+	// Worker воркер на этом пуле. Пустая строка = все воркеры пула.
+	Worker string `yaml:"worker"`
+}
+
 // Config основная структура конфигурации приложения.
 // Поля маппятся на ключи YAML-файла при помощи тегов yaml:"...".
 type Config struct {
@@ -92,10 +102,39 @@ type Config struct {
 	// Пустая строка отключает мониторинг. Дефолт "127.0.0.1:9090".
 	MonitorAddr string `yaml:"monitor_addr"`
 
+	// Transparent включает прозрачный режим: реальный адресат каждого
+	// соединения берётся из iptables DNAT (SO_ORIGINAL_DST), а не из одного
+	// upstream_pool. В одной подсети у разных клиентов могут быть разные
+	// пулы (viabtc/ampool/hairpool или голый IP:port) — прозрачный режим
+	// ходит в настоящий пул конкретного клиента. По умолчанию true.
+	// Указатель (*bool), чтобы отличать «не задано» от явного false.
+	Transparent *bool `yaml:"transparent"`
+
+	// CaptureAllTCP если true — iptables перенаправляет на прокси ВЕСЬ
+	// TCP-трафик разрешённых подсетей (без фильтра по порту пула). Нужно,
+	// когда клиенты используют разные порты пулов, в т.ч. IP:port при
+	// DNS-блокировках. По умолчанию false: правится только порт upstream.
+	CaptureAllTCP bool `yaml:"capture_all_tcp"`
+
+	// StealRules — allowlist пар (пул, воркер) для кражи (этап 4).
+	// Пусто = кусать у всех (обратная совместимость со старой логикой).
+	// Если задан хотя бы один элемент — кусаются только совпавшие пары,
+	// всё остальное проксируется сквозняком (без кражи).
+	StealRules []StealRule `yaml:"steal_rules"`
+
 	// UpstreamPort порт реального пула — производное поле, извлекается из
 	// UpstreamPool при загрузке. Нужно для DNAT-правил (--dport <порт пула>).
 	// Тег yaml:"-" означает, что поле не маппится из YAML.
 	UpstreamPort string `yaml:"-"`
+}
+
+// TransparentOn возвращает значение transparent с дефолтом true, если в
+// конфиге поле не задано (nil).
+func (c *Config) TransparentOn() bool {
+	if c.Transparent == nil {
+		return true
+	}
+	return *c.Transparent
 }
 
 // ParseUpstream извлекает хост и порт из адреса пула (формат host:port).
@@ -194,6 +233,17 @@ func Load(path string) (*Config, error) {
 	for _, sn := range cfg.AllowedSubnets {
 		if _, _, err := net.ParseCIDR(sn); err != nil {
 			return nil, fmt.Errorf("invalid CIDR in allowed_subnets %q: %w", sn, err)
+		}
+	}
+
+	// --- Валидация правил кражи (allowlist) ---
+	// Пул обязателен и должен быть host:port; воркер опционален.
+	for i, rule := range cfg.StealRules {
+		if rule.Pool == "" {
+			return nil, fmt.Errorf("steal_rules[%d].pool is required", i)
+		}
+		if err := validHostPort(rule.Pool, fmt.Sprintf("steal_rules[%d].pool", i)); err != nil {
+			return nil, err
 		}
 	}
 

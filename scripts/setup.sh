@@ -84,6 +84,7 @@ Type=simple
 ExecStart=/usr/local/bin/mining-proxy --config /etc/mining-proxy/config.yaml
 Restart=always
 RestartSec=5
+WatchdogSec=60
 LimitNOFILE=65536
 NoNewPrivileges=no
 ProtectSystem=full

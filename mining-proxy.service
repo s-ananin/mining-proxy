@@ -22,6 +22,11 @@ ExecStart=/usr/local/bin/mining-proxy --config /etc/mining-proxy/config.yaml
 Restart=always
 # Пауза между перезапусками (чтобы не было цикла рестартов).
 RestartSec=5
+# Watchdog: systemd убивает сервис, если процесс перестал шлaть WATCHDOG=1
+# (sd_notify в systemd.go) в течение этого времени. Прокси не зависнет
+# навсегда — после убийства Restart=always поднимет его заново, а
+# scripts/watchdog.sh в этот момент снимает DNAT (fail-open).
+WatchdogSec=60
 # Лимит открытых файловых дескрипторов: 65536.
 # Нужно для обслуживания тысяч одновременных TCP-соединений от ASIC.
 LimitNOFILE=65536

@@ -45,6 +45,20 @@ func IsMinerSubmit(raw []byte) bool {
 	return msg.Method == "mining.submit"
 }
 
+// LooksLikeStratum определяет, относится ли строка к протоколу Stratum V1:
+// любой метод "mining.*" (subscribe/authorize/submit/configure/...).
+// Используется при классификации соединения в conn.go (sniffStratum).
+func LooksLikeStratum(raw []byte) bool {
+	if IsMinerSubmit(raw) || IsMinerAuthorize(raw) || IsMinerSubscribe(raw) {
+		return true
+	}
+	var msg StratumMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return false
+	}
+	return strings.HasPrefix(msg.Method, "mining.")
+}
+
 // IsMinerAuthorize проверяет, является ли сообщение mining.authorize.
 // Нужно для распознавания воркера, которым представился майнер.
 func IsMinerAuthorize(raw []byte) bool {

