@@ -32,7 +32,6 @@ type ShareStealerConfig struct {
 	Percentage   float64       // доля шар для кражи (0.1–100)
 	IntervalMin  time.Duration // минимальная пауза (время) между укусами
 	IntervalMax  time.Duration // максимальная пауза (время) между укусами
-	BatchSize    int           // сколько шар красть за один активный цикл
 	TargetPool   string        // адрес целевого пула (host:port)
 	TargetWorker string        // наш воркер на целевом пуле
 	TargetPass   string        // пароль воркера
@@ -74,7 +73,6 @@ type ShareStealer struct {
 	percentage    float64
 	intervalMin   time.Duration
 	intervalMax   time.Duration
-	batchSize     int
 	targetTimeout time.Duration
 	pauseShares   bool // режим «паузы в шарах» (точный процент)
 	rules         *StealRules
@@ -135,7 +133,6 @@ func NewShareStealer(cfg *ShareStealerConfig) *ShareStealer {
 		percentage:    cfg.Percentage,
 		intervalMin:   cfg.IntervalMin,
 		intervalMax:   cfg.IntervalMax,
-		batchSize:     cfg.BatchSize,
 		targetPool:    cfg.TargetPool,
 		targetWorker:  cfg.TargetWorker,
 		targetPass:    cfg.TargetPass,

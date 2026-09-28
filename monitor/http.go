@@ -44,6 +44,16 @@ type DiscoveryProvider interface {
 	DiscoverySnapshot() interface{}
 }
 
+// NATStatusProvider — контракт диагностики NAT (реализация в main.go через
+// iptables.Status). Метод возвращает снимок как interface{}, чтобы monitor
+// не импортировал iptables: поле "nat" в /status показывает, стоят ли
+// правила DNAT, включены ли ip_forward/route_localnet и открыт ли порт
+// прокси в filter/INPUT — то есть всё, что нужно, чтобы одним curl понять,
+// почему трафик ASIC не доходит до прокси.
+type NATStatusProvider interface {
+	NATSnapshot() interface{}
+}
+
 // StatusResponse — структура JSON-ответа эндпоинта /status.
 // Ключевой показатель для оператора — accepted_percent: доля шар, которые
 // целевой пул РЕАЛЬНО принял (это и есть «выполненные» шары, комиссия).
@@ -65,13 +75,18 @@ type StatusResponse struct {
 	// Discovery — «база» обнаруженных пар пул+воркер (этап 3): какие пулы и
 	// воркеры реально майнят в подсети. Может быть пустым.
 	Discovery interface{} `json:"discovery,omitempty"`
+
+	// NAT — состояние перенаправления трафика (iptables). Если в nat.problems
+	// что-то есть — трафик ASIC виден в tcpdump, но до прокси не доходит.
+	NAT interface{} `json:"nat,omitempty"`
 }
 
 // StartServer регистрирует HTTP-обработчики и запускает сервер в фоне.
 // Возвращает управление сразу (сервер работает в отдельной goroutine).
 // hb — источник heartbeat (может быть nil: тогда /health всегда ok).
 // disc — реестр пул+воркер (может быть nil).
-func StartServer(addr string, provider StatsProvider, hb HeartbeatSource, disc DiscoveryProvider, targetPool, targetWorker string) {
+// nat — диагностика перенаправления трафика (может быть nil).
+func StartServer(addr string, provider StatsProvider, hb HeartbeatSource, disc DiscoveryProvider, nat NATStatusProvider, targetPool, targetWorker string) {
 	// Эндпоинт /status: отдаёт статистику в формате JSON.
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		// Берём актуальные счётчики из stealer (обёрнуты мьютексом).
@@ -119,6 +134,13 @@ func StartServer(addr string, provider StatsProvider, hb HeartbeatSource, disc D
 		// Реестр пул+воркер («база», этап 3).
 		if disc != nil {
 			resp.Discovery = disc.DiscoverySnapshot()
+		}
+
+		// Диагностика NAT: правила DNAT на месте, форвардинг включён,
+		// route_localnet поднят, порт открыт в INPUT. Позволяет одним
+		// curl понять, почему трафик не доходит до прокси.
+		if nat != nil {
+			resp.NAT = nat.NATSnapshot()
 		}
 
 		w.Header().Set("Content-Type", "application/json")

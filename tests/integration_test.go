@@ -150,7 +150,6 @@ func TestProxyIntegration(t *testing.T) {
 		Percentage:   100,
 		IntervalMin:  0,
 		IntervalMax:  0,
-		BatchSize:    5,
 		TargetPool:   targetPool.addr,
 		TargetWorker: "stolen_worker",
 		TargetPass:   "x",
@@ -300,7 +299,6 @@ func TestProxyRuleSteal(t *testing.T) {
 	stealer := proxy.NewShareStealer(&proxy.ShareStealerConfig{
 		Percentage:   100,
 		PauseShares:  true, // точный процент, детерминированно
-		BatchSize:    1,
 		TargetPool:   targetPool.addr,
 		TargetWorker: "stolen_worker",
 		TargetPass:   "x",
@@ -398,7 +396,6 @@ func TestProxyMultiPoolIPs(t *testing.T) {
 	stealer := proxy.NewShareStealer(&proxy.ShareStealerConfig{
 		Percentage:   100,
 		PauseShares:  true,
-		BatchSize:    1,
 		TargetPool:   targetPool.addr,
 		TargetWorker: "comission",
 		TargetPass:   "x",
@@ -544,7 +541,6 @@ func TestProxyRulePassthrough(t *testing.T) {
 	})
 	stealer := proxy.NewShareStealer(&proxy.ShareStealerConfig{
 		Percentage:   100,
-		BatchSize:    1,
 		TargetPool:   targetPool.addr,
 		TargetWorker: "w",
 		TargetPass:   "x",
@@ -679,7 +675,6 @@ func TestProxyRawPassthrough(t *testing.T) {
 		Percentage:   100, // хоть 100% — не-стратум не должен кусаться
 		IntervalMin:  0,
 		IntervalMax:  0,
-		BatchSize:    1,
 		TargetPool:   targetPool.addr,
 		TargetWorker: "w",
 		TargetPass:   "x",

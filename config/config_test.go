@@ -143,3 +143,91 @@ func TestLoadStealRulesInvalid(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadSetupIPTablesWithoutSubnets — главный защитный тест этой правки.
+//
+// Такая конфигурация (NAT включён, но перехватывать нечего) раньше
+// проходила загрузку, процесс стартовал, в лог уходило «setup complete»
+// при нуле правил DNAT, а трафик ASIC уходил мимо прокси прямо в пул.
+// Теперь это ошибка с внятным текстом.
+func TestLoadSetupIPTablesWithoutSubnets(t *testing.T) {
+	path, cleanup := writeConfig(t, baseConfig+`
+setup_iptables: true
+allowed_subnets: []
+`)
+	defer cleanup()
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("ожидалась ошибка: setup_iptables=true при пустом allowed_subnets")
+	}
+	if !strings.Contains(err.Error(), "allowed_subnets") {
+		t.Errorf("в ошибке ожидалось упоминание allowed_subnets, получено: %v", err)
+	}
+}
+
+// Обратный случай: NAT выключен, подсети пусты — конфиг валиден (локальная
+// разработка и тесты без root). Ошибка тут была бы ложной.
+func TestLoadNoIPTablesWithoutSubnetsOK(t *testing.T) {
+	path, cleanup := writeConfig(t, baseConfig+`
+setup_iptables: false
+allowed_subnets: []
+`)
+	defer cleanup()
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("конфиг без NAT и без подсетей должен грузиться, получено: %v", err)
+	}
+	if cfg.SetupIPTables {
+		t.Error("SetupIPTables должен быть false")
+	}
+}
+
+func TestLoadNATIngressIfaces(t *testing.T) {
+	path, cleanup := writeConfig(t, baseConfig+`
+setup_iptables: true
+allowed_subnets: ["10.4.6.0/24"]
+nat_ingress_ifaces: ["eth0", "eth1"]
+`)
+	defer cleanup()
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.NATIngressIfaces) != 2 ||
+		cfg.NATIngressIfaces[0] != "eth0" || cfg.NATIngressIfaces[1] != "eth1" {
+		t.Errorf("NATIngressIfaces = %v, хотели [eth0 eth1]", cfg.NATIngressIfaces)
+	}
+}
+
+// TestExampleConfigLoads защищает эталон config.example.yaml от типичных
+// правок, которые ломают его незаметно для человека:
+//
+//   - дублирующийся YAML-ключ (yaml.v3 отвергает такой файл целиком);
+//   - потерянное или переименованное поле;
+//   - значение, не проходящее валидацию Config.Load.
+//
+// Раньше эталон правился руками и его никто не проверял: сломанный файл
+// обнаруживался только при копировании в /etc на целевой машине.
+func TestExampleConfigLoads(t *testing.T) {
+	path := filepath.Join("..", "config.example.yaml")
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("config.example.yaml недоступен: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("эталон config.example.yaml не грузится: %v", err)
+	}
+	if len(cfg.AllowedSubnets) == 0 {
+		t.Error("в эталоне должен быть непустой allowed_subnets, иначе NAT не работает")
+	}
+	if cfg.ListenAddr == "" {
+		t.Error("в эталоне должен быть listen_addr")
+	}
+	if cfg.MonitorAddr == "" {
+		t.Error("Load() подставляет дефолт мониторинга — эталон его не переопределяет пустым")
+	}
+}

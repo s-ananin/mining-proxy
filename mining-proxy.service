@@ -35,6 +35,11 @@ LimitNOFILE=65536
 # Запрет поднятия привилегий через setuid-бинарники (не мешает iptables,
 # т.к. прокси не выполняет команды с повышенными правами).
 NoNewPrivileges=no
+# ProtectSystem=full делает /etc доступным только на чтение. Исключение —
+# /etc/sysctl.d: туда пишутся постоянные настройки ядра (ip_forward,
+# route_localnet) на случай, если setup.sh их не создал. Без этой строки
+# прокси падает с "Read-only file system" при первой попытке записи sysctl.
+ReadWritePaths=/etc/sysctl.d
 # Защита системных директорий от записи (/usr, /boot, /etc).
 # Конфиг читается, а не пишется — полный доступ к записи не нужен.
 ProtectSystem=full

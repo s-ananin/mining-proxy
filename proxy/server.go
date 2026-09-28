@@ -73,17 +73,34 @@ func NewServer(listenAddr, upstream string, upstreamSSL, transparent bool, steal
 	}
 }
 
-// Run запускает TCP listener и обрабатывает входящие соединения.
-// Работает в бесконечном accept loop. Для graceful shutdown main вызывает
-// Shutdown(), который закрывает listener — accept возвращает ошибку
-// ErrClosed и цикл завершается.
-func (s *Server) Run() error {
+// Listen создаёт TCP-listener, НО НЕ начинаяет принимать соединения.
+//
+// Вызывается из main ДО настройки iptables: перехват не должен существовать
+// ни секунды, пока порт ещё не занят, иначе ASIC получит RST вместо
+// подключения. Run() использует уже созданный listener.
+func (s *Server) Listen() error {
+	if s.ln != nil {
+		return nil
+	}
 	ln, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
 		return err
 	}
 	s.ln = ln
-	defer s.ln.Close()
+	return nil
+}
+
+// Run запускает TCP listener и обрабатывает входящие соединения.
+// Работает в бесконечном accept loop. Для graceful shutdown main вызывает
+// Shutdown(), который закрывает listener — accept возвращает ошибку
+// ErrClosed и цикл завершается.
+func (s *Server) Run() error {
+	// Listener мог быть уже создан в Listen() (см. порядок запуска в main).
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	ln := s.ln
+	defer ln.Close()
 
 	// Фоновый heartbeat: «бьётся» каждые heartbeatInterval, чтобы /health
 	// и watchdog видели прокси живым даже при полном отсутствии трафика.
