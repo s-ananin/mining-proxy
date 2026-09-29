@@ -6,10 +6,14 @@
 #   - если не задана                   -> задаём вопрос с дефолтом из config.example.yaml
 #
 # Переменные (префикс MP_):
-#   MP_LISTEN_ADDR, MP_UPSTREAM_POOL, MP_UPSTREAM_SSL, MP_STEAL_POOL,
-#   MP_STEAL_WORKER, MP_STEAL_PASS, MP_STEAL_SSL, MP_PERCENTAGE,
-#   MP_INTERVAL_MIN_HOURS, MP_INTERVAL_MAX_HOURS,
-#   MP_ALLOWED_SUBNETS (через запятую), MP_SETUP_IPTABLES, MP_MONITOR_ADDR
+#   MP_LISTEN_ADDR, MP_UPSTREAM_POOL, MP_TRANSPARENT, MP_UPSTREAM_SSL,
+#   MP_STEAL_POOL, MP_STEAL_WORKER, MP_STEAL_PASS, MP_STEAL_SSL,
+#   MP_PERCENTAGE, MP_PAUSE_SHARES, MP_INTERVAL_MIN_HOURS,
+#   MP_INTERVAL_MAX_HOURS, MP_SETUP_IPTABLES, MP_ALLOWED_SUBNETS
+#   (через запятую), MP_CAPTURE_ALL_TCP, MP_MONITOR_ADDR
+#
+# Часть вопросов условная: поле, не влияющее на выбранный режим, не
+# спрашивается (см. последнее поле записи в FIELDS ниже).
 #
 # Использование:
 #   MP_UPSTREAM_POOL=x MP_STEAL_POOL=... mining-proxy-start
@@ -137,43 +141,77 @@ if [[ "$reuse_old" == 1 ]]; then
 fi
 
 # --- Сбор переменных: env или интерактивный вопрос ---
-# Каждая запись: "ENV_VAR|yaml_key|вопрос|дефолт|тип"
+# Каждая запись: "ENV_VAR|yaml_key|вопрос|дефолт|тип|условие_пропуска"
 # тип: str | bool | float | int | list
+# условие_пропуска: "ключ==значение" — если поле уже отвечено этим значением,
+# вопрос НЕ задаётся, потому что в данном режиме поле не влияет ни на что.
+# Пустое условие = спрашивать всегда.
+#
+# Порядок важен: ключ условия должен идти раньше зависящего от него поля.
 FIELDS=(
-    "MP_LISTEN_ADDR|listen_addr|адрес и порт прокси (0.0.0.0:8443)|0.0.0.0:8443|str"
-    "MP_UPSTREAM_POOL|upstream_pool|реальный пул ASIC (host:port)|$(cfg_val upstream_pool '')|str"
-    "MP_UPSTREAM_SSL|upstream_ssl|TLS к реальному пулу (true/false)|$(cfg_val upstream_ssl false)|bool"
-    "MP_STEAL_POOL|steal_to.pool|целевой пул для шар (host:port)|$(cfg_val steal_to.pool '')|str"
-    "MP_STEAL_WORKER|steal_to.worker|ваш воркер на целевом пуле|$(cfg_val steal_to.worker '')|str"
-    "MP_STEAL_PASS|steal_to.pass|пароль воркера|$(cfg_val steal_to.pass x)|str"
-    "MP_STEAL_SSL|steal_to.ssl|TLS к целевому пулу (true/false)|$(cfg_val steal_to.ssl false)|bool"
-    "MP_PERCENTAGE|percentage|процент шар для кражи (0.1-100)|$(cfg_val percentage 5.0)|float"
-    "MP_PAUSE_SHARES|pause_shares|пауза в ШАРАХ: точный процент (true/false)|$(cfg_val pause_shares true)|bool"
-    "MP_INTERVAL_MIN_HOURS|interval_min_hours|мин. интервал кражи, часы (если pause_shares=false)|$(cfg_val interval_min_hours 2)|float"
-    "MP_INTERVAL_MAX_HOURS|interval_max_hours|макс. интервал кражи, часы|$(cfg_val interval_max_hours 20)|float"
-    "MP_ALLOWED_SUBNETS|allowed_subnets|подсети ASIC через запятую|$(cfg_val allowed_subnets "$(detect_subnets)")|list"
-    "MP_SETUP_IPTABLES|setup_iptables|автонастройка iptables/NAT (true/false)|$(cfg_val setup_iptables true)|bool"
-    "MP_MONITOR_ADDR|monitor_addr|адрес HTTP /status|$(cfg_val monitor_addr 127.0.0.1:9090)|str"
-    "MP_TRANSPARENT|transparent|прозрачный режим: реальный пул по SO_ORIGINAL_DST (true/false)|$(cfg_val transparent true)|bool"
-    "MP_CAPTURE_ALL_TCP|capture_all_tcp|перенаправлять весь TCP подсети (true/false)|$(cfg_val capture_all_tcp true)|bool"
+    "MP_LISTEN_ADDR|listen_addr|адрес и порт прокси (0.0.0.0:8443)|0.0.0.0:8443|str|"
+    "MP_TRANSPARENT|transparent|прозрачный режим: реальный пул по SO_ORIGINAL_DST (true/false)|$(cfg_val transparent true)|bool|"
+    "MP_UPSTREAM_POOL|upstream_pool|реальный пул ASIC (host:port)|$(cfg_val upstream_pool '')|str|"
+    # upstream_ssl в прозрачном режиме не действует: реальный пул берётся из
+    # SO_ORIGINAL_DST, и TLS там принудительно false (proxy/dest.go).
+    "MP_UPSTREAM_SSL|upstream_ssl|TLS к реальному пулу, только при transparent=false|$(cfg_val upstream_ssl false)|bool|transparent==true"
+    "MP_STEAL_POOL|steal_to.pool|целевой пул для шар (host:port)|$(cfg_val steal_to.pool '')|str|"
+    "MP_STEAL_WORKER|steal_to.worker|ваш воркер на целевом пуле|$(cfg_val steal_to.worker '')|str|"
+    "MP_STEAL_PASS|steal_to.pass|пароль воркера|$(cfg_val steal_to.pass x)|str|"
+    "MP_STEAL_SSL|steal_to.ssl|TLS к целевому пулу (true/false)|$(cfg_val steal_to.ssl false)|bool|"
+    "MP_PERCENTAGE|percentage|процент шар для кражи (0.1-100)|$(cfg_val percentage 5.0)|float|"
+    "MP_PAUSE_SHARES|pause_shares|пауза в ШАРАХ: точный процент (true/false)|$(cfg_val pause_shares true)|bool|"
+    # При pause_shares=true ShouldSteal выходит по счётчику шар и до
+    # interval_* не доходит (proxy/redirect.go) — спрашивать нечего.
+    "MP_INTERVAL_MIN_HOURS|interval_min_hours|мин. интервал кражи, часов (только при pause_shares=false)|$(cfg_val interval_min_hours 2)|float|pause_shares==true"
+    "MP_INTERVAL_MAX_HOURS|interval_max_hours|макс. интервал кражи, часов (только при pause_shares=false)|$(cfg_val interval_max_hours 20)|float|pause_shares==true"
+    "MP_SETUP_IPTABLES|setup_iptables|автонастройка iptables/NAT (true/false)|$(cfg_val setup_iptables true)|bool|"
+    # Дальше два поля нужны только если мы сами ставим правила iptables:
+    # при setup_iptables=false DNAT не создаётся, и capture_all_tcp /
+    # allowed_subnets на перехват не влияют (идут только в /status).
+    "MP_ALLOWED_SUBNETS|allowed_subnets|подсети ASIC через запятую|$(cfg_val allowed_subnets "$(detect_subnets)")|list|setup_iptables==false"
+    "MP_CAPTURE_ALL_TCP|capture_all_tcp|перенаправлять весь TCP подсети, не только порт пула (true/false)|$(cfg_val capture_all_tcp true)|bool|setup_iptables==false"
+    # monitor_addr пустым не отключается — config.Load подставляет
+    # 127.0.0.1:9090, поэтому вопрос остаётся (менять порт/хост нужно руками).
+    "MP_MONITOR_ADDR|monitor_addr|адрес HTTP /status|$(cfg_val monitor_addr 127.0.0.1:9090)|str|"
 )
 
 declare -A RESULT   # yaml_key -> value
+declare -A SKIPPED   # yaml_key -> причина пропуска (для отчёта в конце)
 SECTION=""
 num=1
 echo "== Настройка mining-proxy =="
 for entry in "${FIELDS[@]}"; do
-    IFS='|' read -r envkey yamlkey label dft type <<< "$entry"
+    IFS='|' read -r envkey yamlkey label dft type skipcond <<< "$entry"
+
+    # --- Условный пропуск: поле не влияет на выбранный режим ---
+    if [[ -n "$skipcond" ]]; then
+        dep_key="${skipcond%%==*}"
+        dep_want="${skipcond#*==}"
+        if [[ "$(to_bool "${RESULT[$dep_key]:-false}")" == "$dep_want" ]]; then
+            # Значение всё равно пишем в конфиг (env > дефолт), чтобы файл
+            # оставался полным и предсказуемым.
+            RESULT["$yamlkey"]="${!envkey:-$dft}"
+            SKIPPED["$yamlkey"]="$dep_key=$dep_want"
+            if [[ -n "${!envkey:-}" ]]; then
+                echo "  - $label: ${!envkey} (из env $envkey, вопрос пропущен: $dep_key=$dep_want)"
+            else
+                echo "  - $label: ${RESULT[$yamlkey]} (вопрос пропущен: $dep_key=$dep_want)"
+            fi
+            continue
+        fi
+    fi
+
     case "$yamlkey" in
         steal_to.*) SECTION="  ";;
-        upstream_pool|upstream_ssl|listen_addr|percentage|interval_*|allowed_subnets|setup_iptables|monitor_addr|transparent|capture_all_tcp) SECTION="";;
+        *) SECTION="";;
     esac
 
     if [[ -n "${!envkey:-}" ]]; then
         value="${!envkey}"
-        echo "[$num] $label: $value  (из env $envkey)"
+        echo "[$num]$SECTION $label: $value  (из env $envkey)"
     else
-        printf "[$num] %s [%s]: " "$label" "$dft"
+        printf "[%s]%s %s [%s]: " "$num" "$SECTION" "$label" "$dft"
         read -r answer || true
         value="${answer:-$dft}"
         [[ -z "$value" ]] && value="$dft"
@@ -181,6 +219,12 @@ for entry in "${FIELDS[@]}"; do
     RESULT["$yamlkey"]="$value"
     num=$((num+1))
 done
+
+if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+    echo
+    echo "Пропущено (не влияет на выбранный режим): ${!SKIPPED[*]}"
+    echo "Если нужно изменить — задайте MP_* в окружении или правьте $OUT вручную."
+fi
 
 # --- Генерация config.local.yaml ---
 # yaml_str экранирует кавычки и бэкслеши в значениях строковых полей.
