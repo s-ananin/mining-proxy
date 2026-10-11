@@ -1,15 +1,13 @@
-// Пакет proxy — Stratum V1 парсинг.
+// Пакет proxy — прозрачный Stratum-прокси с мониторингом шар.
 //
-// Stratum V1 — текстовый протокол поверх TCP: каждое сообщение это одна
-// строка JSON (JSON-RPC 2.0-подобная), заканчивающаяся '\n'. ASIC-майнер
-// работает с пулом через три основных метода:
-//   mining.subscribe  — регистрация, получение extranonce;
-//   mining.authorize  — «я воркер X, разреши майнить», передаёт воркера;
-//   mining.submit     — отправка найденной шары (вот её мы «кусаем»).
+// Поток данных:
 //
-// Эти функции извлекают/переписывают поля сообщений без изменения остальных
-// параметров шары (job_id, extranonce2, ntime, nonce) — иначе шара
-// считалась бы невалидной.
+//	майнер --TCP--> (iptables DNAT) --> proxy --> реальный пул
+//	                                      |
+//	                                      +--> mining.submit / accepted / rejected
+//
+// Прокси НЕ меняет сообщения: все строки уходят байт-в-байт, единственная
+// задача — посчитать шары и отдать статистику в /status.
 package proxy
 
 import (
@@ -17,169 +15,167 @@ import (
 	"strings"
 )
 
-// StratumMessage представляет одно Stratum V1 JSON-RPC сообщение.
+// StratumMessage — одно Stratum V1 JSON-RPC сообщение.
 //
-//	{
-//	  "id":     1,            // идентификатор запроса (для сопоставления ответа)
-//	  "method": "mining.submit", // метод запроса; у ответов метода нет
-//	  "params": [...],        // параметры метода
-//	  "result": ...,          // результат (только в ответах)
-//	  "error":  null          // ошибка (null = успех)
-//	}
+//	{"id":1, "method":"mining.submit", "params":[...]}   — запрос майнера
+//	{"id":1, "result":true, "error":null}                — ответ пула
 type StratumMessage struct {
-	ID     interface{}     `json:"id"`
+	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method,omitempty"`
 	Params json.RawMessage `json:"params,omitempty"`
 	Result json.RawMessage `json:"result,omitempty"`
-	Error  interface{}     `json:"error,omitempty"`
+	Error  json.RawMessage `json:"error,omitempty"`
 }
 
-// IsMinerSubmit проверяет, является ли сообщение mining.submit (шарой).
-// Парсим JSON в лёгкую структуру и сравниваем метод. Некорректный JSON
-// не считается submit-ом (возвращаем false).
+// Parse декодирует одну строку; не-JSON → ошибка.
+func Parse(raw []byte) (*StratumMessage, error) {
+	var msg StratumMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+
+// IsMinerSubmit true, если строка — mining.submit (шара от майнера).
 func IsMinerSubmit(raw []byte) bool {
-	var msg StratumMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return false
-	}
-	return msg.Method == "mining.submit"
+	msg, err := Parse(raw)
+	return err == nil && msg.Method == "mining.submit"
 }
 
-// LooksLikeStratum определяет, относится ли строка к протоколу Stratum V1:
-// любой метод "mining.*" (subscribe/authorize/submit/configure/...).
-// Используется при классификации соединения в conn.go (sniffStratum).
+// IsMinerAuthorize true, если строка — mining.authorize (воркер представился).
+func IsMinerAuthorize(raw []byte) bool {
+	msg, err := Parse(raw)
+	return err == nil && msg.Method == "mining.authorize"
+}
+
+// IsMinerSubscribe true, если строка — mining.subscribe.
+func IsMinerSubscribe(raw []byte) bool {
+	msg, err := Parse(raw)
+	return err == nil && msg.Method == "mining.subscribe"
+}
+
+// LooksLikeStratum отличает Stratum-трафик от прочего (TLS, HTTP): любой
+// метод "mining.*" означает, что соединение — стратум и его можно разбирать
+// построчно. Бинарные данные JSON не распарсятся → false → прозрачный проброс.
 func LooksLikeStratum(raw []byte) bool {
-	if IsMinerSubmit(raw) || IsMinerAuthorize(raw) || IsMinerSubscribe(raw) {
-		return true
-	}
-	var msg StratumMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
+	msg, err := Parse(raw)
+	if err != nil {
 		return false
 	}
 	return strings.HasPrefix(msg.Method, "mining.")
 }
 
-// IsMinerAuthorize проверяет, является ли сообщение mining.authorize.
-// Нужно для распознавания воркера, которым представился майнер.
-func IsMinerAuthorize(raw []byte) bool {
-	var msg StratumMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return false
-	}
-	return msg.Method == "mining.authorize"
+// WorkerFromAuthorize достаёт воркера из mining.authorize: params[0].
+// Возвращает полное имя, как его шлёт майнер ("pool.worker").
+func WorkerFromAuthorize(raw []byte) string {
+	return workerFromParams(raw, "mining.authorize")
 }
 
-// IsMinerSubscribe проверяет, является ли сообщение mining.subscribe
-// (первый шаг рукопожатия майнера с пулом).
-func IsMinerSubscribe(raw []byte) bool {
-	var msg StratumMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return false
-	}
-	return msg.Method == "mining.subscribe"
+// WorkerFromSubmit достаёт воркера из mining.submit: params[0].
+// Воркер в submit может отличаться от authorize — майнер меняет его на ходу.
+func WorkerFromSubmit(raw []byte) string {
+	return workerFromParams(raw, "mining.submit")
 }
 
-// ExtractWorkerFromAuthorize извлекает имя воркера из mining.authorize.
-//
-//	params: ["worker_name", "password"]
-//
-// Имя может быть в формате "пул.воркер" (например "viabtc.вася3344") —
-// тогда берём последнюю часть после точки. Возвращает пустую строку,
-// если сообщение не authorize или параметры некорректны.
-func ExtractWorkerFromAuthorize(raw []byte) string {
-	var msg StratumMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
+// workerFromParams общая логика: method должен совпасть, params[0] — строка.
+func workerFromParams(raw []byte, method string) string {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != method {
 		return ""
 	}
-	if msg.Method != "mining.authorize" {
+	var params []json.RawMessage
+	if err := json.Unmarshal(msg.Params, &params); err != nil || len(params) == 0 {
 		return ""
 	}
-	var params []string
-	if err := json.Unmarshal(msg.Params, &params); err != nil {
+	var name string
+	if err := json.Unmarshal(params[0], &name); err != nil {
 		return ""
 	}
-	if len(params) == 0 {
-		return ""
-	}
-	// воркер может быть в формате "pool.worker" — берём последнюю часть
-	parts := strings.Split(params[0], ".")
-	return parts[len(parts)-1]
+	return name
 }
 
-// ExtractWorkerFromSubmit извлекает имя воркера из mining.submit.
-//
-//	params: ["worker_name", "job_id", "extranonce2", "ntime", "nonce"]
-//
-// Логика та же, что в ExtractWorkerFromAuthorize. Нужен, чтобы понять,
-// от какого воркера пришла шара (майнер может менять воркера на ходу).
-func ExtractWorkerFromSubmit(raw []byte) string {
-	var msg StratumMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return ""
+// SubmitID возвращает id запроса mining.submit в виде строки — по нему потом
+// сопоставляется ответ пула (пул эхом возвращает тот же id). Окавычки JSON
+// сохраняются: id 3 и id "3" — разные ключи, как и у пула.
+func SubmitID(raw []byte) (string, bool) {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != "mining.submit" || isNullID(msg.ID) {
+		return "", false
 	}
-	if msg.Method != "mining.submit" {
-		return ""
-	}
-	var params []string
-	if err := json.Unmarshal(msg.Params, &params); err != nil {
-		return ""
-	}
-	if len(params) == 0 {
-		return ""
-	}
-	parts := strings.Split(params[0], ".")
-	return parts[len(parts)-1]
+	return string(msg.ID), true
 }
 
-// RewriteWorkerSubmit перезаписывает имя воркера в mining.submit на newWorker.
-// Все остальные параметры шары (job_id, extranonce2, ntime, nonce)
-// сохраняются — иначе целевой пул отвергнет шару.
-// Возвращает сериализованное JSON сообщение с новым воркером.
-func RewriteWorkerSubmit(raw []byte, newWorker string) ([]byte, error) {
-	var msg StratumMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return nil, err
-	}
-
-	var params []string
-	if err := json.Unmarshal(msg.Params, &params); err != nil {
-		return nil, err
-	}
-
-	// params[0] — имя воркера, меняем на наш.
-	if len(params) > 0 {
-		params[0] = newWorker
-	}
-
-	newParams, err := json.Marshal(params)
-	if err != nil {
-		return nil, err
-	}
-	msg.Params = newParams
-
-	return json.Marshal(msg)
+// PoolResponse — распознанный ответ пула (результат обработки шары).
+type PoolResponse struct {
+	// ID id запроса, которому это ответ (эхо от mining.submit).
+	ID string
+	// Accepted true, если result == true (шара принята).
+	Accepted bool
+	// Error текст причины отказа из error[1], если есть.
+	Error string
 }
 
-// MessageID возвращает ID сообщения для корреляции запрос-ответ.
-// В Stratum пул отвечает на запрос с тем же id — по нему можно
-// сопоставить ответ с отправленным запросом.
-func MessageID(raw []byte) (interface{}, bool) {
-	var msg StratumMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return nil, false
+// ParsePoolResponse разбирает ответ пула: есть id, нет method. result может
+// быть true/false (submit/authorize) или массивом (subscribe) — вызывающая
+// сторона сверяет id с таблицей ожидающих шар, поэтому лишние ответы
+// (subscribe/authorize) отфильтровываются там.
+func ParsePoolResponse(raw []byte) (PoolResponse, bool) {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != "" || isNullID(msg.ID) {
+		return PoolResponse{}, false
 	}
-	if msg.ID == nil {
-		return nil, false
+	// Ответ пула: результат должен быть булевым (submit/authorize) либо
+	// задана причина отказа. Ответ на subscribe (result — массив) так не
+	// разбирается: его id мог бы коллизионировать с id шары.
+	resultIsBool := string(msg.Result) == "true" || string(msg.Result) == "false"
+	hasError := !isNull(msg.Error)
+	if !resultIsBool && !hasError {
+		return PoolResponse{}, false
 	}
-	return msg.ID, true
+	resp := PoolResponse{ID: string(msg.ID), Accepted: string(msg.Result) == "true"}
+	if hasError {
+		resp.Error = extractErrorMessage(msg.Error)
+		if resp.Error == "" {
+			resp.Error = string(msg.Error)
+		}
+		resp.Accepted = false
+	}
+	return resp, true
 }
 
-// IsResponse проверяет, является ли сообщение ответом (а не запросом).
-// Ответ отличается тем, что содержит id, но не содержит method.
-func IsResponse(raw []byte) bool {
-	var msg StratumMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return false
+// ParseSetDifficulty разбирает mining.set_difficulty (пул → майнер):
+// params[0] — новая сложность. По ней считается хешрейт воркера.
+func ParseSetDifficulty(raw []byte) (float64, bool) {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != "mining.set_difficulty" {
+		return 0, false
 	}
-	return msg.ID != nil && msg.Method == ""
+	var params []float64
+	if err := json.Unmarshal(msg.Params, &params); err != nil || len(params) == 0 {
+		return 0, false
+	}
+	return params[0], true
+}
+
+// isNull true, если raw — пустой, "null" или не задан.
+func isNull(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return s == "" || s == "null"
+}
+
+// isNullID id отсутствует или null (у notify-сообщений пула id = null).
+func isNullID(id json.RawMessage) bool { return isNull(id) }
+
+// extractErrorMessage достаёт человекочитаемую причину из error:
+// формат error = [code, "message", "traceback"|null].
+func extractErrorMessage(errRaw json.RawMessage) string {
+	var arr []json.RawMessage
+	if json.Unmarshal(errRaw, &arr) != nil || len(arr) < 2 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(arr[1], &s) != nil {
+		return ""
+	}
+	return s
 }

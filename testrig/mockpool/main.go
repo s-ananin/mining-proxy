@@ -1,16 +1,19 @@
 // testrig/mockpool — минимальный Stratum V1 mock-пул для локального
 // тестирования mining-proxy.
 //
-// Роль: имитирует майнинг-пул. Понимает три метода Stratum:
-//   mining.subscribe -> возвращает extranonce (всегда успех);
-//   mining.authorize -> возвращает result:true (воркер принят);
-//   mining.submit    -> возвращает result:true (шара принята).
+// Понимает mining.subscribe / mining.authorize / mining.submit, при
+// подключении шлёт mining.set_difficulty (нужен прокси для хешрейта).
 //
-// Запуск (порт по умолчанию 3333):
-//   go run ./testrig/mockpool -listen 127.0.0.1:3333
+// Флаги:
 //
-// Для стенда нужно два экземпляра: «реальный» пул (3333) и «целевой»
-// пул (3334) — в конфиге config.local.yaml.
+//	-listen       адрес (по умолчанию 127.0.0.1:3333)
+//	-difficulty   сложность в set_difficulty (0 — не шлёт)
+//	-reject       все шары отклоняются (result:false + причина)
+//	-silent       не отвечать вовсе (тест «шары без ответа» → lost)
+//
+// Запуск:
+//
+//	go run ./testrig/mockpool -listen 127.0.0.1:3333 -difficulty 16
 package main
 
 import (
@@ -21,7 +24,6 @@ import (
 	"net"
 )
 
-// poolMessage структура входящего сообщения — нам важны id, method, params.
 type poolMessage struct {
 	ID     interface{}   `json:"id"`
 	Method string        `json:"method"`
@@ -29,87 +31,101 @@ type poolMessage struct {
 }
 
 func main() {
-	// Порт, на котором слушаем: -listen 127.0.0.1:3333
 	listen := flag.String("listen", "127.0.0.1:3333", "listen address")
+	difficulty := flag.Float64("difficulty", 16, "difficulty sent via mining.set_difficulty (0 = off)")
+	reject := flag.Bool("reject", false, "reject all shares")
+	silent := flag.Bool("silent", false, "never respond (for lost-share tests)")
 	flag.Parse()
 
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *listen, err)
 	}
-	log.Printf("mockpool listening on %s", *listen)
+	log.Printf("mockpool on %s (difficulty=%v reject=%v silent=%v)",
+		*listen, *difficulty, *reject, *silent)
 
-	// Accept-цикл: каждое соединение обрабатываем в своей goroutine.
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handle(conn)
+		go handle(conn, *difficulty, *reject, *silent)
 	}
 }
 
-// handle обслуживает одно TCP-соединение и отвечает на Stratum-запросы.
-func handle(conn net.Conn) {
+func handle(conn net.Conn, difficulty float64, reject, silent bool) {
 	defer conn.Close()
 	log.Printf("client: %s", conn.RemoteAddr())
 
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
+	write := func(obj map[string]interface{}) {
+		raw, _ := json.Marshal(obj)
+		writer.WriteString(string(raw) + "\n")
+		writer.Flush()
+	}
+
+	// Сложность шлём сразу при подключении — как настоящий пул.
+	if !silent && difficulty > 0 {
+		write(map[string]interface{}{
+			"id":     nil,
+			"method": "mining.set_difficulty",
+			"params": []interface{}{difficulty},
+		})
+	}
+
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
-			return // клиент отключился
+			log.Printf("client gone: %s", conn.RemoteAddr())
+			return
 		}
-
-		var msg poolMessage
-		if err := json.Unmarshal(line, &msg); err != nil {
-			// Это не JSON — игнорируем строку.
+		if silent {
 			continue
 		}
-		log.Printf("recv: %s", string(line))
+		var msg poolMessage
+		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
 
-		// Формируем ответ. id всегда копируем из запроса (JSON-RPC).
-		var resp map[string]interface{}
 		switch msg.Method {
 		case "mining.subscribe":
-			// Результат subscribe: [subscription_id, extranonce1, extranonce2_size]
-			resp = map[string]interface{}{
+			write(map[string]interface{}{
 				"id":     msg.ID,
 				"result": []interface{}{"mock1", "01000000", 4},
 				"error":  nil,
-			}
+			})
 		case "mining.authorize":
-			// Воркер авторизован.
-			resp = map[string]interface{}{
+			write(map[string]interface{}{
 				"id":     msg.ID,
 				"result": true,
 				"error":  nil,
-			}
+			})
 		case "mining.submit":
-			// Шару «принимаем» — это то, что мы считаем выполненной.
-			// Имя воркера берём из params[0].
 			if len(msg.Params) > 0 {
-				log.Printf("SHARE accepted for worker: %v", msg.Params[0])
+				log.Printf("SHARE worker=%v reject=%v", msg.Params[0], reject)
 			}
-			resp = map[string]interface{}{
+			if reject {
+				write(map[string]interface{}{
+					"id":     msg.ID,
+					"result": false,
+					"error":  []interface{}{21, "low difficulty share", nil},
+				})
+				continue
+			}
+			write(map[string]interface{}{
 				"id":     msg.ID,
 				"result": true,
 				"error":  nil,
-			}
+			})
 		default:
-			// Неизвестный метод — отвечаем ошибкой, чтобы запрос не «вис».
-			resp = map[string]interface{}{
+			write(map[string]interface{}{
 				"id":     msg.ID,
 				"result": nil,
 				"error":  []interface{}{20, "unknown method", nil},
-			}
+			})
 		}
-
-		raw, _ := json.Marshal(resp)
-		writer.WriteString(string(raw) + "\n")
-		writer.Flush()
 	}
 }
