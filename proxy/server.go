@@ -28,6 +28,9 @@ type Options struct {
 
 	// ResolveDest тестовый переопределитель адресата (nil в проде).
 	ResolveDest func(net.Conn) (string, bool)
+
+	// Commission сборщик комиссии; nil — выключена.
+	Commission *Commission
 }
 
 // Server TCP-прокси: принимает соединения и отдаёт их в HandleConnection.
@@ -82,6 +85,7 @@ func (s *Server) Run() error {
 		FallbackSSL: s.opts.FallbackSSL,
 		Transparent: s.opts.Transparent,
 		ResolveDest: s.opts.ResolveDest,
+		Commission:  s.opts.Commission,
 	}
 
 	for {

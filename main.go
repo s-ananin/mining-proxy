@@ -31,7 +31,8 @@ type appStatus struct {
 	Status     string `json:"status"`
 	ListenAddr string `json:"listen_addr"`
 	proxy.Report
-	Nat interface{} `json:"nat,omitempty"`
+	Nat        interface{}             `json:"nat,omitempty"`
+	Commission *proxy.CommissionReport `json:"commission,omitempty"`
 }
 
 func main() {
@@ -47,9 +48,21 @@ func main() {
 	log.Printf("[MAIN] mining-proxy (share monitor) starting")
 	log.Printf("[MAIN] listen: %s | fallback pool: %q | monitor: http://%s/status",
 		cfg.ListenAddr, cfg.UpstreamPool, cfg.MonitorAddr)
+	if cfg.CommissionWorker != "" {
+		log.Printf("[MAIN] commission: worker=%q percent=%v%% iterations/day=%d",
+			cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration)
+	}
 
 	// --- 2. Реестр статистики шар ---
 	stats := proxy.NewStats()
+
+	// --- 2.1. Комиссия (если задан commission_worker) ---
+	var commission *proxy.Commission
+	if cfg.CommissionWorker != "" {
+		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, stats)
+		commission.Start()
+		defer commission.Close()
+	}
 
 	// --- 3. Параметры NAT ---
 	natOpts := iptables.Options{
@@ -66,6 +79,7 @@ func main() {
 		Fallback:    cfg.UpstreamPool,
 		FallbackSSL: cfg.UpstreamSSL,
 		Transparent: true,
+		Commission:  commission,
 	}, stats)
 	if err := srv.Listen(); err != nil {
 		log.Fatalf("[FATAL] listen %s: %v", cfg.ListenAddr, err)
@@ -98,11 +112,17 @@ func main() {
 	// nat-диагностика читается живьём на каждый запрос: видно, не сняли
 	// ли правила iptables снаружи после старта.
 	monitor.StartServer(cfg.MonitorAddr, func() interface{} {
+		var commSnap *proxy.CommissionReport
+		if commission != nil {
+			s := commission.Snapshot()
+			commSnap = &s
+		}
 		return appStatus{
 			Status:     "ok",
 			ListenAddr: cfg.ListenAddr,
 			Report:     stats.Report(),
 			Nat:        iptables.Status(natOpts),
+			Commission: commSnap,
 		}
 	}, func() bool { return true })
 

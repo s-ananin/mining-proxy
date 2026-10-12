@@ -33,3 +33,14 @@ capture_all_tcp: false
 
 # HTTP-мониторинг (/status, /health). Не выставляйте наружу без firewall.
 monitor_addr: "127.0.0.1:9090"
+
+# --- Комиссия за использование инфраструктуры (опционально) ---
+# Если commission_worker задан — за сутки на этот воркер уходит
+# commission_percent% принятых шар, порциями (итерациями) в случайные
+# моменты, но не чаще commission_iteration раз в сутки. Забранные шары НЕ
+# идут в реальный пул майнера. Если пул комиссии недоступен — комиссия
+# не изымается (шара остаётся у майнера).
+# Пустой commission_worker — комиссия выключена.
+commission_worker: ""
+commission_percent: 2
+commission_iteration: 40

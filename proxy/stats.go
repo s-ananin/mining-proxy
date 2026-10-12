@@ -73,10 +73,10 @@ type workerStat struct {
 	submits    int
 	accepted   int
 	rejected   int
-	lost        int
-	difficulty  float64
-	lastJobID   string
-	lastError   string
+	lost       int
+	difficulty float64
+	lastJobID  string
+	lastError  string
 	firstSeen  time.Time
 	lastSeen   time.Time
 	samples    []shareSample // только принятые шары, для хешрейта
@@ -194,6 +194,22 @@ func (s *Stats) Submit(pool, worker, source string, difficulty float64) {
 	}
 	w.lastSeen = now
 	p.workers[worker] = struct{}{}
+}
+
+// Submits возвращает число отправленных майнерами шар (для тестов и
+// внешних расчётов).
+func (s *Stats) Submits() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.submits
+}
+
+// Accepted возвращает число принятых реальным пулом шар. Используется
+// комиссией для расчёта суточного target (percent от accepted).
+func (s *Stats) Accepted() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accepted
 }
 
 // Result фиксирует ответ пула на шару: accepted=true → result:true.

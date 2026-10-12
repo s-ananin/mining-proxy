@@ -59,6 +59,9 @@ type ProxyPass struct {
 	// ResolveDest переопределение адресата — ТОЛЬКО для тестов
 	// (эмуляция DNAT без root и iptables). В проде nil.
 	ResolveDest func(net.Conn) (string, bool)
+
+	// Commission сборщик комиссии; nil — комиссия выключена.
+	Commission *Commission
 }
 
 // HandleConnection обслуживает одно соединение от майнера до самого конца:
@@ -115,7 +118,7 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 	done := make(chan struct{}, 2)
 	if stratum {
 		go func() {
-			pipeMinerToPool(clientConn, reader, upstream, se)
+			pipeMinerToPool(clientConn, reader, upstream, se, pass.Commission)
 			done <- struct{}{}
 		}()
 		go func() {
@@ -202,8 +205,9 @@ func sniffStratum(reader *bufio.Reader) (bool, [][]byte) {
 
 // pipeMinerToPool ведёт поток майнер → пул построчно и считает шары:
 // authorize привязывает воркера, submit штампуется сложностью и
-// регистрируется в таблице ожидающих ответа.
-func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session) {
+// регистрируется в таблице ожидающих ответа. Если шара забрана комиссией
+// (Redirect вернул true) — в реальный пул она НЕ отправляется.
+func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session, commission *Commission) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
 
@@ -214,12 +218,14 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		}
 		line := scanner.Bytes()
 
-		switch {
-		case IsMinerAuthorize(line):
-			se.authorize(WorkerFromAuthorize(line))
-		case IsMinerSubmit(line):
+		if IsMinerSubmit(line) {
+			if commission != nil && commission.Redirect(line, se.pool) {
+				continue
+			}
 			id, _ := SubmitID(line)
 			se.submit(id, WorkerFromSubmit(line))
+		} else if IsMinerAuthorize(line) {
+			se.authorize(WorkerFromAuthorize(line))
 		}
 
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))

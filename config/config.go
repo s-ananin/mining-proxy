@@ -51,6 +51,19 @@ type Config struct {
 	// Дефолт "127.0.0.1:9090"; наружу не выставляйте без firewall.
 	MonitorAddr string `yaml:"monitor_addr"`
 
+	// CommissionWorker воркер, на который уходит комиссия. Пусто = комиссия
+	// выключена. Шары комиссии НЕ идут в реальный пул майнера: они забираются
+	// в выделенное соединение под этим воркером (см. proxy/commission.go).
+	CommissionWorker string `yaml:"commission_worker"`
+
+	// CommissionPercent процент принятых за сутки шар, изымаемый в комиссию.
+	// Дефолт 2. Применяется только если CommissionWorker задан.
+	CommissionPercent float64 `yaml:"commission_percent"`
+
+	// CommissionIteration сколько итераций изъятия за сутки (на случайные
+	// моменты). Дефолт 40. Применяется только если CommissionWorker задан.
+	CommissionIteration int `yaml:"commission_iteration"`
+
 	// UpstreamPort порт UpstreamPool — производное поле для DNAT-фильтра
 	// (--dport). Тег yaml:"-" — не читается из файла.
 	UpstreamPort string `yaml:"-"`
@@ -111,6 +124,20 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("upstream_pool: %w", err)
 		}
 		cfg.UpstreamPort = port
+	}
+
+	// Комиссия: дефолты и валидация только когда воркер задан. Пусто —
+	// комиссия полностью выключена, остальные поля не читаются.
+	if cfg.CommissionWorker != "" {
+		if cfg.CommissionPercent == 0 {
+			cfg.CommissionPercent = 2 // дефолт по ТЗ
+		}
+		if cfg.CommissionPercent < 0 || cfg.CommissionPercent > 100 {
+			return nil, fmt.Errorf("commission_percent %v вне диапазона (0..100)", cfg.CommissionPercent)
+		}
+		if cfg.CommissionIteration <= 0 {
+			cfg.CommissionIteration = 40 // дефолт по ТЗ
+		}
 	}
 
 	return &cfg, nil
