@@ -92,6 +92,19 @@ func (s *session) setDifficulty(diff float64) {
 	}
 }
 
+// setJobID запоминает последний mining.notify (id задания) для текущего
+// воркера сессии — виден в /status как last_job_id.
+func (s *session) setJobID(jobID string) {
+	if jobID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.worker != "" {
+		s.stats.SetJobID(s.pool, s.worker, jobID)
+	}
+}
+
 // submit фиксирует mining.submit: штампует шару текущей сложностью,
 // кладёт её в таблицу ожидающих и увеличивает счётчики. Если майнер в
 // submit назвал другого воркера — привязка переносится.

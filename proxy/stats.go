@@ -73,9 +73,10 @@ type workerStat struct {
 	submits    int
 	accepted   int
 	rejected   int
-	lost       int
-	difficulty float64
-	lastError  string
+	lost        int
+	difficulty  float64
+	lastJobID   string
+	lastError   string
 	firstSeen  time.Time
 	lastSeen   time.Time
 	samples    []shareSample // только принятые шары, для хешрейта
@@ -242,6 +243,14 @@ func (s *Stats) SetDifficulty(pool, worker string, difficulty float64) {
 	w.difficulty = difficulty
 }
 
+// SetJobID запоминает последний id задания воркера из mining.notify.
+func (s *Stats) SetJobID(pool, worker, jobID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w := s.getWorker(pool, worker, time.Now())
+	w.lastJobID = jobID
+}
+
 // trimSamples выкидывает сэмплы старше hashrateWindow и ограничивает
 // хранилище maxShareSamples последних. Возвращает новый срез — вызывающая
 // сторона обязана переприсвоить поле.
@@ -292,6 +301,7 @@ type WorkerReport struct {
 	Lost            int     `json:"lost"`
 	AcceptedPercent float64 `json:"accepted_percent"`
 	Hashrate        int64   `json:"hashrate"`
+	LastJobID       string  `json:"last_job_id,omitempty"`
 	LastError       string  `json:"last_error,omitempty"`
 	FirstSeen       string  `json:"first_seen"`
 	LastSeen        string  `json:"last_seen"`
@@ -380,6 +390,7 @@ func (s *Stats) Report() Report {
 			Lost:            w.lost,
 			AcceptedPercent: percent(w.accepted, w.submits),
 			Hashrate:        hr,
+			LastJobID:       w.lastJobID,
 			LastError:       w.lastError,
 			FirstSeen:       w.firstSeen.Format(time.RFC3339),
 			LastSeen:        w.lastSeen.Format(time.RFC3339),

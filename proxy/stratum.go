@@ -143,6 +143,24 @@ func ParsePoolResponse(raw []byte) (PoolResponse, bool) {
 	return resp, true
 }
 
+// JobIDFromNotify достаёт id задания из mining.notify (пул → майнер):
+// params[0] — работа, на которой сейчас считает майнер.
+func JobIDFromNotify(raw []byte) (string, bool) {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != "mining.notify" {
+		return "", false
+	}
+	var params []json.RawMessage
+	if err := json.Unmarshal(msg.Params, &params); err != nil || len(params) == 0 {
+		return "", false
+	}
+	var id string
+	if err := json.Unmarshal(params[0], &id); err != nil {
+		return "", false
+	}
+	return id, true
+}
+
 // ParseSetDifficulty разбирает mining.set_difficulty (пул → майнер):
 // params[0] — новая сложность. По ней считается хешрейт воркера.
 func ParseSetDifficulty(raw []byte) (float64, bool) {

@@ -248,6 +248,8 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 			se.setDifficulty(diff)
 		} else if resp, ok := ParsePoolResponse(line); ok {
 			se.resolve(resp)
+		} else if jobID, ok := JobIDFromNotify(line); ok {
+			se.setJobID(jobID)
 		}
 
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
