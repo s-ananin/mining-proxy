@@ -349,6 +349,11 @@ func (c *Commission) Redirect(submitRaw []byte, pool string) (swallowed bool) {
 		}
 		resp, ok := ParsePoolResponse(line)
 		if ok {
+			if resp.Accepted {
+				log.Printf("[COMMISSION] шара зачтена воркеру %q (пул %s)", c.worker, pool)
+			} else {
+				log.Printf("[COMMISSION] пул %s отклонил шару воркера %q: %s", pool, c.worker, resp.Error)
+			}
 			c.countResult(resp.Accepted)
 			return true
 		}
