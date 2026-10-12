@@ -84,7 +84,7 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 	}
 
 	source := sourceHost(clientConn.RemoteAddr())
-	se := newSession(stats, dest, source)
+	se := newSession(stats, dest, source, pass.Commission)
 	defer se.close()
 
 	// --- 2. Подключаемся к реальному пулу ---
@@ -205,8 +205,11 @@ func sniffStratum(reader *bufio.Reader) (bool, [][]byte) {
 
 // pipeMinerToPool ведёт поток майнер → пул построчно и считает шары:
 // authorize привязывает воркера, submit штампуется сложностью и
-// регистрируется в таблице ожидающих ответа. Если шара забрана комиссией
-// (Redirect вернул true) — в реальный пул она НЕ отправляется.
+// регистрируется в таблице ожидающих ответа.
+//
+// Если комиссия забирает шару (reserve вернул true и воркер переписан) —
+// шара уходит в тот же upstream с подменённым params[0]; ответ пула вернётся
+// майнеру по его id, но зачтётся в счётчики комиссии.
 func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session, commission *Commission) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
@@ -219,10 +222,25 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		line := scanner.Bytes()
 
 		if IsMinerSubmit(line) {
-			if commission != nil && commission.Redirect(line, se.pool) {
-				continue
-			}
 			id, _ := SubmitID(line)
+			if id != "" && commission != nil && commission.reserve() {
+				rewritten, err := rewriteSubmitWorker(line, commission.worker)
+				if err == nil {
+					commission.countAttempt()
+					se.markCommissionSubmit(id)
+					log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s)",
+						commission.worker, se.pool, id)
+					line = rewritten
+					dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+					if werr := writeLine(dst, line); werr != nil {
+						log.Printf("[CONN] miner->pool write: %v", werr)
+						return
+					}
+					continue
+				}
+				// Переписать не удалось — fail-open: шару не трогаем.
+				commission.countFailed()
+			}
 			se.submit(id, WorkerFromSubmit(line))
 		} else if IsMinerAuthorize(line) {
 			se.authorize(WorkerFromAuthorize(line))

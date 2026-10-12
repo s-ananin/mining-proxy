@@ -13,36 +13,42 @@
 package proxy
 
 import (
+	"log"
 	"sync"
 	"time"
 )
 
-// pendingShare — отправленная шара, ждущая ответа пула.
+// pendingShare — отправленная шара, ждущая ответа пула. commission = true,
+// если шара забрана комиссией (ответ учтётся в счётчиках комиссии, а не в
+// статистике воркера майнера).
 type pendingShare struct {
-	worker string
-	diff   float64
-	at     time.Time
+	worker     string
+	diff       float64
+	at         time.Time
+	commission bool
 }
 
 // session — привязка соединения к реестру статистики.
 type session struct {
-	mu      sync.Mutex
-	stats   *Stats
-	pool    string // адресат соединения (реальный пул из DNAT)
-	source  string // IP майнера (без порта)
-	worker  string // текущий воркер (пусто, пока не авторизовался)
-	diff    float64
-	pending map[string]pendingShare
-	closed  bool
+	mu         sync.Mutex
+	stats      *Stats
+	pool       string // адресат соединения (реальный пул из DNAT)
+	source     string // IP майнера (без порта)
+	worker     string // текущий воркер (пусто, пока не авторизовался)
+	diff       float64
+	pending    map[string]pendingShare
+	closed     bool
+	commission *Commission // сборщик комиссии; nil — выключена
 }
 
 // newSession регистрирует соединение в реестре.
-func newSession(stats *Stats, pool, source string) *session {
+func newSession(stats *Stats, pool, source string, commission *Commission) *session {
 	s := &session{
-		stats:   stats,
-		pool:    pool,
-		source:  source,
-		pending: map[string]pendingShare{},
+		stats:      stats,
+		pool:       pool,
+		source:     source,
+		pending:    map[string]pendingShare{},
+		commission: commission,
 	}
 	s.stats.Connect(pool)
 	return s
@@ -129,6 +135,9 @@ func (s *session) submit(id, worker string) {
 	for k, p := range s.pending {
 		if now.Sub(p.at) > pendingTimeout {
 			delete(s.pending, k)
+			if p.commission {
+				continue // комиссионные в lost воркера не пишем
+			}
 			s.stats.LostShare(s.pool, p.worker)
 		}
 	}
@@ -137,6 +146,18 @@ func (s *session) submit(id, worker string) {
 	if id != "" {
 		s.pending[id] = pendingShare{worker: w, diff: s.diff, at: now}
 	}
+}
+
+// markCommissionSubmit регистрирует забранную комиссией шару как ожидающую
+// ответа пула. Ответ по её id уйдёт в счётчики комиссии, а не воркеру
+// майнера (см. resolve).
+func (s *session) markCommissionSubmit(id string) {
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pending[id] = pendingShare{commission: true, at: time.Now()}
 }
 
 // resolve закрывает шару по ответу пула. Возвращает false, если id не
@@ -152,6 +173,17 @@ func (s *session) resolve(resp PoolResponse) bool {
 	if !ok {
 		return false
 	}
+	if p.commission {
+		if s.commission != nil {
+			s.commission.countResult(resp.Accepted)
+			if resp.Accepted {
+				log.Printf("[COMMISSION] пул %s зачёл шару воркера %q", s.pool, s.commission.worker)
+			} else {
+				log.Printf("[COMMISSION] пул %s отклонил шару воркера %q: %s", s.pool, s.commission.worker, resp.Error)
+			}
+		}
+		return true
+	}
 	s.stats.Result(s.pool, p.worker, p.diff, resp.Accepted, resp.Error)
 	return true
 }
@@ -166,6 +198,9 @@ func (s *session) close() {
 	}
 	s.closed = true
 	for _, p := range s.pending {
+		if p.commission {
+			continue // комиссионные шары в lost воркера не пишем
+		}
 		s.stats.LostShare(s.pool, p.worker)
 	}
 	s.pending = nil

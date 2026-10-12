@@ -17,12 +17,12 @@
 //     2) случайные итерации (commission_iteration, дефолт 40/сутки):
 //     batch = ceil((target - уже взято) / оставшиеся итерации). Так процент
 //     сходится к target, а число изъятий не превышает commission_iteration;
-//   - в момент итерации следующие batch mining.submit из ЛЮБОГО ASIC не уходят
-//     в его реальный пул, а перенаправляются на выделенное соединение с
-//     commission_worker (subscribe+authorize), где воркер шары переписан;
-//   - fail-open: если пул комиссии недоступен или перенаправление не удалось,
-//     шара остаётся у майнера (идёт в реальный пул как обычно), комиссия
-//     НЕ изымается. Майнинг клиента не прерывается никогда.
+//   - в момент итерации следующие batch mining.submit из ЛЮБОГО ASIC
+//     отправляются в ТОТ ЖЕ upstream-соединение майнера (не в реальный пул под
+//     его воркером), но с подменённым params[0] = commission_worker. job_id и
+//     extranonce1 соединения сохраняются, поэтому шара остаётся валидной;
+//   - fail-open: если переписать шару не удалось, она уходит как обычно,
+//     комиссия НЕ изымается. Майнинг клиента не прерывается никогда.
 //
 // Комиссия учитывается в своих счётчиках (/status.commission) и НЕ влияет на
 // totals/workers штатного мониторинга: забранные шары не регистрируются как
@@ -30,28 +30,16 @@
 package proxy
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
-	"net"
-	"strconv"
 	"sync"
 	"time"
 )
 
-// Таймауты и окно комиссионного изъятия.
+// Окно комиссионного изъятия.
 const (
-	// commissionDialTimeout TCP-подключение к пулу комиссии.
-	commissionDialTimeout = 10 * time.Second
-
-	// commissionHandshakeTimeout полный handshake (subscribe+authorize).
-	commissionHandshakeTimeout = 30 * time.Second
-
-	// commissionForwardTimeout ожидание ответа пула на перенаправленную шару.
-	commissionForwardTimeout = 5 * time.Second
-
 	// commissionWindow суточное окно изъятий (скользящее).
 	commissionWindow = 24 * time.Hour
 
@@ -59,19 +47,13 @@ const (
 	commissionMinGap = time.Minute
 )
 
-// commissionConn — выделенное соединение к пулу с commission_worker.
-// subscribe+authorize выполняются один раз, дальше переиспользуется.
-type commissionConn struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	seq    int // последовательный id наших перенаправленных submit
-}
-
 // Commission — сборщик комиссии. Потокобезопасен (mu).
 //
-// Для каждого пула, на который ходят ASIC, держится отдельное соединение с
-// commission_worker (воркер одинаковый, пулы разные). Решения по изъятию
-// принимаются глобально по всем ASIC, как и процент в ТЗ (25000 -> 500).
+// Изъятие идёт НА СОЕДИНЕНИИ МАЙНЕРА: шара, которую забрали, не уходит в
+// реальный пул майнера, а отправляется в тот же upstream с подменённым
+// воркером (params[0]). Так сохраняются job_id и extranonce1 соединения, и
+// шара остаётся валидной для пула. Решения по изъятию принимаются глобально
+// по всем ASIC, как и процент в ТЗ (25000 -> 500).
 type Commission struct {
 	mu   sync.Mutex
 	stop chan struct{}
@@ -96,9 +78,6 @@ type Commission struct {
 	takeBudget      int // сколько следующих шар забрать (порция итерации)
 	budgetIssued    int // выдано бюджета за окно (interval-режим, кап на target)
 	nextIterationAt time.Time
-
-	// Выделенные соединения к пулам: pool address → conn.
-	conns map[string]*commissionConn
 
 	rng *rand.Rand
 }
@@ -126,7 +105,6 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 		stats:            stats,
 		windowStart:      now,
 		baseAccepted:     stats.Accepted(),
-		conns:            map[string]*commissionConn{},
 		rng:              rand.New(rand.NewSource(now.UnixNano())),
 	}
 }
@@ -147,7 +125,7 @@ func (c *Commission) Start() {
 	go c.scheduler()
 }
 
-// Close останавливает планировщик и закрывает соединения к пулам.
+// Close останавливает планировщик изъятия.
 func (c *Commission) Close() {
 	select {
 	case <-c.stop:
@@ -156,13 +134,6 @@ func (c *Commission) Close() {
 		close(c.stop)
 	}
 	c.wg.Wait()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, cc := range c.conns {
-		cc.conn.Close()
-	}
-	c.conns = map[string]*commissionConn{}
 }
 
 // scheduler будит комиссию в моменты итераций. В interval-режиме — ровно
@@ -289,165 +260,28 @@ func planBatch(acceptedToday, taken, iterationsLeft int, percent float64) int {
 	return (need + iterationsLeft - 1) / iterationsLeft
 }
 
-// Redirect обрабатывает mining.submit от ASIC.
-//
-// Возвращает true, если шара ЗАБРАНА: ушла на commission_worker, в реальный
-// пул майнера НЕ отправляется (вызывающий не должен писать её в upstream).
-// Возвращает false, если шара остаётся майнеру: комиссия выключена, бюджет
-// исчерпан или перенаправление не удалось (fail-open — комиссия не
-// изымается при недоступном пуле).
-//
-// После успешной записи в пул комиссии шара считается забранной ВСЕГДА
-// (ответ читается только для счётчиков): дубль в реальный пул не шлём.
-func (c *Commission) Redirect(submitRaw []byte, pool string) (swallowed bool) {
-	if c.worker == "" {
-		return false
-	}
-
+// reserve пытается зарезервировать одну шару под комиссию. true — бюджет
+// есть: вызывающий должен переписать воркера шары и отправить её в тот же
+// upstream. Потокобезопасно.
+func (c *Commission) reserve() bool {
 	c.mu.Lock()
-	if c.takeBudget <= 0 {
-		c.mu.Unlock()
+	defer c.mu.Unlock()
+	if c.worker == "" || c.takeBudget <= 0 {
 		return false
 	}
 	c.takeBudget--
-	cc := c.connForLocked(pool)
-	c.mu.Unlock()
-
-	if cc == nil {
-		// Пул комиссии недоступен — шару не трогаем (fail-open).
-		c.countFailed()
-		return false
-	}
-
-	cc.conn.SetWriteDeadline(time.Now().Add(commissionForwardTimeout))
-	c.mu.Lock()
-	cc.seq++
-	raw, err := rewriteSubmitWorker(submitRaw, c.worker, cc.seq)
-	c.mu.Unlock()
-	if err != nil {
-		log.Printf("[COMMISSION] rewrite worker %q: %v", c.worker, err)
-		c.countFailed()
-		return false
-	}
-
-	if _, err := cc.conn.Write(append(raw, '\n')); err != nil {
-		log.Printf("[COMMISSION] write %s: %v (reconnect next time)", pool, err)
-		c.dropConn(pool, cc)
-		c.countFailed()
-		return false
-	}
-	c.countAttempt()
-
-	// Ответ читаем до timeout; счётчики accepted/rejected пополняются по
-	// живому ответу пула. Ошибка чтения на swallow не влияет.
-	cc.conn.SetReadDeadline(time.Now().Add(commissionForwardTimeout))
-	for {
-		line, err := cc.reader.ReadBytes('\n')
-		if err != nil {
-			c.dropConn(pool, cc)
-			return true
-		}
-		resp, ok := ParsePoolResponse(line)
-		if ok {
-			if resp.Accepted {
-				log.Printf("[COMMISSION] шара зачтена воркеру %q (пул %s)", c.worker, pool)
-			} else {
-				log.Printf("[COMMISSION] пул %s отклонил шару воркера %q: %s", pool, c.worker, resp.Error)
-			}
-			c.countResult(resp.Accepted)
-			return true
-		}
-	}
-}
-
-// connForLocked возвращает (или создаёт) соединение к пулу под
-// commission_worker. Вызывается под c.mu. При неудаче вернёт nil.
-func (c *Commission) connForLocked(pool string) *commissionConn {
-	if cc, ok := c.conns[pool]; ok {
-		return cc
-	}
-	cc, err := c.dialAndHandshake(pool)
-	if err != nil {
-		log.Printf("[COMMISSION] connect %s (worker %q): %v", pool, c.worker, err)
-		return nil
-	}
-	c.conns[pool] = cc
-	return cc
-}
-
-// dialAndHandshake подключается к пулу и выполняет полный Stratum handshake:
-// mining.subscribe → ответ, mining.authorize (commission_worker) → ответ.
-func (c *Commission) dialAndHandshake(pool string) (*commissionConn, error) {
-	conn, err := net.DialTimeout("tcp", pool, commissionDialTimeout)
-	if err != nil {
-		return nil, err
-	}
-	deadline := time.Now().Add(commissionHandshakeTimeout)
-	conn.SetDeadline(deadline)
-	reader := bufio.NewReader(conn)
-
-	sub, _ := json.Marshal(map[string]interface{}{
-		"id": 1, "method": "mining.subscribe", "params": []string{"mining-proxy/commission/1.0"},
-	})
-	if _, err := conn.Write(append(sub, '\n')); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	if _, err := readHandshakeResp(reader, 1); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	auth, _ := json.Marshal(map[string]interface{}{
-		"id": 2, "method": "mining.authorize", "params": []string{c.worker, ""},
-	})
-	if _, err := conn.Write(append(auth, '\n')); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	resp, err := readHandshakeResp(reader, 2)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	var ar struct {
-		Result json.RawMessage `json:"result"`
-	}
-	if json.Unmarshal(resp, &ar) == nil && string(ar.Result) != "true" {
-		conn.Close()
-		return nil, fmt.Errorf("authorize rejected (worker %q)", c.worker)
-	}
-
-	conn.SetDeadline(time.Time{})
-	return &commissionConn{conn: conn, reader: reader}, nil
-}
-
-// readHandshakeResp читает строки, пока не придёт ответ с нужным id
-// (без method — это ответ на наш запрос, а не notify/set_difficulty).
-func readHandshakeResp(r *bufio.Reader, wantID int) ([]byte, error) {
-	want := strconv.Itoa(wantID)
-	for {
-		line, err := r.ReadBytes('\n')
-		if err != nil {
-			return nil, err
-		}
-		msg, err := Parse(line)
-		if err != nil {
-			continue
-		}
-		if msg.Method == "" && string(msg.ID) == want {
-			return line, nil
-		}
-	}
+	return true
 }
 
 // rewriteSubmitWorker переписывает в mining.submit имя воркера (params[0])
-// на newWorker и ставит последовательный id. Остаток шары (job_id, nonce2,
-// ntime, nonce) сохраняется — это «перекосит» шару на commission_worker.
-func rewriteSubmitWorker(raw []byte, newWorker string, id int) ([]byte, error) {
+// на newWorker, СОХРАНЯЯ id шары (чтобы ответ пула вернулся майнеру по его
+// id). Остаток шары (job_id, extranonce2, ntime, nonce) не трогаем — на
+// соединении майнера шара остаётся валидной.
+func rewriteSubmitWorker(raw []byte, newWorker string) ([]byte, error) {
 	var msg struct {
-		Method string          `json:"method"`
-		Params json.RawMessage `json:"params"`
+		ID     json.RawMessage   `json:"id"`
+		Method string            `json:"method"`
+		Params []json.RawMessage `json:"params"`
 	}
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return nil, err
@@ -455,33 +289,15 @@ func rewriteSubmitWorker(raw []byte, newWorker string, id int) ([]byte, error) {
 	if msg.Method != "mining.submit" {
 		return nil, fmt.Errorf("not mining.submit")
 	}
-	var params []json.RawMessage
-	if err := json.Unmarshal(msg.Params, &params); err != nil || len(params) == 0 {
+	if len(msg.Params) == 0 {
 		return nil, fmt.Errorf("bad submit params")
 	}
-	params[0], _ = json.Marshal(newWorker)
-	newParams, err := json.Marshal(params)
-	if err != nil {
-		return nil, err
-	}
+	msg.Params[0], _ = json.Marshal(newWorker)
 	return json.Marshal(struct {
-		ID     int             `json:"id"`
-		Method string          `json:"method"`
-		Params json.RawMessage `json:"params"`
-	}{ID: id, Method: msg.Method, Params: newParams})
-}
-
-// dropConn закрывает и удаляет соединение к пулу (следующая шара создаст
-// новое). Безопасно вызывать повторно.
-func (c *Commission) dropConn(pool string, cc *commissionConn) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if cur, ok := c.conns[pool]; ok && cur == cc {
-		delete(c.conns, pool)
-	} else if !ok {
-		return
-	}
-	cc.conn.Close()
+		ID     json.RawMessage   `json:"id"`
+		Method string            `json:"method"`
+		Params []json.RawMessage `json:"params"`
+	}{ID: msg.ID, Method: msg.Method, Params: msg.Params})
 }
 
 // countAttempt / countResult / countFailed обновляют счётчики комиссии.

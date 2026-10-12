@@ -1,9 +1,7 @@
 package proxy
 
 import (
-	"bufio"
 	"encoding/json"
-	"net"
 	"testing"
 	"time"
 )
@@ -35,7 +33,7 @@ func TestPlanBatch(t *testing.T) {
 
 func TestRewriteSubmitWorker(t *testing.T) {
 	raw := []byte(`{"id":7,"method":"mining.submit","params":["ger.w1","job1","n2","nt","nc"]}`)
-	got, err := rewriteSubmitWorker(raw, "test.com", 100)
+	got, err := rewriteSubmitWorker(raw, "test.com")
 	if err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
@@ -48,8 +46,8 @@ func TestRewriteSubmitWorker(t *testing.T) {
 	if err := json.Unmarshal(got, &msg); err != nil {
 		t.Fatalf("unmarshal rewritten: %v (%s)", err, got)
 	}
-	if msg.ID != 100 {
-		t.Errorf("id = %d, want 100", msg.ID)
+	if msg.ID != 7 {
+		t.Errorf("id = %d, want 7 (id шары должен сохраняться)", msg.ID)
 	}
 	if msg.Method != "mining.submit" {
 		t.Errorf("method = %q", msg.Method)
@@ -65,154 +63,80 @@ func TestRewriteSubmitWorker(t *testing.T) {
 	}
 }
 
-// mockPool2 — минимальный Stratum-пул для комиссии: отвечает на
-// subscribe/authorize/submit, запоминает воркеров в submit.
-type mockPool2 struct {
-	addr   string
-	ln     net.Listener
-	gotSub []string
-}
-
-func startMockPool2(t *testing.T) *mockPool2 {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	p := &mockPool2{addr: ln.Addr().String(), ln: ln}
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go p.handle(conn)
-		}
-	}()
-	return p
-}
-
-func (p *mockPool2) handle(conn net.Conn) {
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	w := bufio.NewWriter(conn)
-	write := func(m map[string]interface{}) {
-		raw, _ := json.Marshal(m)
-		w.WriteString(string(raw) + "\n")
-		w.Flush()
-	}
-	for {
-		line, err := r.ReadBytes('\n')
-		if err != nil {
-			return
-		}
-		var msg struct {
-			ID     interface{}   `json:"id"`
-			Method string        `json:"method"`
-			Params []interface{} `json:"params"`
-		}
-		if json.Unmarshal(line, &msg) != nil {
-			continue
-		}
-		switch msg.Method {
-		case "mining.subscribe":
-			write(map[string]interface{}{"id": msg.ID, "result": []interface{}{"sub1", "01000000", 4}, "error": nil})
-		case "mining.authorize":
-			write(map[string]interface{}{"id": msg.ID, "result": true, "error": nil})
-		case "mining.submit":
-			p.gotSub = append(p.gotSub, msg.Params[0].(string))
-			write(map[string]interface{}{"id": msg.ID, "result": true, "error": nil})
-		}
-	}
-}
-
-func (p *mockPool2) Close() { p.ln.Close() }
-
 func TestCommissionDisabled(t *testing.T) {
 	c := NewCommission("", 2, 40, 0, NewStats())
 	if c.Enabled() {
 		t.Error("пустой worker — комиссия должна быть выключена")
 	}
-	if c.Redirect([]byte(`{"id":1,"method":"mining.submit","params":["w","j","n","t","c"]}`), "pool:3333") {
-		t.Error("Redirect должен вернуть false при выключенной комиссии")
+	if c.reserve() {
+		t.Error("reserve должен вернуть false при выключенной комиссии")
 	}
 	if c.Snapshot().Enabled {
 		t.Error("Snapshot.Enabled должен быть false")
 	}
 }
 
-func TestRedirectToCommissionPool(t *testing.T) {
-	pool := startMockPool2(t)
-	defer pool.Close()
-
+// TestCommissionStealAndCount проверяет полный цикл: бюджет → переписывание
+// воркера → ответ пула зачитывается в счётчики комиссии, а не воркера.
+func TestCommissionStealAndCount(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("test.com", 2, 40, 0, stats)
-	c.takeBudget = 2 // одна итерация на 2 шары
+	c.takeBudget = 2
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
 
-	submit := func() []byte {
-		b, _ := json.Marshal(map[string]interface{}{
-			"id": 1, "method": "mining.submit",
-			"params": []interface{}{"client.w", "job1", "n2", "nt", "nc"},
-		})
-		return b
+	line := []byte(`{"id":7,"method":"mining.submit","params":["w","j","n2","nt","nc"]}`)
+
+	// Шара 1: забрана, пул принял.
+	if !c.reserve() {
+		t.Fatal("первый reserve должен выдать бюджет")
+	}
+	rewritten, err := rewriteSubmitWorker(line, c.worker)
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	var rew struct {
+		ID     int      `json:"id"`
+		Params []string `json:"params"`
+	}
+	if err := json.Unmarshal(rewritten, &rew); err != nil {
+		t.Fatalf("unmarshal rewritten: %v", err)
+	}
+	if rew.ID != 7 || rew.Params[0] != "test.com" {
+		t.Errorf("переписанная шара: id=%d worker=%q, want 7/test.com", rew.ID, rew.Params[0])
+	}
+	c.countAttempt()
+	se.markCommissionSubmit("7")
+	if !se.resolve(PoolResponse{ID: "7", Accepted: true}) {
+		t.Fatal("resolve комиссионной шары должен вернуть true")
 	}
 
-	// Первые две шары забраны (ушли на test.com).
-	if !c.Redirect(submit(), pool.addr) {
-		t.Fatal("первая шара должна быть забрана")
+	// Шара 2: забрана, пул отклонил.
+	if !c.reserve() {
+		t.Fatal("второй reserve должен выдать бюджет")
 	}
-	if !c.Redirect(submit(), pool.addr) {
-		t.Fatal("вторая шара должна быть забрана")
-	}
-	// Бюджет исчерпан — следующая остаётся майнеру.
-	if c.Redirect(submit(), pool.addr) {
-		t.Fatal("третья шара (вне бюджета) не должна быть забрана")
-	}
+	c.countAttempt()
+	se.markCommissionSubmit("8")
+	se.resolve(PoolResponse{ID: "8", Accepted: false, Error: "unknown job id"})
 
-	if len(pool.gotSub) != 2 {
-		t.Fatalf("пул комиссии получил %d submit, want 2", len(pool.gotSub))
+	// Шара 3: бюджет исчерпан — остаётся майнеру.
+	if c.reserve() {
+		t.Fatal("третий reserve не должен выдавать бюджет")
 	}
-	for i, w := range pool.gotSub {
-		if w != "test.com" {
-			t.Errorf("submit[%d] worker = %q, want test.com", i, w)
-		}
-	}
+	se.submit("9", "w")
+	se.resolve(PoolResponse{ID: "9", Accepted: true})
 
 	snap := c.Snapshot()
-	if !snap.Enabled || snap.Worker != "test.com" {
-		t.Errorf("snapshot = %+v", snap)
-	}
-	if snap.Attempts != 2 || snap.Accepted != 2 || snap.Rejected != 0 {
-		t.Errorf("counters = attempts=%d accepted=%d rejected=%d, want 2/2/0",
+	if snap.Attempts != 2 || snap.Accepted != 1 || snap.Rejected != 1 {
+		t.Errorf("счётчики комиссии = attempts=%d accepted=%d rejected=%d, want 2/1/1",
 			snap.Attempts, snap.Accepted, snap.Rejected)
 	}
-	if snap.TakenToday != 2 {
-		t.Errorf("taken_today = %d, want 2", snap.TakenToday)
+	if snap.TakenToday != 1 {
+		t.Errorf("taken_today = %d, want 1", snap.TakenToday)
 	}
-}
-
-func TestRedirectFailOpenWhenCommissionPoolDown(t *testing.T) {
-	// Порт, который никто не слушает: пул комиссии недоступен.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadPool := ln.Addr().String()
-	ln.Close()
-
-	c := NewCommission("test.com", 2, 40, 0, NewStats())
-	c.takeBudget = 1
-
-	raw := []byte(`{"id":1,"method":"mining.submit","params":["w","j","n","t","c"]}`)
-	if c.Redirect(raw, deadPool) {
-		t.Fatal("шара не должна быть забрана при недоступном пуле комиссии (fail-open)")
-	}
-	snap := c.Snapshot()
-	if snap.Failed != 1 {
-		t.Errorf("failed = %d, want 1", snap.Failed)
-	}
-	if snap.Attempts != 0 {
-		t.Errorf("attempts = %d, want 0 (шара не доставлена)", snap.Attempts)
+	// Майнеру засчитана только третья шара — комиссионные в stats не попали.
+	if stats.Submits() != 1 || stats.Accepted() != 1 {
+		t.Errorf("майнерские submits=%d accepted=%d, want 1/1", stats.Submits(), stats.Accepted())
 	}
 }
 
