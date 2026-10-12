@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeTmp создаёт временный YAML-файл и возвращает путь к нему.
@@ -69,6 +70,35 @@ func TestLoadBadListenFails(t *testing.T) {
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(os.TempDir(), "no-such-mp-config.yaml")); err == nil {
 		t.Fatal("отсутствующий файл должен давать ошибку")
+	}
+}
+
+func TestLoadCommissionInterval(t *testing.T) {
+	path := writeTmp(t, "commission_worker: \"me\"\ncommission_interval: \"10m\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CommissionEvery != 10*time.Minute {
+		t.Errorf("CommissionEvery = %v, want 10m", cfg.CommissionEvery)
+	}
+}
+
+func TestLoadBadCommissionIntervalFails(t *testing.T) {
+	path := writeTmp(t, "commission_worker: \"me\"\ncommission_interval: \"not-a-duration\"\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("некорректный commission_interval должен давать ошибку")
+	}
+}
+
+func TestLoadCommissionIntervalIgnoredWithoutWorker(t *testing.T) {
+	path := writeTmp(t, "commission_interval: \"10m\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CommissionEvery != 0 {
+		t.Errorf("без commission_worker интервал не должен применяться: %v", cfg.CommissionEvery)
 	}
 }
 

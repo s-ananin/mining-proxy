@@ -12,6 +12,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -61,8 +62,19 @@ type Config struct {
 	CommissionPercent float64 `yaml:"commission_percent"`
 
 	// CommissionIteration сколько итераций изъятия за сутки (на случайные
-	// моменты). Дефолт 40. Применяется только если CommissionWorker задан.
+	// моменты). Дефолт 40. Применяется только если CommissionWorker задан и
+	// CommissionInterval пуст.
 	CommissionIteration int `yaml:"commission_iteration"`
+
+	// CommissionInterval фиксированный интервал изъятия (Go-длительность,
+	// например "10m"): изъятие идёт ровными порциями каждые N, пропорционально
+	// принятым за интервал шарам, суммарно не более CommissionPercent% в сутки.
+	// Пусто — случайные итерации CommissionIteration раз в сутки.
+	CommissionInterval string `yaml:"commission_interval"`
+
+	// CommissionEvery распарсенный CommissionInterval — производное поле
+	// (не читается из файла).
+	CommissionEvery time.Duration `yaml:"-"`
 
 	// UpstreamPort порт UpstreamPool — производное поле для DNAT-фильтра
 	// (--dport). Тег yaml:"-" — не читается из файла.
@@ -137,6 +149,18 @@ func Load(path string) (*Config, error) {
 		}
 		if cfg.CommissionIteration <= 0 {
 			cfg.CommissionIteration = 40 // дефолт по ТЗ
+		}
+		// Фиксированный интервал (если задан) имеет приоритет над
+		// commission_iteration: число изъятий выводится из интервала.
+		if cfg.CommissionInterval != "" {
+			d, err := time.ParseDuration(cfg.CommissionInterval)
+			if err != nil {
+				return nil, fmt.Errorf("invalid commission_interval %q: %w", cfg.CommissionInterval, err)
+			}
+			if d <= 0 || d > 24*time.Hour {
+				return nil, fmt.Errorf("commission_interval %v вне диапазона (0..24h)", d)
+			}
+			cfg.CommissionEvery = d
 		}
 	}
 

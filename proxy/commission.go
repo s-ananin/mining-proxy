@@ -8,7 +8,13 @@
 //
 //   - суточное окно (скользящие 24h): target = процент от принятых за окно
 //     шар (accepted реестра Stats — подтверждённые реальным пулом);
-//   - планировщик N раз в сутки в случайный момент «снимает» порцию шар:
+//   - есть два режима изъятия:
+//     1) фиксированный интервал (commission_interval, напр. "10m"):
+//     каждые N планировщик добирает бюджет до target. target растёт по мере
+//     принятия шар, поэтому порция пропорциональна принятым за интервал
+//     шарам, а сумма выданного бюджета никогда не превышает target
+//     (кап — commission_percent% за сутки);
+//     2) случайные итерации (commission_iteration, дефолт 40/сутки):
 //     batch = ceil((target - уже взято) / оставшиеся итерации). Так процент
 //     сходится к target, а число изъятий не превышает commission_iteration;
 //   - в момент итерации следующие batch mining.submit из ЛЮБОГО ASIC не уходят
@@ -75,6 +81,7 @@ type Commission struct {
 	worker           string
 	percent          float64
 	iterationsPerDay int
+	interval         time.Duration // >0 — фиксированный интервал изъятия
 	stats            *Stats
 
 	// Состояние суточного окна.
@@ -87,6 +94,7 @@ type Commission struct {
 	failedCnt       int // ошибок перенаправления / недоступности пула
 	iterationsUsed  int // итераций в текущем окне
 	takeBudget      int // сколько следующих шар забрать (порция итерации)
+	budgetIssued    int // выдано бюджета за окно (interval-режим, кап на target)
 	nextIterationAt time.Time
 
 	// Выделенные соединения к пулам: pool address → conn.
@@ -97,13 +105,24 @@ type Commission struct {
 
 // NewCommission создаёт сборщик комиссии. worker == "" — комиссия
 // выключена: Redirect всегда вернёт false, Start ничего не планирует.
-func NewCommission(worker string, percent float64, iterationsPerDay int, stats *Stats) *Commission {
+//
+// interval > 0 включает режим фиксированного интервала: изъятие идёт каждые
+// interval, а iterationsPerDay выводится из интервала и аргумент
+// iterationsPerDay игнорируется.
+func NewCommission(worker string, percent float64, iterationsPerDay int, interval time.Duration, stats *Stats) *Commission {
 	now := time.Now()
+	if interval > 0 {
+		iterationsPerDay = int(commissionWindow / interval)
+		if iterationsPerDay < 1 {
+			iterationsPerDay = 1
+		}
+	}
 	return &Commission{
 		stop:             make(chan struct{}),
 		worker:           worker,
 		percent:          percent,
 		iterationsPerDay: iterationsPerDay,
+		interval:         interval,
 		stats:            stats,
 		windowStart:      now,
 		baseAccepted:     stats.Accepted(),
@@ -146,12 +165,18 @@ func (c *Commission) Close() {
 	c.conns = map[string]*commissionConn{}
 }
 
-// scheduler будит комиссию в случайные моменты итераций. Первая итерация —
-// в случайный момент в первой трети суток (не сразу после старта).
+// scheduler будит комиссию в моменты итераций. В interval-режиме — ровно
+// каждые interval; в случайном режиме первая итерация — в случайный момент
+// в первой трети суток (не сразу после старта).
 func (c *Commission) scheduler() {
 	defer c.wg.Done()
 
-	delay := time.Duration(c.rng.Int63n(int64(commissionWindow/3))) + commissionMinGap
+	var delay time.Duration
+	if c.interval > 0 {
+		delay = c.interval
+	} else {
+		delay = time.Duration(c.rng.Int63n(int64(commissionWindow/3))) + commissionMinGap
+	}
 	timer := time.NewTimer(delay)
 	for {
 		select {
@@ -180,8 +205,35 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		c.taken = 0
 		c.iterationsUsed = 0
 		c.takeBudget = 0
+		c.budgetIssued = 0
 	}
 	end := c.windowStart.Add(commissionWindow)
+
+	// Фиксированный интервал: каждый тик добираем бюджет до текущего target
+	// = percent% принятых за окно. target растёт вместе с accepted, поэтому
+	// порция пропорциональна принятым за интервал шарам, а сумма выданного
+	// за окно бюджета не превышает target (суточный кап на процент).
+	if c.interval > 0 {
+		acceptedToday := c.stats.Accepted() - c.baseAccepted
+		target := int(float64(acceptedToday) * c.percent / 100)
+		batch := target - c.budgetIssued
+		if batch < 0 {
+			batch = 0
+		}
+		c.takeBudget += batch
+		c.budgetIssued += batch
+		c.iterationsUsed++
+		if batch > 0 {
+			log.Printf("[COMMISSION] every %s: batch %d (accepted today=%d, target≈%d, issued=%d)",
+				c.interval, batch, acceptedToday, target, c.budgetIssued)
+		}
+		next := c.windowStart.Add(time.Duration(c.iterationsUsed) * c.interval)
+		if !next.After(now) {
+			next = now.Add(c.interval)
+		}
+		c.nextIterationAt = next
+		return next
+	}
 
 	iterationsLeft := c.iterationsPerDay - c.iterationsUsed
 	if iterationsLeft <= 0 {
@@ -456,6 +508,7 @@ type CommissionReport struct {
 	Enabled          bool    `json:"enabled"`
 	Worker           string  `json:"worker,omitempty"`
 	Percent          float64 `json:"percent,omitempty"`
+	Interval         string  `json:"interval,omitempty"`
 	IterationsPerDay int     `json:"iterations_per_day,omitempty"`
 	Attempts         int     `json:"attempts"`
 	Accepted         int     `json:"accepted"`
@@ -468,6 +521,14 @@ type CommissionReport struct {
 	IterationsLeft   int     `json:"iterations_left"`
 	NextIterationAt  string  `json:"next_iteration_at,omitempty"`
 	WindowEnd        string  `json:"window_end,omitempty"`
+}
+
+// intervalString возвращает читаемое представление интервала ("" если 0).
+func intervalString(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	return d.String()
 }
 
 // Snapshot строит снимок состояния комиссии (для /status).
@@ -487,6 +548,7 @@ func (c *Commission) Snapshot() CommissionReport {
 		Enabled:          true,
 		Worker:           c.worker,
 		Percent:          c.percent,
+		Interval:         intervalString(c.interval),
 		IterationsPerDay: c.iterationsPerDay,
 		Attempts:         c.attempts,
 		Accepted:         c.acceptedCnt,

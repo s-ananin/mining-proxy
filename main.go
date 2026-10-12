@@ -49,8 +49,13 @@ func main() {
 	log.Printf("[MAIN] listen: %s | fallback pool: %q | monitor: http://%s/status",
 		cfg.ListenAddr, cfg.UpstreamPool, cfg.MonitorAddr)
 	if cfg.CommissionWorker != "" {
-		log.Printf("[MAIN] commission: worker=%q percent=%v%% iterations/day=%d",
-			cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration)
+		if cfg.CommissionEvery > 0 {
+			log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s",
+				cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery)
+		} else {
+			log.Printf("[MAIN] commission: worker=%q percent=%v%% iterations/day=%d",
+				cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration)
+		}
 	}
 
 	// --- 2. Реестр статистики шар ---
@@ -59,7 +64,7 @@ func main() {
 	// --- 2.1. Комиссия (если задан commission_worker) ---
 	var commission *proxy.Commission
 	if cfg.CommissionWorker != "" {
-		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, stats)
+		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, stats)
 		commission.Start()
 		defer commission.Close()
 	}

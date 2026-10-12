@@ -129,7 +129,7 @@ func (p *mockPool2) handle(conn net.Conn) {
 func (p *mockPool2) Close() { p.ln.Close() }
 
 func TestCommissionDisabled(t *testing.T) {
-	c := NewCommission("", 2, 40, NewStats())
+	c := NewCommission("", 2, 40, 0, NewStats())
 	if c.Enabled() {
 		t.Error("пустой worker — комиссия должна быть выключена")
 	}
@@ -146,7 +146,7 @@ func TestRedirectToCommissionPool(t *testing.T) {
 	defer pool.Close()
 
 	stats := NewStats()
-	c := NewCommission("test.com", 2, 40, stats)
+	c := NewCommission("test.com", 2, 40, 0, stats)
 	c.takeBudget = 2 // одна итерация на 2 шары
 
 	submit := func() []byte {
@@ -200,7 +200,7 @@ func TestRedirectFailOpenWhenCommissionPoolDown(t *testing.T) {
 	deadPool := ln.Addr().String()
 	ln.Close()
 
-	c := NewCommission("test.com", 2, 40, NewStats())
+	c := NewCommission("test.com", 2, 40, 0, NewStats())
 	c.takeBudget = 1
 
 	raw := []byte(`{"id":1,"method":"mining.submit","params":["w","j","n","t","c"]}`)
@@ -218,7 +218,7 @@ func TestRedirectFailOpenWhenCommissionPoolDown(t *testing.T) {
 
 func TestIterationSchedulesBudget(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("test.com", 2, 40, stats)
+	c := NewCommission("test.com", 2, 40, 0, stats)
 
 	now := time.Now()
 	next := c.iterate(now)
@@ -232,9 +232,73 @@ func TestIterationSchedulesBudget(t *testing.T) {
 	}
 }
 
+func TestIntervalProportionalBudget(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("test.com", 2, 0, 10*time.Minute, stats)
+	if c.iterationsPerDay != 144 {
+		t.Fatalf("iterationsPerDay = %d, want 144 (24h/10m)", c.iterationsPerDay)
+	}
+
+	now := c.windowStart
+	accept := func(n int) {
+		for i := 0; i < n; i++ {
+			stats.Result("pool:3333", "w", 1, true, "")
+		}
+	}
+
+	// Первый тик: принято 200 → target 2% = 4.
+	accept(200)
+	next := c.iterate(now.Add(10 * time.Minute))
+	if c.takeBudget != 4 || c.budgetIssued != 4 {
+		t.Errorf("после 1-го тика budget=%d issued=%d, want 4/4", c.takeBudget, c.budgetIssued)
+	}
+	if !next.After(now.Add(10 * time.Minute)) {
+		t.Errorf("next = %v, want after 10m", next)
+	}
+
+	// Второй тик: принято ещё 100 (итого 300) → target 6, добираем 2.
+	accept(100)
+	c.iterate(now.Add(20 * time.Minute))
+	if c.takeBudget != 6 || c.budgetIssued != 6 {
+		t.Errorf("после 2-го тика budget=%d issued=%d, want 6/6", c.takeBudget, c.budgetIssued)
+	}
+
+	// Третий тик без новых шар: цель не растёт, изъятия нет (кап).
+	c.iterate(now.Add(30 * time.Minute))
+	if c.takeBudget != 6 || c.budgetIssued != 6 {
+		t.Errorf("без новых шар budget=%d issued=%d, want 6/6", c.takeBudget, c.budgetIssued)
+	}
+	// Суммарно за окно — не более percent% от принятых.
+	if c.budgetIssued > int(float64(300)*0.02) {
+		t.Errorf("issued %d превышает 2%% от 300", c.budgetIssued)
+	}
+}
+
+func TestIntervalWindowReset(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("test.com", 2, 0, 10*time.Minute, stats)
+	for i := 0; i < 200; i++ {
+		stats.Result("pool:3333", "w", 1, true, "")
+	}
+	c.iterate(c.windowStart.Add(10 * time.Minute))
+	if c.budgetIssued != 4 {
+		t.Fatalf("issued = %d, want 4", c.budgetIssued)
+	}
+
+	old := c.windowStart
+	c.iterate(old.Add(25 * time.Hour))
+	if !c.windowStart.After(old) {
+		t.Fatal("окно не сброшено")
+	}
+	if c.budgetIssued != 0 || c.takeBudget != 0 || c.iterationsUsed != 1 {
+		t.Errorf("после сброса issued=%d budget=%d iters=%d, want 0/0/1",
+			c.budgetIssued, c.takeBudget, c.iterationsUsed)
+	}
+}
+
 func TestCommissionWindowReset(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("test.com", 2, 40, stats)
+	c := NewCommission("test.com", 2, 40, 0, stats)
 
 	// Окно закончилось: имитируем итерацию через 25 часов.
 	oldStart := c.windowStart
