@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
+	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -236,5 +239,84 @@ func TestCommissionWindowReset(t *testing.T) {
 	}
 	if c.taken != 0 || c.takeBudget != 0 {
 		t.Errorf("счётчики окна должны обнуляться: taken=%d budget=%d", c.taken, c.takeBudget)
+	}
+}
+
+// TestPipeMinerToPoolCommissionSwitch проверяет переавторизацию: на время
+// изъятия прокси шлёт в пул служебный authorize с commission_worker вместе с
+// подменённой шарой, а когда бюджет исчерпан — возвращает authorize на воркер
+// майнера.
+func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 40, 0, stats)
+	c.takeBudget = 1
+
+	clientConn, minerSide := net.Pipe()
+	defer clientConn.Close()
+	defer minerSide.Close()
+	dst, poolSide := net.Pipe()
+	defer dst.Close()
+	defer poolSide.Close()
+
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+
+	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
+
+	pr := bufio.NewReader(poolSide)
+	type wire struct {
+		ID     json.RawMessage   `json:"id"`
+		Method string            `json:"method"`
+		Params []json.RawMessage `json:"params"`
+	}
+	send := func(s string) {
+		if _, err := minerSide.Write([]byte(s + "\n")); err != nil {
+			t.Fatalf("miner write: %v", err)
+		}
+	}
+	recv := func() wire {
+		line, err := pr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("pool read: %v", err)
+		}
+		var w wire
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &w); err != nil {
+			t.Fatalf("unmarshal %q: %v", line, err)
+		}
+		return w
+	}
+	worker := func(w wire) string {
+		var s string
+		json.Unmarshal(w.Params[0], &s)
+		return s
+	}
+	tagID := func(w wire) string { return string(w.ID) }
+
+	// Майнер авторизуется — прокси пробрасывает authorize как есть.
+	send(`{"id":1,"method":"mining.authorize","params":["client.w","x"]}`)
+	if a := recv(); a.Method != "mining.authorize" || worker(a) != "client.w" {
+		t.Fatalf("authorize майнера проброшен неверно: %+v", a)
+	}
+
+	// Первая шара: забрана → authorize(fee.worker) + submit(fee.worker).
+	send(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
+	a := recv()
+	if a.Method != "mining.authorize" || worker(a) != "fee.worker" || tagID(a) != commissionAuthID {
+		t.Fatalf("ожидался служебный authorize fee.worker: %+v", a)
+	}
+	s := recv()
+	if s.Method != "mining.submit" || worker(s) != "fee.worker" || string(s.ID) != "2" {
+		t.Fatalf("подменённая шара неверна: %+v", s)
+	}
+
+	// Вторая шара: бюджет исчерпан → authorize(client.w) + submit(client.w).
+	send(`{"id":3,"method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
+	a = recv()
+	if a.Method != "mining.authorize" || worker(a) != "client.w" {
+		t.Fatalf("ожидался возврат authorize на client.w: %+v", a)
+	}
+	s = recv()
+	if s.Method != "mining.submit" || worker(s) != "client.w" || string(s.ID) != "3" {
+		t.Fatalf("возвращённая шара неверна: %+v", s)
 	}
 }

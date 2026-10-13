@@ -207,12 +207,25 @@ func sniffStratum(reader *bufio.Reader) (bool, [][]byte) {
 // authorize привязывает воркера, submit штампуется сложностью и
 // регистрируется в таблице ожидающих ответа.
 //
-// Если комиссия забирает шару (reserve вернул true и воркер переписан) —
-// шара уходит в тот же upstream с подменённым params[0]; ответ пула вернётся
-// майнеру по его id, но зачтётся в счётчики комиссии.
+// Комиссия: пул привязывает воркер к mining.authorize, поэтому одной подмены
+// params[0] мало. На время изъятия прокси отправляет в пул служебный
+// mining.authorize с commission_worker (feeAuth), а params[0] шар приводит к
+// тому же воркеру; когда бюджет исчерпан — возвращает authorize на воркер
+// майнера. job_id/extranonce1 соединения сохраняются, шары остаются валидными.
 func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session, commission *Commission) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
+
+	// feeAuth — соединение сейчас авторизовано под commission_worker.
+	feeAuth := false
+	writeAuthorize := func(worker string) bool {
+		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err := writeLine(dst, miningAuthorizeLine(worker, commissionAuthTag)); err != nil {
+			log.Printf("[CONN] miner->pool authorize: %v", err)
+			return false
+		}
+		return true
+	}
 
 	for {
 		clientConn.SetReadDeadline(time.Now().Add(idleTimeout))
@@ -223,23 +236,36 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 
 		if IsMinerSubmit(line) {
 			id, _ := SubmitID(line)
-			if id != "" && commission != nil && commission.reserve() {
-				rewritten, err := rewriteSubmitWorker(line, commission.worker)
-				if err == nil {
-					commission.countAttempt()
-					se.markCommissionSubmit(id)
-					log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s)",
-						commission.worker, se.pool, id)
-					line = rewritten
-					dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-					if werr := writeLine(dst, line); werr != nil {
-						log.Printf("[CONN] miner->pool write: %v", werr)
-						return
+			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() {
+				if commission.reserve() {
+					rewritten, err := rewriteSubmitWorker(line, commission.worker)
+					if err == nil && (feeAuth || writeAuthorize(commission.worker)) {
+						feeAuth = true
+						commission.countAttempt()
+						se.markCommissionSubmit(id)
+						log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s)",
+							commission.worker, se.pool, id)
+						line = rewritten
+						dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+						if werr := writeLine(dst, line); werr != nil {
+							log.Printf("[CONN] miner->pool write: %v", werr)
+							return
+						}
+						continue
 					}
-					continue
+					// Не удалось — fail-open: шару не трогаем.
+					commission.countFailed()
+				} else if feeAuth {
+					// Бюджет исчерпан — возвращаем соединение майнеру.
+					if w := se.workerName(); w != "" && writeAuthorize(w) {
+						feeAuth = false
+					}
 				}
-				// Переписать не удалось — fail-open: шару не трогаем.
-				commission.countFailed()
+			} else if feeAuth {
+				// Комиссия отключена/отклонена пулом — вернуть воркер майнера.
+				if w := se.workerName(); w != "" && writeAuthorize(w) {
+					feeAuth = false
+				}
 			}
 			se.submit(id, WorkerFromSubmit(line))
 		} else if IsMinerAuthorize(line) {
@@ -271,6 +297,18 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 		if diff, ok := ParseSetDifficulty(line); ok {
 			se.setDifficulty(diff)
 		} else if resp, ok := ParsePoolResponse(line); ok {
+			if resp.ID == commissionAuthID {
+				// Ответ на служебный authorize: майнеру не показываем,
+				// но пишем в лог — по нему видно, принял ли пул смену воркера.
+				if resp.Accepted {
+					log.Printf("[COMMISSION] пул %s подтвердил переавторизацию", se.pool)
+				} else {
+					log.Printf("[COMMISSION] пул %s ОТКЛОНИЛ переавторизацию: %s — изъятие на этом соединении остановлено",
+						se.pool, resp.Error)
+					se.denyFee()
+				}
+				continue
+			}
 			se.resolve(resp)
 		} else if jobID, ok := JobIDFromNotify(line); ok {
 			se.setJobID(jobID)

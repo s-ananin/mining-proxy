@@ -39,6 +39,7 @@ type session struct {
 	pending    map[string]pendingShare
 	closed     bool
 	commission *Commission // сборщик комиссии; nil — выключена
+	feeDenied  bool        // пул отклонил служебный authorize — не изымаем
 }
 
 // newSession регистрирует соединение в реестре.
@@ -75,6 +76,29 @@ func (s *session) bindWorkerLocked(worker string) {
 	}
 	s.worker = worker
 	s.stats.BindWorker(s.pool, worker, s.source)
+}
+
+// workerName возвращает текущий воркер майнера (из mining.authorize) — по
+// нему комиссия возвращает соединение после изъятия.
+func (s *session) workerName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.worker
+}
+
+// denyFee помечает, что пул отклонил служебную переавторизацию: на этом
+// соединении комиссия больше не изымается (fail-open для майнера).
+func (s *session) denyFee() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.feeDenied = true
+}
+
+// feeDeniedNow сообщает, отклонял ли пул служебную переавторизацию.
+func (s *session) feeDeniedNow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.feeDenied
 }
 
 // authorize обрабатывает mining.authorize.

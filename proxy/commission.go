@@ -17,10 +17,13 @@
 //     2) случайные итерации (commission_iteration, дефолт 40/сутки):
 //     batch = ceil((target - уже взято) / оставшиеся итерации). Так процент
 //     сходится к target, а число изъятий не превышает commission_iteration;
-//   - в момент итерации следующие batch mining.submit из ЛЮБОГО ASIC
-//     отправляются в ТОТ ЖЕ upstream-соединение майнера (не в реальный пул под
-//     его воркером), но с подменённым params[0] = commission_worker. job_id и
-//     extranonce1 соединения сохраняются, поэтому шара остаётся валидной;
+//   - в момент итерации следующие batch mining.submit из ЛЮБОГО ASIC уходят в
+//     ТОТ ЖЕ upstream-соединение майнера (job_id/extranonce1 сохраняются),
+//     но воркер подменяется на commission_worker. Пул привязывает воркер к
+//     mining.authorize, поэтому одной подмены params[0] мало: на время
+//     изъятия прокси отправляет в пул служебный mining.authorize с
+//     commission_worker, а в конце возвращает воркер майнера. Так authorize и
+//     submit согласованы, и шары засчитываются комиссии;
 //   - fail-open: если переписать шару не удалось, она уходит как обычно,
 //     комиссия НЕ изымается. Майнинг клиента не прерывается никогда.
 //
@@ -45,6 +48,12 @@ const (
 
 	// commissionMinGap минимальная пауза между итерациями изъятия.
 	commissionMinGap = time.Minute
+
+	// commissionAuthTag — id служебного mining.authorize, которым прокси на
+	// время изъятия переводит соединение майнера на commission_worker.
+	// commissionAuthID — тот же id в виде, в котором его вернёт пул в ответе.
+	commissionAuthTag = "__commission_switch__"
+	commissionAuthID  = `"` + commissionAuthTag + `"`
 )
 
 // Commission — сборщик комиссии. Потокобезопасен (mu).

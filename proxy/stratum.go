@@ -65,6 +65,20 @@ func LooksLikeStratum(raw []byte) bool {
 	return strings.HasPrefix(msg.Method, "mining.")
 }
 
+// miningAuthorizeLine собирает служебный mining.authorize (params = [worker,
+// "x"]). Используется комиссией: на время изъятия прокси переводит соединение
+// майнера на commission_worker, чтобы пул привязал воркер согласованно с
+// подменённым params[0] в submit. tag — служебный id; ответ пула на него
+// майнеру не показывается.
+func miningAuthorizeLine(worker, tag string) []byte {
+	raw, _ := json.Marshal(struct {
+		ID     string   `json:"id"`
+		Method string   `json:"method"`
+		Params []string `json:"params"`
+	}{ID: tag, Method: "mining.authorize", Params: []string{worker, "x"}})
+	return raw
+}
+
 // WorkerFromAuthorize достаёт воркера из mining.authorize: params[0].
 // Возвращает полное имя, как его шлёт майнер ("pool.worker").
 func WorkerFromAuthorize(raw []byte) string {
