@@ -313,6 +313,10 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	if s.Method != "mining.submit" || worker(s) != "fee.worker" || string(s.ID) != "2" {
 		t.Fatalf("подменённая шара неверна: %+v", s)
 	}
+	// Ответ пула по изъятой шаре: разблокирует отправку следующей (сериализация).
+	if !se.resolve(PoolResponse{ID: "2", Accepted: true}) {
+		t.Fatalf("resolve изъятой шары не найден")
+	}
 
 	// Вторая шара: бюджет исчерпан → authorize(client.w) + submit(client.w).
 	send(`{"id":3,"method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)

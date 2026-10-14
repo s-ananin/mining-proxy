@@ -38,8 +38,9 @@ type session struct {
 	diff       float64
 	pending    map[string]pendingShare
 	closed     bool
-	commission *Commission // сборщик комиссии; nil — выключена
-	feeDenied  bool        // пул отклонил служебный authorize — не изымаем
+	commission *Commission   // сборщик комиссии; nil — выключена
+	feeDenied  bool          // пул отклонил служебный authorize — не изымаем
+	commAck    chan struct{} // ответ пула на текущую изъятую шару (сериализация)
 }
 
 // newSession регистрирует соединение в реестре.
@@ -186,6 +187,29 @@ func (s *session) markCommissionSubmit(id string) float64 {
 	return s.diff
 }
 
+// armCommissionAck заводит канал ответа для очередной изъятой шары: пока
+// ответа нет, pipeMinerToPool не отправляет следующую (сериализация изъятия).
+func (s *session) armCommissionAck() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.commAck = make(chan struct{}, 1)
+	return s.commAck
+}
+
+// signalCommission сообщает отправителю, что по текущей изъятой шаре пришёл
+// ответ пула (зачёт или отказ) — можно отправлять следующую.
+func (s *session) signalCommission() {
+	s.mu.Lock()
+	ch := s.commAck
+	s.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
 // resolve закрывает шару по ответу пула. Возвращает false, если id не
 // известен (ответ на subscribe/authorize или дубль) — тогда строка просто
 // проксируется дальше без влияния на статистику.
@@ -210,6 +234,7 @@ func (s *session) resolve(resp PoolResponse) bool {
 					s.pool, s.commission.worker, p.diff, resp.Error)
 			}
 		}
+		s.signalCommission()
 		return true
 	}
 	s.stats.Result(s.pool, p.worker, p.diff, resp.Accepted, resp.Error)

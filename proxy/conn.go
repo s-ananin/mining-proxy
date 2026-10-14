@@ -34,6 +34,11 @@ const (
 	// sniffTimeout — сколько ждём первые байты, чтобы определить протокол.
 	sniffTimeout = 10 * time.Second
 
+	// commissionAckTimeout — сколько ждём ответ пула на изъятую шару, прежде
+	// чем отправить следующую (сериализация изъятия). Молчание пула не
+	// должно вешать соединение — по таймауту продолжаем.
+	commissionAckTimeout = 10 * time.Second
+
 	// lineBuf / maxLineSize — буфер строки Stratum (JSON редко > 1КБ).
 	lineBuf     = 4 * 1024
 	maxLineSize = 16 * 1024
@@ -242,6 +247,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					if err == nil && (feeAuth || writeAuthorize(commission.worker)) {
 						feeAuth = true
 						diff := se.markCommissionSubmit(id)
+						ack := se.armCommissionAck()
 						commission.countSteal(diff)
 						log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s, diff %g)",
 							commission.worker, se.pool, id, diff)
@@ -250,6 +256,12 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 						if werr := writeLine(dst, line); werr != nil {
 							log.Printf("[CONN] miner->pool write: %v", werr)
 							return
+						}
+						// Следующую шару берём только после ответа пула на
+						// эту: иначе порция уходит залпом и пул путает шары.
+						if !waitCommissionAck(ack, commissionAckTimeout) {
+							log.Printf("[COMMISSION] пул %s не ответил на шару id %s за %s — продолжаем",
+								se.pool, id, commissionAckTimeout)
 						}
 						continue
 					}
@@ -321,6 +333,18 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 		}
 	}
 	logReadErr("pool", src, scanner.Err())
+}
+
+// waitCommissionAck ждёт ответа пула на текущую изъятую шару. Возвращает
+// false, если за отведённое время ответа не было (соединение продолжает
+// работать, просто без сериализации по этой шаре).
+func waitCommissionAck(ch chan struct{}, d time.Duration) bool {
+	select {
+	case <-ch:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // writeLine пишет строку и терминальный '\n' (scanner его съел).
