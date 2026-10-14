@@ -241,10 +241,10 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					rewritten, err := rewriteSubmitWorker(line, commission.worker)
 					if err == nil && (feeAuth || writeAuthorize(commission.worker)) {
 						feeAuth = true
-						commission.countAttempt()
-						se.markCommissionSubmit(id)
-						log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s)",
-							commission.worker, se.pool, id)
+						diff := se.markCommissionSubmit(id)
+						commission.countSteal(diff)
+						log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s, diff %g)",
+							commission.worker, se.pool, id, diff)
 						line = rewritten
 						dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 						if werr := writeLine(dst, line); werr != nil {

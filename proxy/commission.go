@@ -96,6 +96,18 @@ type Commission struct {
 	sessionStart time.Time
 	sessionEnd   time.Time
 
+	// Pacing: минимальный интервал между изъятиями, чтобы порция уходила
+	// ровным потоком, а не залпом в начале интервала.
+	stealGap  time.Duration
+	lastSteal time.Time
+
+	// Диагностика: суммарная сложность (work) изъятых шар. Сравнивается с
+	// тем, что пул показал по commission_worker: наш work должен расти ровно.
+	workIssued    float64 // work всех изъятых шар (по сложности на момент изъятия)
+	workAccepted  float64 // work зачтённых пулом
+	workRejected  float64 // work отклонённых пулом
+	workSinceTick float64 // work, изъятый с прошлого тика (сбрасывается в iterate)
+
 	rng *rand.Rand
 }
 
@@ -219,6 +231,14 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		c.budgetIssued += batch
 		c.iterationsUsed++
 
+		// Pacing: размазываем порцию на весь интервал — не чаще одной
+		// шары в interval/batch. Тот же суточный объём, но ровным потоком
+		// (иначе залп в начале интервала пул видит как всплеск, который
+		// потом «затухает» по скользящему окну).
+		if batch > 0 {
+			c.stealGap = c.interval / time.Duration(batch)
+		}
+
 		// Окно изъятия на предстоящий интервал: случайное начало,
 		// длина ровно session (влезает в интервал: offset ≤ interval-session).
 		if c.session > 0 {
@@ -239,6 +259,14 @@ func (c *Commission) iterate(now time.Time) time.Time {
 				log.Printf("[COMMISSION] every %s: batch %d (accepted today=%d, target≈%d, issued=%d)",
 					c.interval, batch, acceptedToday, target, c.budgetIssued)
 			}
+		}
+		// Диагностика: сколько work реально изъято за прошедший интервал и
+		// сколько пул зачёл. Наш work должен держаться ровно — если на
+		// диаграмме пула воркер «затухает», а здесь ровно, причина на пуле.
+		if c.workSinceTick > 0 {
+			log.Printf("[COMMISSION] за интервал work изъято=%.0f (issued=%.0f, зачтено=%.0f, отклонено=%.0f)",
+				c.workSinceTick, c.workIssued, c.workAccepted, c.workRejected)
+			c.workSinceTick = 0
 		}
 		next := c.windowStart.Add(time.Duration(c.iterationsUsed) * c.interval)
 		if !next.After(now) {
@@ -308,18 +336,25 @@ func planBatch(acceptedToday, taken, iterationsLeft int, percent float64) int {
 //
 // Если задано окно изъятия (session > 0), шара забирается только внутри
 // текущего окна; вне окна бюджет не тратится и переносится на следующее окно.
+//
+// Pacing (stealGap > 0): между изъятиями выдерживается минимальный интервал,
+// поэтому порция уходит ровным потоком, а не залпом.
 func (c *Commission) reserve() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.worker == "" || c.takeBudget <= 0 {
 		return false
 	}
+	now := time.Now()
 	if c.session > 0 {
-		now := time.Now()
 		if now.Before(c.sessionStart) || !now.Before(c.sessionEnd) {
 			return false
 		}
 	}
+	if c.stealGap > 0 && !c.lastSteal.IsZero() && now.Sub(c.lastSteal) < c.stealGap {
+		return false
+	}
+	c.lastSteal = now
 	c.takeBudget--
 	return true
 }
@@ -351,21 +386,27 @@ func rewriteSubmitWorker(raw []byte, newWorker string) ([]byte, error) {
 	}{ID: msg.ID, Method: msg.Method, Params: msg.Params})
 }
 
-// countAttempt / countResult / countFailed обновляют счётчики комиссии.
-func (c *Commission) countAttempt() {
+// countSteal / countResult / countFailed обновляют счётчики комиссии.
+// diff — сложность изъятой шары: копим work как сумму сложностей, чтобы
+// сверять реальный вклад с тем, что показывает пул по commission_worker.
+func (c *Commission) countSteal(diff float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.attempts++
+	c.workIssued += diff
+	c.workSinceTick += diff
 }
 
-func (c *Commission) countResult(accepted bool) {
+func (c *Commission) countResult(accepted bool, diff float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if accepted {
 		c.acceptedCnt++
 		c.taken++
+		c.workAccepted += diff
 	} else {
 		c.rejectedCnt++
+		c.workRejected += diff
 	}
 }
 
@@ -389,6 +430,9 @@ type CommissionReport struct {
 	Accepted         int     `json:"accepted"`
 	Rejected         int     `json:"rejected"`
 	Failed           int     `json:"failed"`
+	WorkIssued       float64 `json:"work_issued"`
+	WorkAccepted     float64 `json:"work_accepted"`
+	WorkRejected     float64 `json:"work_rejected"`
 	AcceptedToday    int     `json:"accepted_today"`
 	TargetToday      int     `json:"target_today"`
 	TakenToday       int     `json:"taken_today"`
@@ -430,6 +474,9 @@ func (c *Commission) Snapshot() CommissionReport {
 		Accepted:         c.acceptedCnt,
 		Rejected:         c.rejectedCnt,
 		Failed:           c.failedCnt,
+		WorkIssued:       c.workIssued,
+		WorkAccepted:     c.workAccepted,
+		WorkRejected:     c.workRejected,
 		AcceptedToday:    acceptedToday,
 		TargetToday:      target,
 		TakenToday:       c.taken,

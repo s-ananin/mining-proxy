@@ -108,8 +108,8 @@ func TestCommissionStealAndCount(t *testing.T) {
 	if rew.ID != 7 || rew.Params[0] != "test.com" {
 		t.Errorf("переписанная шара: id=%d worker=%q, want 7/test.com", rew.ID, rew.Params[0])
 	}
-	c.countAttempt()
-	se.markCommissionSubmit("7")
+	se.setDifficulty(2)
+	c.countSteal(se.markCommissionSubmit("7"))
 	if !se.resolve(PoolResponse{ID: "7", Accepted: true}) {
 		t.Fatal("resolve комиссионной шары должен вернуть true")
 	}
@@ -118,8 +118,8 @@ func TestCommissionStealAndCount(t *testing.T) {
 	if !c.reserve() {
 		t.Fatal("второй reserve должен выдать бюджет")
 	}
-	c.countAttempt()
-	se.markCommissionSubmit("8")
+	se.setDifficulty(4)
+	c.countSteal(se.markCommissionSubmit("8"))
 	se.resolve(PoolResponse{ID: "8", Accepted: false, Error: "unknown job id"})
 
 	// Шара 3: бюджет исчерпан — остаётся майнеру.
@@ -136,6 +136,11 @@ func TestCommissionStealAndCount(t *testing.T) {
 	}
 	if snap.TakenToday != 1 {
 		t.Errorf("taken_today = %d, want 1", snap.TakenToday)
+	}
+	// work: изъято diff 2+4=6, зачтено 2, отклонено 4.
+	if snap.WorkIssued != 6 || snap.WorkAccepted != 2 || snap.WorkRejected != 4 {
+		t.Errorf("work issued=%.0f accepted=%.0f rejected=%.0f, want 6/2/4",
+			snap.WorkIssued, snap.WorkAccepted, snap.WorkRejected)
 	}
 	// Майнеру засчитана только третья шара — комиссионные в stats не попали.
 	if stats.Submits() != 1 || stats.Accepted() != 1 {
@@ -318,6 +323,31 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	s = recv()
 	if s.Method != "mining.submit" || worker(s) != "client.w" || string(s.ID) != "3" {
 		t.Fatalf("возвращённая шара неверна: %+v", s)
+	}
+}
+
+// TestReservePacing: между изъятиями выдерживается stealGap, чтобы порция
+// уходила ровным потоком, а не залпом.
+func TestReservePacing(t *testing.T) {
+	c := NewCommission("fee.worker", 2, 0, 10*time.Minute, 0, NewStats())
+	c.takeBudget = 3
+	c.stealGap = 30 * time.Second
+
+	// Первый забор проходит сразу, дальше — пауза stealGap.
+	if !c.reserve() {
+		t.Fatal("первый reserve должен пройти (lastSteal ещё ноль)")
+	}
+	if c.reserve() {
+		t.Fatal("второй reserve раньше stealGap должен быть отклонён")
+	}
+	if c.takeBudget != 2 {
+		t.Errorf("takeBudget = %d, want 2 (второй забор не потратил бюджет)", c.takeBudget)
+	}
+
+	// Сдвигаем lastSteal в прошлое — пауза вышла, забор снова проходит.
+	c.lastSteal = time.Now().Add(-time.Minute)
+	if !c.reserve() {
+		t.Fatal("после паузы reserve должен пройти")
 	}
 }
 
