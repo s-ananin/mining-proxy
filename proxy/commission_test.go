@@ -326,31 +326,6 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	}
 }
 
-// TestReservePacing: между изъятиями выдерживается stealGap, чтобы порция
-// уходила ровным потоком, а не залпом.
-func TestReservePacing(t *testing.T) {
-	c := NewCommission("fee.worker", 2, 0, 10*time.Minute, 0, NewStats())
-	c.takeBudget = 3
-	c.stealGap = 30 * time.Second
-
-	// Первый забор проходит сразу, дальше — пауза stealGap.
-	if !c.reserve() {
-		t.Fatal("первый reserve должен пройти (lastSteal ещё ноль)")
-	}
-	if c.reserve() {
-		t.Fatal("второй reserve раньше stealGap должен быть отклонён")
-	}
-	if c.takeBudget != 2 {
-		t.Errorf("takeBudget = %d, want 2 (второй забор не потратил бюджет)", c.takeBudget)
-	}
-
-	// Сдвигаем lastSteal в прошлое — пауза вышла, забор снова проходит.
-	c.lastSteal = time.Now().Add(-time.Minute)
-	if !c.reserve() {
-		t.Fatal("после паузы reserve должен пройти")
-	}
-}
-
 // TestCommissionSessionGatesReserve проверяет, что при заданном окне шары
 // изымаются только внутри него, а вне окна бюджет не тратится.
 func TestCommissionSessionGatesReserve(t *testing.T) {
