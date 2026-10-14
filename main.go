@@ -50,8 +50,13 @@ func main() {
 		cfg.ListenAddr, cfg.UpstreamPool, cfg.MonitorAddr)
 	if cfg.CommissionWorker != "" {
 		if cfg.CommissionEvery > 0 {
-			log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s",
-				cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery)
+			if cfg.CommissionSessionEvery > 0 {
+				log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s session=%s",
+					cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery, cfg.CommissionSessionEvery)
+			} else {
+				log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s",
+					cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery)
+			}
 		} else {
 			log.Printf("[MAIN] commission: worker=%q percent=%v%% iterations/day=%d",
 				cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration)
@@ -64,7 +69,7 @@ func main() {
 	// --- 2.1. Комиссия (если задан commission_worker) ---
 	var commission *proxy.Commission
 	if cfg.CommissionWorker != "" {
-		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, stats)
+		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, cfg.CommissionSessionEvery, stats)
 		commission.Start()
 		defer commission.Close()
 	}

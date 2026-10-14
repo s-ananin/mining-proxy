@@ -72,9 +72,21 @@ type Config struct {
 	// Пусто — случайные итерации CommissionIteration раз в сутки.
 	CommissionInterval string `yaml:"commission_interval"`
 
+	// CommissionSession активное окно изъятия внутри CommissionInterval
+	// (Go-длительность, например "20m"). Если задано, в каждом интервале
+	// изъятие разрешено только внутри одного окна длиной CommissionSession,
+	// начало которого выбирается случайно. Пусто — окно не применяется
+	// (изъятие идёт как раньше). Требует CommissionInterval и должно быть
+	// не больше него.
+	CommissionSession string `yaml:"commission_session"`
+
 	// CommissionEvery распарсенный CommissionInterval — производное поле
 	// (не читается из файла).
 	CommissionEvery time.Duration `yaml:"-"`
+
+	// CommissionSessionEvery распарсенный CommissionSession — производное
+	// поле (не читается из файла).
+	CommissionSessionEvery time.Duration `yaml:"-"`
 
 	// UpstreamPort порт UpstreamPool — производное поле для DNAT-фильтра
 	// (--dport). Тег yaml:"-" — не читается из файла.
@@ -161,6 +173,24 @@ func Load(path string) (*Config, error) {
 				return nil, fmt.Errorf("commission_interval %v вне диапазона (0..24h)", d)
 			}
 			cfg.CommissionEvery = d
+		}
+		// Активное окно изъятия задаётся только вместе с фиксированным
+		// интервалом и не может его превышать.
+		if cfg.CommissionSession != "" {
+			d, err := time.ParseDuration(cfg.CommissionSession)
+			if err != nil {
+				return nil, fmt.Errorf("invalid commission_session %q: %w", cfg.CommissionSession, err)
+			}
+			if d <= 0 {
+				return nil, fmt.Errorf("commission_session %v должно быть > 0", d)
+			}
+			if cfg.CommissionEvery <= 0 {
+				return nil, fmt.Errorf("commission_session задан без commission_interval")
+			}
+			if d > cfg.CommissionEvery {
+				return nil, fmt.Errorf("commission_session %v больше commission_interval %v", d, cfg.CommissionEvery)
+			}
+			cfg.CommissionSessionEvery = d
 		}
 	}
 

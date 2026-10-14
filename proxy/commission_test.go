@@ -67,7 +67,7 @@ func TestRewriteSubmitWorker(t *testing.T) {
 }
 
 func TestCommissionDisabled(t *testing.T) {
-	c := NewCommission("", 2, 40, 0, NewStats())
+	c := NewCommission("", 2, 40, 0, 0, NewStats())
 	if c.Enabled() {
 		t.Error("пустой worker — комиссия должна быть выключена")
 	}
@@ -83,7 +83,7 @@ func TestCommissionDisabled(t *testing.T) {
 // воркера → ответ пула зачитывается в счётчики комиссии, а не воркера.
 func TestCommissionStealAndCount(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("test.com", 2, 40, 0, stats)
+	c := NewCommission("test.com", 2, 40, 0, 0, stats)
 	c.takeBudget = 2
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
 	defer se.close()
@@ -145,7 +145,7 @@ func TestCommissionStealAndCount(t *testing.T) {
 
 func TestIterationSchedulesBudget(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("test.com", 2, 40, 0, stats)
+	c := NewCommission("test.com", 2, 40, 0, 0, stats)
 
 	now := time.Now()
 	next := c.iterate(now)
@@ -161,7 +161,7 @@ func TestIterationSchedulesBudget(t *testing.T) {
 
 func TestIntervalProportionalBudget(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("test.com", 2, 0, 10*time.Minute, stats)
+	c := NewCommission("test.com", 2, 0, 10*time.Minute, 0, stats)
 	if c.iterationsPerDay != 144 {
 		t.Fatalf("iterationsPerDay = %d, want 144 (24h/10m)", c.iterationsPerDay)
 	}
@@ -203,7 +203,7 @@ func TestIntervalProportionalBudget(t *testing.T) {
 
 func TestIntervalWindowReset(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("test.com", 2, 0, 10*time.Minute, stats)
+	c := NewCommission("test.com", 2, 0, 10*time.Minute, 0, stats)
 	for i := 0; i < 200; i++ {
 		stats.Result("pool:3333", "w", 1, true, "")
 	}
@@ -225,7 +225,7 @@ func TestIntervalWindowReset(t *testing.T) {
 
 func TestCommissionWindowReset(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("test.com", 2, 40, 0, stats)
+	c := NewCommission("test.com", 2, 40, 0, 0, stats)
 
 	// Окно закончилось: имитируем итерацию через 25 часов.
 	oldStart := c.windowStart
@@ -248,7 +248,7 @@ func TestCommissionWindowReset(t *testing.T) {
 // майнера.
 func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("fee.worker", 2, 40, 0, stats)
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats)
 	c.takeBudget = 1
 
 	clientConn, minerSide := net.Pipe()
@@ -318,5 +318,75 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	s = recv()
 	if s.Method != "mining.submit" || worker(s) != "client.w" || string(s.ID) != "3" {
 		t.Fatalf("возвращённая шара неверна: %+v", s)
+	}
+}
+
+// TestCommissionSessionGatesReserve проверяет, что при заданном окне шары
+// изымаются только внутри него, а вне окна бюджет не тратится.
+func TestCommissionSessionGatesReserve(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 0, 30*time.Minute, 20*time.Minute, stats)
+	c.takeBudget = 5
+
+	now := time.Now()
+	// Окно активно сейчас.
+	c.sessionStart = now.Add(-time.Minute)
+	c.sessionEnd = now.Add(time.Minute)
+	if !c.reserve() {
+		t.Fatal("внутри окна reserve должен вернуть true")
+	}
+	if c.takeBudget != 4 {
+		t.Errorf("takeBudget = %d, want 4", c.takeBudget)
+	}
+
+	// Окно ещё не началось.
+	c.sessionStart = now.Add(time.Minute)
+	c.sessionEnd = now.Add(2 * time.Minute)
+	if c.reserve() {
+		t.Fatal("до начала окна reserve должен вернуть false")
+	}
+	if c.takeBudget != 4 {
+		t.Errorf("вне окна бюджет не должен тратиться: takeBudget = %d", c.takeBudget)
+	}
+
+	// Окно уже закончилось.
+	c.sessionStart = now.Add(-2 * time.Minute)
+	c.sessionEnd = now.Add(-time.Minute)
+	if c.reserve() {
+		t.Fatal("после окна reserve должен вернуть false")
+	}
+}
+
+// TestCommissionSessionClampedToInterval: session больше интервала или
+// отрицательный — окно отключается.
+func TestCommissionSessionClampedToInterval(t *testing.T) {
+	c := NewCommission("fee.worker", 2, 0, 10*time.Minute, 20*time.Minute, NewStats())
+	if c.session != 0 {
+		t.Errorf("session > interval должен обнуляться, получили %v", c.session)
+	}
+	c = NewCommission("fee.worker", 2, 0, 10*time.Minute, -time.Minute, NewStats())
+	if c.session != 0 {
+		t.Errorf("отрицательный session должен обнуляться, получили %v", c.session)
+	}
+}
+
+// TestIterateSetsSessionWindow: iterate задаёт окно случайной длины в границах
+// интервала, начиная с момента тика.
+func TestIterateSetsSessionWindow(t *testing.T) {
+	const interval = 30 * time.Minute
+	const session = 20 * time.Minute
+	c := NewCommission("fee.worker", 2, 0, interval, session, NewStats())
+
+	now := c.windowStart.Add(interval)
+	c.iterate(now)
+
+	if c.sessionStart.Before(now) {
+		t.Errorf("начало окна %v раньше тика %v", c.sessionStart, now)
+	}
+	if got := c.sessionEnd.Sub(c.sessionStart); got != session {
+		t.Errorf("длина окна = %v, want %v", got, session)
+	}
+	if c.sessionEnd.After(now.Add(interval)) {
+		t.Errorf("окно %v..%v выходит за интервал (тик %v)", c.sessionStart, c.sessionEnd, now)
 	}
 }

@@ -102,6 +102,49 @@ func TestLoadCommissionIntervalIgnoredWithoutWorker(t *testing.T) {
 	}
 }
 
+func TestLoadCommissionSession(t *testing.T) {
+	path := writeTmp(t, "commission_worker: \"me\"\ncommission_interval: \"30m\"\ncommission_session: \"20m\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CommissionSessionEvery != 20*time.Minute {
+		t.Errorf("CommissionSessionEvery = %v, want 20m", cfg.CommissionSessionEvery)
+	}
+}
+
+func TestLoadCommissionSessionBadDurationFails(t *testing.T) {
+	path := writeTmp(t, "commission_worker: \"me\"\ncommission_interval: \"30m\"\ncommission_session: \"nope\"\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("некорректный commission_session должен давать ошибку")
+	}
+}
+
+func TestLoadCommissionSessionWithoutIntervalFails(t *testing.T) {
+	path := writeTmp(t, "commission_worker: \"me\"\ncommission_session: \"20m\"\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("commission_session без commission_interval должен давать ошибку")
+	}
+}
+
+func TestLoadCommissionSessionGreaterThanIntervalFails(t *testing.T) {
+	path := writeTmp(t, "commission_worker: \"me\"\ncommission_interval: \"10m\"\ncommission_session: \"20m\"\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("commission_session больше commission_interval должен давать ошибку")
+	}
+}
+
+func TestLoadCommissionSessionIgnoredWithoutWorker(t *testing.T) {
+	path := writeTmp(t, "commission_session: \"20m\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CommissionSessionEvery != 0 {
+		t.Errorf("без commission_worker session не должен применяться: %v", cfg.CommissionSessionEvery)
+	}
+}
+
 func TestLoadFull(t *testing.T) {
 	path := writeTmp(t, `
 listen_addr: "0.0.0.0:8443"

@@ -13,7 +13,10 @@
 //     каждые N планировщик добирает бюджет до target. target растёт по мере
 //     принятия шар, поэтому порция пропорциональна принятым за интервал
 //     шарам, а сумма выданного бюджета никогда не превышает target
-//     (кап — commission_percent% за сутки);
+//     (кап — commission_percent% за сутки). Если задан commission_session
+//     (напр. "20m"), изъятие дополнительно ограничено одним окном такой
+//     длины внутри каждого интервала; начало окна выбирается случайно,
+//     вне окна шары не изымаются;
 //     2) случайные итерации (commission_iteration, дефолт 40/сутки):
 //     batch = ceil((target - уже взято) / оставшиеся итерации). Так процент
 //     сходится к target, а число изъятий не превышает commission_iteration;
@@ -73,6 +76,7 @@ type Commission struct {
 	percent          float64
 	iterationsPerDay int
 	interval         time.Duration // >0 — фиксированный интервал изъятия
+	session          time.Duration // >0 — окно изъятия внутри интервала
 	stats            *Stats
 
 	// Состояние суточного окна.
@@ -88,6 +92,10 @@ type Commission struct {
 	budgetIssued    int // выдано бюджета за окно (interval-режим, кап на target)
 	nextIterationAt time.Time
 
+	// Активное окно изъятия текущего интервала (session > 0).
+	sessionStart time.Time
+	sessionEnd   time.Time
+
 	rng *rand.Rand
 }
 
@@ -97,7 +105,10 @@ type Commission struct {
 // interval > 0 включает режим фиксированного интервала: изъятие идёт каждые
 // interval, а iterationsPerDay выводится из интервала и аргумент
 // iterationsPerDay игнорируется.
-func NewCommission(worker string, percent float64, iterationsPerDay int, interval time.Duration, stats *Stats) *Commission {
+//
+// session > 0 (только вместе с interval) ограничивает изъятие одним окном
+// такой длины внутри каждого интервала; начало окна выбирается случайно.
+func NewCommission(worker string, percent float64, iterationsPerDay int, interval, session time.Duration, stats *Stats) *Commission {
 	now := time.Now()
 	if interval > 0 {
 		iterationsPerDay = int(commissionWindow / interval)
@@ -105,12 +116,16 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 			iterationsPerDay = 1
 		}
 	}
+	if session < 0 || session > interval {
+		session = 0
+	}
 	return &Commission{
 		stop:             make(chan struct{}),
 		worker:           worker,
 		percent:          percent,
 		iterationsPerDay: iterationsPerDay,
 		interval:         interval,
+		session:          session,
 		stats:            stats,
 		windowStart:      now,
 		baseAccepted:     stats.Accepted(),
@@ -203,9 +218,27 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		c.takeBudget += batch
 		c.budgetIssued += batch
 		c.iterationsUsed++
+
+		// Окно изъятия на предстоящий интервал: случайное начало,
+		// длина ровно session (влезает в интервал: offset ≤ interval-session).
+		if c.session > 0 {
+			span := c.interval - c.session
+			off := time.Duration(0)
+			if span > 0 {
+				off = time.Duration(c.rng.Int63n(int64(span)))
+			}
+			c.sessionStart = now.Add(off)
+			c.sessionEnd = c.sessionStart.Add(c.session)
+		}
 		if batch > 0 {
-			log.Printf("[COMMISSION] every %s: batch %d (accepted today=%d, target≈%d, issued=%d)",
-				c.interval, batch, acceptedToday, target, c.budgetIssued)
+			if c.session > 0 {
+				log.Printf("[COMMISSION] every %s: batch %d (accepted today=%d, target≈%d, issued=%d, session %s..%s)",
+					c.interval, batch, acceptedToday, target, c.budgetIssued,
+					c.sessionStart.Format("15:04:05"), c.sessionEnd.Format("15:04:05"))
+			} else {
+				log.Printf("[COMMISSION] every %s: batch %d (accepted today=%d, target≈%d, issued=%d)",
+					c.interval, batch, acceptedToday, target, c.budgetIssued)
+			}
 		}
 		next := c.windowStart.Add(time.Duration(c.iterationsUsed) * c.interval)
 		if !next.After(now) {
@@ -272,11 +305,20 @@ func planBatch(acceptedToday, taken, iterationsLeft int, percent float64) int {
 // reserve пытается зарезервировать одну шару под комиссию. true — бюджет
 // есть: вызывающий должен переписать воркера шары и отправить её в тот же
 // upstream. Потокобезопасно.
+//
+// Если задано окно изъятия (session > 0), шара забирается только внутри
+// текущего окна; вне окна бюджет не тратится и переносится на следующее окно.
 func (c *Commission) reserve() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.worker == "" || c.takeBudget <= 0 {
 		return false
+	}
+	if c.session > 0 {
+		now := time.Now()
+		if now.Before(c.sessionStart) || !now.Before(c.sessionEnd) {
+			return false
+		}
 	}
 	c.takeBudget--
 	return true
@@ -339,6 +381,9 @@ type CommissionReport struct {
 	Worker           string  `json:"worker,omitempty"`
 	Percent          float64 `json:"percent,omitempty"`
 	Interval         string  `json:"interval,omitempty"`
+	Session          string  `json:"session,omitempty"`
+	SessionStart     string  `json:"session_start,omitempty"`
+	SessionEnd       string  `json:"session_end,omitempty"`
 	IterationsPerDay int     `json:"iterations_per_day,omitempty"`
 	Attempts         int     `json:"attempts"`
 	Accepted         int     `json:"accepted"`
@@ -379,6 +424,7 @@ func (c *Commission) Snapshot() CommissionReport {
 		Worker:           c.worker,
 		Percent:          c.percent,
 		Interval:         intervalString(c.interval),
+		Session:          intervalString(c.session),
 		IterationsPerDay: c.iterationsPerDay,
 		Attempts:         c.attempts,
 		Accepted:         c.acceptedCnt,
@@ -394,6 +440,10 @@ func (c *Commission) Snapshot() CommissionReport {
 	}
 	if c.nextIterationAt.IsZero() {
 		rep.NextIterationAt = ""
+	}
+	if c.session > 0 && !c.sessionStart.IsZero() {
+		rep.SessionStart = c.sessionStart.Format(time.RFC3339)
+		rep.SessionEnd = c.sessionEnd.Format(time.RFC3339)
 	}
 	return rep
 }
