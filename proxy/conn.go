@@ -223,6 +223,14 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 
 	// feeAuth — соединение сейчас авторизовано под commission_worker.
 	feeAuth := false
+	// setFee фиксирует режим изъятия в сессии: пока он включён, stream
+	// пул→майнер не применяет и не пробрасывает set_difficulty (см.
+	// pipePoolToMiner), чтобы сложность майнера не подменялась сложностью
+	// commission_worker.
+	setFee := func(v bool) {
+		feeAuth = v
+		se.setFeeActive(v)
+	}
 	writeAuthorize := func(worker string) bool {
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if err := writeLine(dst, miningAuthorizeLine(worker, commissionAuthTag)); err != nil {
@@ -245,7 +253,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 				if commission.reserve() {
 					rewritten, err := rewriteSubmitWorker(line, commission.worker)
 					if err == nil && (feeAuth || writeAuthorize(commission.worker)) {
-						feeAuth = true
+						setFee(true)
 						diff := se.markCommissionSubmit(id)
 						ack := se.armCommissionAck()
 						commission.countSteal(diff)
@@ -270,13 +278,13 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 				} else if feeAuth {
 					// Бюджет исчерпан — возвращаем соединение майнеру.
 					if w := se.workerName(); w != "" && writeAuthorize(w) {
-						feeAuth = false
+						setFee(false)
 					}
 				}
 			} else if feeAuth {
 				// Комиссия отключена/отклонена пулом — вернуть воркер майнера.
 				if w := se.workerName(); w != "" && writeAuthorize(w) {
-					feeAuth = false
+					setFee(false)
 				}
 			}
 			se.submit(id, WorkerFromSubmit(line))
@@ -307,6 +315,15 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 		line := scanner.Bytes()
 
 		if diff, ok := ParseSetDifficulty(line); ok {
+			if se.feeActiveNow() {
+				// Пока соединение авторизовано под commission_worker, пул
+				// присылает сложность изъятия. Не применяем и не пробрасываем
+				// её майнеру — ASIC и сессия остаются на сложности майнера,
+				// иначе шары комиссии весят в разы меньше (см. setFeeActive).
+				log.Printf("[CONN] пул %s: set_difficulty %g скрыта в режиме изъятия (воркер %q)",
+					se.pool, diff, se.workerName())
+				continue
+			}
 			se.setDifficulty(diff)
 		} else if resp, ok := ParsePoolResponse(line); ok {
 			if resp.ID == commissionAuthID {

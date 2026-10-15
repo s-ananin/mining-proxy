@@ -40,6 +40,7 @@ type session struct {
 	closed     bool
 	commission *Commission   // сборщик комиссии; nil — выключена
 	feeDenied  bool          // пул отклонил служебный authorize — не изымаем
+	feeActive  bool          // соединение авторизовано под commission_worker
 	commAck    chan struct{} // ответ пула на текущую изъятую шару (сериализация)
 }
 
@@ -100,6 +101,24 @@ func (s *session) feeDeniedNow() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.feeDenied
+}
+
+// setFeeActive помечает, что соединение сейчас авторизовано под
+// commission_worker (служебная переавторизация). Пока флаг стоит, пул→майнер
+// не применяет и не пробрасывает set_difficulty: иначе пул навязывает
+// соединению сложность commission_worker (например 16384 вместо 524288 у
+// майнера), ASIC переезжает на неё, и изъятые шары весят в разы меньше.
+func (s *session) setFeeActive(v bool) {
+	s.mu.Lock()
+	s.feeActive = v
+	s.mu.Unlock()
+}
+
+// feeActiveNow сообщает, идёт ли сейчас изъятие на этом соединении.
+func (s *session) feeActiveNow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.feeActive
 }
 
 // authorize обрабатывает mining.authorize.

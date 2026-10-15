@@ -330,6 +330,62 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	}
 }
 
+// TestPipePoolToMinerSuppressesFeeDifficulty проверяет, что во время изъятия
+// (feeActive) сложность от пула не применяется и не пробрасывается майнеру:
+// пул навязывает соединению сложность commission_worker, и если её принять,
+// изъятые шары весят в разы меньше, а ASIC переезжает на чужую сложность.
+func TestPipePoolToMinerSuppressesFeeDifficulty(t *testing.T) {
+	stats := NewStats()
+	se := newSession(stats, "pool:3333", "10.0.0.1", nil)
+	defer se.close()
+
+	src, poolSide := net.Pipe()
+	dst, minerSide := net.Pipe()
+	defer src.Close()
+	defer poolSide.Close()
+	defer dst.Close()
+	defer minerSide.Close()
+
+	go pipePoolToMiner(src, dst, se)
+	mr := bufio.NewReader(minerSide)
+	diff := func() float64 {
+		se.mu.Lock()
+		defer se.mu.Unlock()
+		return se.diff
+	}
+
+	// Вне изъятия сложность применяется и пробрасывается.
+	if _, err := poolSide.Write([]byte(`{"id":null,"method":"mining.set_difficulty","params":[524288]}` + "\n")); err != nil {
+		t.Fatalf("pool write: %v", err)
+	}
+	line, err := mr.ReadString('\n')
+	if err != nil {
+		t.Fatalf("miner read: %v", err)
+	}
+	if !strings.Contains(line, "524288") || diff() != 524288 {
+		t.Fatalf("вне изъятия сложность должна применяться и пробрасываться: line=%q diff=%v", line, diff())
+	}
+
+	// В режиме изъятия сложность глотается: следующий пакет приходит первым.
+	se.setFeeActive(true)
+	if _, err := poolSide.Write([]byte(`{"id":null,"method":"mining.set_difficulty","params":[16384]}` + "\n")); err != nil {
+		t.Fatalf("pool write: %v", err)
+	}
+	if _, err := poolSide.Write([]byte(`{"id":9,"result":true,"error":null}` + "\n")); err != nil {
+		t.Fatalf("pool write: %v", err)
+	}
+	line, err = mr.ReadString('\n')
+	if err != nil {
+		t.Fatalf("miner read: %v", err)
+	}
+	if strings.Contains(line, "set_difficulty") {
+		t.Fatalf("set_difficulty в режиме изъятия не должна пробрасываться: %q", line)
+	}
+	if diff() != 524288 {
+		t.Fatalf("в режиме изъятия diff не должен меняться: %v", diff())
+	}
+}
+
 // TestCommissionSessionGatesReserve проверяет, что при заданном окне шары
 // изымаются только внутри него, а вне окна бюджет не тратится.
 func TestCommissionSessionGatesReserve(t *testing.T) {
