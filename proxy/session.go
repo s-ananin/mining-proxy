@@ -114,12 +114,21 @@ func (s *session) authorize(worker string) {
 
 // setDifficulty запоминает сложность из mining.set_difficulty и обновляет
 // её в реестре (текущая сложность воркера видна в /status).
+//
+// Диагностика: смена сложности логируется как old->new. Это ключ к «затуханию»
+// комиссии: изъятые шары штампуются текущей сложностью соединения, поэтому
+// падение сложности (например, из-за служебной переавторизации) напрямую
+// уменьшает work, который видит пул по commission_worker.
 func (s *session) setDifficulty(diff float64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	old := s.diff
 	s.diff = diff
 	if s.worker != "" {
 		s.stats.SetDifficulty(s.pool, s.worker, diff)
+	}
+	s.mu.Unlock()
+	if old != diff {
+		log.Printf("[CONN] пул %s: set_difficulty %g -> %g (воркер %q)", s.pool, old, diff, s.workerName())
 	}
 }
 
