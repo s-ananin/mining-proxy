@@ -114,6 +114,34 @@ func TestStatsEmptyReport(t *testing.T) {
 	}
 }
 
+// Воркер без открытых соединений в отчёт не попадает (иначе копятся
+// «мёртвые» пулы после переключений ASIC).
+func TestStatsHidesInactiveWorkers(t *testing.T) {
+	s := proxy.NewStats()
+	s.Connect("p:1")
+	s.BindWorker("p:1", "w", "10.0.0.1")
+	s.Submit("p:1", "w", "10.0.0.1", 16)
+	s.Result("p:1", "w", 16, true, "")
+
+	if got := len(s.Report().Workers); got != 1 {
+		t.Fatalf("workers = %d, want 1 (соединение активно)", got)
+	}
+
+	// Соединение закрылось — воркер скрыт, счётчик воркеров пула обнулён.
+	s.UnbindWorker("p:1", "w")
+	rep := s.Report()
+	if len(rep.Workers) != 0 || rep.Totals.Workers != 0 {
+		t.Errorf("workers = %d (totals %d), want 0 после отключения",
+			len(rep.Workers), rep.Totals.Workers)
+	}
+	if rep.Totals.Hashrate != 0 {
+		t.Errorf("totals hashrate = %d, want 0 (неактивный воркер не учитывается)", rep.Totals.Hashrate)
+	}
+	if len(rep.Pools) != 1 || rep.Pools[0].Workers != 0 {
+		t.Errorf("pools = %+v, want пул с 0 воркеров", rep.Pools)
+	}
+}
+
 // Несколько воркеров и пулов разделяются, сортировка стабильна.
 func TestStatsMultiWorkerSorting(t *testing.T) {
 	s := proxy.NewStats()

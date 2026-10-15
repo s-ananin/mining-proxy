@@ -278,7 +278,11 @@ func TestShareMonitoringEndToEnd(t *testing.T) {
 		c.submitOne("client.worker.x")
 		time.Sleep(20 * time.Millisecond)
 	}
-	c.close()
+	// Ждём ответы пула, пока соединение открыто: неактивные воркеры в
+	// отчёте не показываются, поэтому читаем статистику до c.close().
+	waitFor(t, "all shares accepted", func() bool {
+		return stats.Report().Totals.Accepted == 5
+	})
 
 	// Пул получил все 5 шар (данные прошли через прокси без подмен).
 	subs, auths, submits, worker := pool.stats()
@@ -319,6 +323,8 @@ func TestShareMonitoringEndToEnd(t *testing.T) {
 		t.Errorf("pools = %+v", rep.Pools)
 	}
 
+	c.close()
+
 	// После закрытия соединения активных сессий не остаётся.
 	waitFor(t, "connections drain", func() bool {
 		return stats.Report().Totals.ConnectionsActive == 0
@@ -339,7 +345,10 @@ func TestRejectedShares(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		c.submitOne("reject.worker")
 	}
-	c.close()
+	// Читаем статистику, пока соединение открыто (неактивные воркеры скрыты).
+	waitFor(t, "all shares rejected", func() bool {
+		return stats.Report().Totals.Rejected == 3
+	})
 
 	rep := stats.Report()
 	if rep.Totals.Submits != 3 || rep.Totals.Rejected != 3 || rep.Totals.Accepted != 0 {
@@ -354,6 +363,8 @@ func TestRejectedShares(t *testing.T) {
 	if rep.Totals.AcceptedPercent != 0 {
 		t.Errorf("AcceptedPercent = %v, want 0", rep.Totals.AcceptedPercent)
 	}
+
+	c.close()
 }
 
 // Пул молчит (нет ответа на submit) → шара списывается в lost, а не висит.

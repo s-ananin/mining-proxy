@@ -369,6 +369,16 @@ func (s *Stats) Report() Report {
 		},
 	}
 
+	// Активные воркеры — с хотя бы одним открытым соединением. По ним
+	// считаем воркеров на пул и в totals; неактивные («мёртвые» после
+	// переключения ASIC между пулами) в отчёт не попадают.
+	activeByPool := map[string]int{}
+	for _, w := range s.workers {
+		if w.conns > 0 {
+			activeByPool[w.pool]++
+		}
+	}
+
 	// Пулы: отдельная копия, чтобы не держать данные под блокировкой.
 	for _, p := range s.pools {
 		pr := PoolReport{
@@ -379,7 +389,7 @@ func (s *Stats) Report() Report {
 			Rejected:        p.rejected,
 			Lost:            p.lost,
 			AcceptedPercent: percent(p.accepted, p.submits),
-			Workers:         len(p.workers),
+			Workers:         activeByPool[p.pool],
 			FirstSeen:       p.firstSeen.Format(time.RFC3339),
 			LastSeen:        p.lastSeen.Format(time.RFC3339),
 		}
@@ -389,9 +399,14 @@ func (s *Stats) Report() Report {
 		return rep.Pools[i].Pool < rep.Pools[j].Pool
 	})
 
-	// Воркеры + хешрейт по каждому.
+	// Воркеры + хешрейт по каждому. Показываем только активных (есть хотя
+	// бы одно открытое соединение): иначе в /status копятся «мёртвые»
+	// воркеры/пулы, оставшиеся после переключений ASIC между пулами.
 	poolHash := map[string]int64{}
 	for _, w := range s.workers {
+		if w.conns == 0 {
+			continue
+		}
 		hr := hashrate(w.samples, now)
 		poolHash[w.pool] += hr
 		wr := WorkerReport{
@@ -414,6 +429,7 @@ func (s *Stats) Report() Report {
 		rep.Workers = append(rep.Workers, wr)
 		rep.Totals.Hashrate += hr
 	}
+	rep.Totals.Workers = len(rep.Workers)
 	sort.Slice(rep.Workers, func(i, j int) bool {
 		a, b := rep.Workers[i], rep.Workers[j]
 		if a.Pool != b.Pool {
