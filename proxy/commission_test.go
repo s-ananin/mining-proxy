@@ -71,7 +71,7 @@ func TestCommissionDisabled(t *testing.T) {
 	if c.Enabled() {
 		t.Error("пустой worker — комиссия должна быть выключена")
 	}
-	if c.reserve() {
+	if c.reserve("w", 1) {
 		t.Error("reserve должен вернуть false при выключенной комиссии")
 	}
 	if c.Snapshot().Enabled {
@@ -83,15 +83,15 @@ func TestCommissionDisabled(t *testing.T) {
 // воркера → ответ пула зачитывается в счётчики комиссии, а не воркера.
 func TestCommissionStealAndCount(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("test.com", 2, 40, 0, 0, stats)
-	c.takeBudget = 2
+	c := NewCommission("test.com", 2, 0, 30*time.Minute, 0, stats)
+	c.workerWorkBudget["w"] = 6 // diff 2+4=6, ровно на две шары
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
 	defer se.close()
 
 	line := []byte(`{"id":7,"method":"mining.submit","params":["w","j","n2","nt","nc"]}`)
 
 	// Шара 1: забрана, пул принял.
-	if !c.reserve() {
+	if !c.reserve("w", 2) {
 		t.Fatal("первый reserve должен выдать бюджет")
 	}
 	rewritten, err := rewriteSubmitWorker(line, c.worker)
@@ -109,21 +109,21 @@ func TestCommissionStealAndCount(t *testing.T) {
 		t.Errorf("переписанная шара: id=%d worker=%q, want 7/test.com", rew.ID, rew.Params[0])
 	}
 	se.setDifficulty(2)
-	c.countSteal(se.markCommissionSubmit("7"))
+	c.countSteal("w", se.markCommissionSubmit("7", "w"))
 	if !se.resolve(PoolResponse{ID: "7", Accepted: true}) {
 		t.Fatal("resolve комиссионной шары должен вернуть true")
 	}
 
 	// Шара 2: забрана, пул отклонил.
-	if !c.reserve() {
+	if !c.reserve("w", 4) {
 		t.Fatal("второй reserve должен выдать бюджет")
 	}
 	se.setDifficulty(4)
-	c.countSteal(se.markCommissionSubmit("8"))
+	c.countSteal("w", se.markCommissionSubmit("8", "w"))
 	se.resolve(PoolResponse{ID: "8", Accepted: false, Error: "unknown job id"})
 
-	// Шара 3: бюджет исчерпан — остаётся майнеру.
-	if c.reserve() {
+	// Шара 3: бюджет воркера исчерпан — остаётся майнеру.
+	if c.reserve("w", 1) {
 		t.Fatal("третий reserve не должен выдавать бюджет")
 	}
 	se.submit("9", "w")
@@ -141,6 +141,14 @@ func TestCommissionStealAndCount(t *testing.T) {
 	if snap.WorkIssued != 6 || snap.WorkAccepted != 2 || snap.WorkRejected != 4 {
 		t.Errorf("work issued=%.0f accepted=%.0f rejected=%.0f, want 6/2/4",
 			snap.WorkIssued, snap.WorkAccepted, snap.WorkRejected)
+	}
+	// Per-воркер breakdown.
+	if len(snap.Workers) != 1 || snap.Workers[0].Worker != "w" {
+		t.Fatalf("workers breakdown = %+v, want [{w ...}]", snap.Workers)
+	}
+	wr := snap.Workers[0]
+	if wr.WorkIssued != 6 || wr.WorkAccepted != 2 || wr.WorkRejected != 4 || wr.Taken != 1 {
+		t.Errorf("worker breakdown = %+v, want issued=6 accepted=2 rejected=4 taken=1", wr)
 	}
 	// Майнеру засчитана только третья шара — комиссионные в stats не попали.
 	if stats.Submits() != 1 || stats.Accepted() != 1 {
@@ -164,57 +172,88 @@ func TestIterationSchedulesBudget(t *testing.T) {
 	}
 }
 
-func TestIntervalProportionalBudget(t *testing.T) {
+func TestIntervalPerWorkerBudget(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("test.com", 2, 0, 10*time.Minute, 0, stats)
 	if c.iterationsPerDay != 144 {
 		t.Fatalf("iterationsPerDay = %d, want 144 (24h/10m)", c.iterationsPerDay)
 	}
 
-	now := c.windowStart
-	accept := func(n int) {
+	// Inject hashrate directly: hashrate = sum(diff) * 2^32 / span.
+	// Воркер A: 100 TH/s, воркер B: 300 TH/s.
+	setHashrate := func(worker string, hr float64) {
+		stats.mu.Lock()
+		defer stats.mu.Unlock()
+		w := stats.getWorker("pool:3333", worker, time.Now())
+		w.conns = 1
+		diff := 16384.0
+		span := 600.0 // 10 минут
+		totalDiff := hr * span / diffToHash
+		n := int(totalDiff/diff) + 2
+		now := time.Now()
+		start := now.Add(-time.Duration(span) * time.Second)
+		step := span / float64(n-1)
 		for i := 0; i < n; i++ {
-			stats.Result("pool:3333", "w", 1, true, "")
+			at := start.Add(time.Duration(float64(i) * step * float64(time.Second)))
+			w.samples = append(w.samples, shareSample{at: at, diff: diff})
 		}
 	}
+	setHashrate("A", 100e12)
+	setHashrate("B", 300e12)
 
-	// Первый тик: принято 200 → target 2% = 4.
-	accept(200)
-	next := c.iterate(now.Add(10 * time.Minute))
-	if c.takeBudget != 4 || c.budgetIssued != 4 {
-		t.Errorf("после 1-го тика budget=%d issued=%d, want 4/4", c.takeBudget, c.budgetIssued)
-	}
-	if !next.After(now.Add(10 * time.Minute)) {
-		t.Errorf("next = %v, want after 10m", next)
+	// Хешрейты должны быть > 0.
+	hashrates := stats.ActiveHashrates()
+	if len(hashrates) != 2 {
+		t.Fatalf("ActiveHashrates вернул %d воркеров, want 2: %v", len(hashrates), hashrates)
 	}
 
-	// Второй тик: принято ещё 100 (итого 300) → target 6, добираем 2.
-	accept(100)
-	c.iterate(now.Add(20 * time.Minute))
-	if c.takeBudget != 6 || c.budgetIssued != 6 {
-		t.Errorf("после 2-го тика budget=%d issued=%d, want 6/6", c.takeBudget, c.budgetIssued)
+	c.iterate(c.windowStart.Add(10 * time.Minute))
+
+	// Бюджет B должен быть ≈3× больше бюджета A (хешрейт B в 3 раза больше).
+	budgetA := c.workerWorkBudget["A"]
+	budgetB := c.workerWorkBudget["B"]
+	if budgetA <= 0 || budgetB <= 0 {
+		t.Fatalf("бюджеты должны быть > 0: A=%g B=%g", budgetA, budgetB)
+	}
+	ratio := budgetB / budgetA
+	if ratio < 2.5 || ratio > 3.5 {
+		t.Errorf("budgetB/budgetA = %.2f, want ≈3.0 (пропорционально хешрейту)", ratio)
 	}
 
-	// Третий тик без новых шар: цель не растёт, изъятия нет (кап).
-	c.iterate(now.Add(30 * time.Minute))
-	if c.takeBudget != 6 || c.budgetIssued != 6 {
-		t.Errorf("без новых шар budget=%d issued=%d, want 6/6", c.takeBudget, c.budgetIssued)
+	// Бюджет воркера A: hr_A × interval / 2^32 × percent / 100.
+	wantA := hashrates["A"] * float64(10*time.Minute) / diffToHash * 0.02
+	if gotA := budgetA; gotA < wantA*0.9 || gotA > wantA*1.1 {
+		t.Errorf("budgetA = %g, want ≈%g (±10%%)", gotA, wantA)
 	}
-	// Суммарно за окно — не более percent% от принятых.
-	if c.budgetIssued > int(float64(300)*0.02) {
-		t.Errorf("issued %d превышает 2%% от 300", c.budgetIssued)
+
+	// Шара от B с diff 1M укладывается в бюджет.
+	if !c.reserve("B", 1000000) {
+		t.Errorf("reserve(B, 1M) = false, бюджет B=%g", c.workerWorkBudget["B"])
+	}
+	// Шара от A с diff 1M может не влезть (бюджет A меньше).
+	budgetAAfter := c.workerWorkBudget["A"]
+	c.reserve("A", budgetAAfter) // забираем весь бюджет A
+	if c.reserve("A", 1) {
+		t.Error("reserve(A, 1) после исчерпания бюджета должен быть false")
 	}
 }
 
 func TestIntervalWindowReset(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("test.com", 2, 0, 10*time.Minute, 0, stats)
-	for i := 0; i < 200; i++ {
-		stats.Result("pool:3333", "w", 1, true, "")
+	// Inject hashrate for one worker.
+	stats.mu.Lock()
+	w := stats.getWorker("pool:3333", "w", time.Now())
+	w.conns = 1
+	now := time.Now()
+	for i := 4; i >= 0; i-- {
+		w.samples = append(w.samples, shareSample{at: now.Add(-time.Duration(i) * time.Minute), diff: 16384})
 	}
+	stats.mu.Unlock()
+
 	c.iterate(c.windowStart.Add(10 * time.Minute))
-	if c.budgetIssued != 4 {
-		t.Fatalf("issued = %d, want 4", c.budgetIssued)
+	if len(c.workerWorkBudget) == 0 {
+		t.Fatal("workBudget не заполнен")
 	}
 
 	old := c.windowStart
@@ -222,9 +261,11 @@ func TestIntervalWindowReset(t *testing.T) {
 	if !c.windowStart.After(old) {
 		t.Fatal("окно не сброшено")
 	}
-	if c.budgetIssued != 0 || c.takeBudget != 0 || c.iterationsUsed != 1 {
-		t.Errorf("после сброса issued=%d budget=%d iters=%d, want 0/0/1",
-			c.budgetIssued, c.takeBudget, c.iterationsUsed)
+	if c.iterationsUsed != 1 {
+		t.Errorf("iterationsUsed = %d, want 1", c.iterationsUsed)
+	}
+	if len(c.workIssuedByWorker) != 0 || len(c.takenByWorker) != 0 {
+		t.Errorf("per-воркер счётчики должны обнуляться при сбросе окна")
 	}
 }
 
@@ -245,6 +286,9 @@ func TestCommissionWindowReset(t *testing.T) {
 	if c.taken != 0 || c.takeBudget != 0 {
 		t.Errorf("счётчики окна должны обнуляться: taken=%d budget=%d", c.taken, c.takeBudget)
 	}
+	if len(c.workerWorkBudget) != 0 || len(c.workIssuedByWorker) != 0 {
+		t.Errorf("per-воркер счётчики должны обнуляться при сбросе окна")
+	}
 }
 
 // TestPipeMinerToPoolCommissionSwitch проверяет переавторизацию: на время
@@ -253,8 +297,8 @@ func TestCommissionWindowReset(t *testing.T) {
 // майнера.
 func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("fee.worker", 2, 40, 0, 0, stats)
-	c.takeBudget = 1
+	c := NewCommission("fee.worker", 2, 0, 30*time.Minute, 0, stats)
+	c.workerWorkBudget["client.w"] = 16384 // ровно на одну шару diff 16384
 
 	clientConn, minerSide := net.Pipe()
 	defer clientConn.Close()
@@ -302,6 +346,9 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	if a := recv(); a.Method != "mining.authorize" || worker(a) != "client.w" {
 		t.Fatalf("authorize майнера проброшен неверно: %+v", a)
 	}
+
+	// Сложность пула — иначе diff=0 и reserve не пропустит шару.
+	se.setDifficulty(16384)
 
 	// Первая шара: забрана → authorize(fee.worker) + submit(fee.worker).
 	send(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
@@ -407,33 +454,33 @@ func TestPipePoolToMinerSuppressesFeeDifficulty(t *testing.T) {
 func TestCommissionSessionGatesReserve(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("fee.worker", 2, 0, 30*time.Minute, 20*time.Minute, stats)
-	c.takeBudget = 5
+	c.workerWorkBudget["w"] = 5
 
 	now := time.Now()
 	// Окно активно сейчас.
 	c.sessionStart = now.Add(-time.Minute)
 	c.sessionEnd = now.Add(time.Minute)
-	if !c.reserve() {
+	if !c.reserve("w", 1) {
 		t.Fatal("внутри окна reserve должен вернуть true")
 	}
-	if c.takeBudget != 4 {
-		t.Errorf("takeBudget = %d, want 4", c.takeBudget)
+	if c.workerWorkBudget["w"] != 4 {
+		t.Errorf("workBudget[w] = %g, want 4", c.workerWorkBudget["w"])
 	}
 
 	// Окно ещё не началось.
 	c.sessionStart = now.Add(time.Minute)
 	c.sessionEnd = now.Add(2 * time.Minute)
-	if c.reserve() {
+	if c.reserve("w", 1) {
 		t.Fatal("до начала окна reserve должен вернуть false")
 	}
-	if c.takeBudget != 4 {
-		t.Errorf("вне окна бюджет не должен тратиться: takeBudget = %d", c.takeBudget)
+	if c.workerWorkBudget["w"] != 4 {
+		t.Errorf("вне окна бюджет не должен тратиться: workBudget[w] = %g", c.workerWorkBudget["w"])
 	}
 
 	// Окно уже закончилось.
 	c.sessionStart = now.Add(-2 * time.Minute)
 	c.sessionEnd = now.Add(-time.Minute)
-	if c.reserve() {
+	if c.reserve("w", 1) {
 		t.Fatal("после окна reserve должен вернуть false")
 	}
 }

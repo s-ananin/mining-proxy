@@ -208,17 +208,24 @@ func (s *session) submit(id, worker string) {
 	}
 }
 
+// currentDiff возвращает текущую сложность соединения (потокобезопасно).
+func (s *session) currentDiff() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.diff
+}
+
 // markCommissionSubmit регистрирует забранную комиссией шару как ожидающую
 // ответа пула. Ответ по её id уйдёт в счётчики комиссии, а не воркеру
-// майнера (см. resolve). Возвращает сложность шары (текущую сложность
-// соединения) — комиссия копит по ней work.
-func (s *session) markCommissionSubmit(id string) float64 {
+// майнера (см. resolve). worker — имя воркера майнера, с которого забрана
+// шара (для per-воркер учёта). Возвращает сложность шары.
+func (s *session) markCommissionSubmit(id, worker string) float64 {
 	if id == "" {
 		return 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pending[id] = pendingShare{commission: true, diff: s.diff, at: time.Now()}
+	s.pending[id] = pendingShare{worker: worker, commission: true, diff: s.diff, at: time.Now()}
 	return s.diff
 }
 
@@ -260,7 +267,7 @@ func (s *session) resolve(resp PoolResponse) bool {
 	}
 	if p.commission {
 		if s.commission != nil {
-			s.commission.countResult(resp.Accepted, p.diff)
+			s.commission.countResult(p.worker, resp.Accepted, p.diff)
 			if resp.Accepted {
 				log.Printf("[COMMISSION] пул %s зачёл шару воркера %q (diff %g)",
 					s.pool, s.commission.worker, p.diff)

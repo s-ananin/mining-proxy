@@ -212,6 +212,27 @@ func (s *Stats) Accepted() int {
 	return s.accepted
 }
 
+// ActiveHashrates возвращает хешрейт (H/s) каждого активного воркера
+// (с хотя бы одним открытым соединением). Используется комиссией для
+// распределения бюджета пропорционально реальному вкладу каждого ASIC.
+func (s *Stats) ActiveHashrates() map[string]float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	out := make(map[string]float64)
+	for _, w := range s.workers {
+		if w.conns == 0 {
+			continue
+		}
+		hr := float64(hashrate(w.samples, now))
+		if hr <= 0 {
+			continue
+		}
+		out[w.worker] += hr
+	}
+	return out
+}
+
 // Result фиксирует ответ пула на шару: accepted=true → result:true.
 // rejected шары получают lastError (причина из error[1]).
 func (s *Stats) Result(pool, worker string, difficulty float64, accepted bool, errText string) {

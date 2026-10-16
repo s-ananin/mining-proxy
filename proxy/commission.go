@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -88,20 +89,28 @@ type Commission struct {
 	rejectedCnt     int // отклонено пулом
 	failedCnt       int // ошибок перенаправления / недоступности пула
 	iterationsUsed  int // итераций в текущем окне
-	takeBudget      int // сколько следующих шар забрать (порция итерации)
-	budgetIssued    int // выдано бюджета за окно (interval-режим, кап на target)
+	takeBudget      int // сколько следующих шар забрать (порция итерации, random-режим)
+	budgetIssued    int // выдано бюджета за окно (random-режим)
 	nextIterationAt time.Time
 
 	// Активное окно изъятия текущего интервала (session > 0).
 	sessionStart time.Time
 	sessionEnd   time.Time
 
-	// Диагностика: суммарная сложность (work) изъятых шар. Сравнивается с
-	// тем, что пул показал по commission_worker: наш work должен расти ровно.
-	workIssued    float64 // work всех изъятых шар (по сложности на момент изъятия)
-	workAccepted  float64 // work зачтённых пулом
-	workRejected  float64 // work отклонённых пулом
-	workSinceTick float64 // work, изъятый с прошлого тика (сбрасывается в iterate)
+	// Per-воркер бюджет work (interval-режим): каждый воркер получает
+	// budget = percent% × его хешрейт × интервал. Изымается пропорционально
+	// реальному вкладу каждого ASIC, а не «кто первый отправил шару».
+	workerWorkBudget map[string]float64
+
+	// Диагностика: суммарная сложность (work) изъятых шар по воркерам.
+	workIssued           float64 // work всех изъятых шар
+	workAccepted         float64 // work зачтённых пулом
+	workRejected         float64 // work отклонённых пулом
+	workSinceTick        float64 // work с прошлого тика
+	workIssuedByWorker   map[string]float64
+	workAcceptedByWorker map[string]float64
+	workRejectedByWorker map[string]float64
+	takenByWorker        map[string]int
 
 	rng *rand.Rand
 }
@@ -127,16 +136,21 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 		session = 0
 	}
 	return &Commission{
-		stop:             make(chan struct{}),
-		worker:           worker,
-		percent:          percent,
-		iterationsPerDay: iterationsPerDay,
-		interval:         interval,
-		session:          session,
-		stats:            stats,
-		windowStart:      now,
-		baseAccepted:     stats.Accepted(),
-		rng:              rand.New(rand.NewSource(now.UnixNano())),
+		stop:                 make(chan struct{}),
+		worker:               worker,
+		percent:              percent,
+		iterationsPerDay:     iterationsPerDay,
+		interval:             interval,
+		session:              session,
+		stats:                stats,
+		windowStart:          now,
+		baseAccepted:         stats.Accepted(),
+		workerWorkBudget:     map[string]float64{},
+		workIssuedByWorker:   map[string]float64{},
+		workAcceptedByWorker: map[string]float64{},
+		workRejectedByWorker: map[string]float64{},
+		takenByWorker:        map[string]int{},
+		rng:                  rand.New(rand.NewSource(now.UnixNano())),
 	}
 }
 
@@ -208,22 +222,29 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		c.iterationsUsed = 0
 		c.takeBudget = 0
 		c.budgetIssued = 0
+		c.workerWorkBudget = map[string]float64{}
+		c.workIssuedByWorker = map[string]float64{}
+		c.workAcceptedByWorker = map[string]float64{}
+		c.workRejectedByWorker = map[string]float64{}
+		c.takenByWorker = map[string]int{}
 	}
 	end := c.windowStart.Add(commissionWindow)
 
-	// Фиксированный интервал: каждый тик добираем бюджет до текущего target
-	// = percent% принятых за окно. target растёт вместе с accepted, поэтому
-	// порция пропорциональна принятым за интервал шарам, а сумма выданного
-	// за окно бюджета не превышает target (суточный кап на процент).
+	// Фиксированный интервал: каждый тик распределяем work-бюджет
+	// пропорционально хешрейту каждого активного воркера.
+	// Бюджет воркера = percent% × его хешрейт × интервал.
+	// Так каждый ASIC платит ровно percent% от СВОЕГО хешрейта,
+	// а не «кто первый отправил шару».
 	if c.interval > 0 {
-		acceptedToday := c.stats.Accepted() - c.baseAccepted
-		target := int(float64(acceptedToday) * c.percent / 100)
-		batch := target - c.budgetIssued
-		if batch < 0 {
-			batch = 0
+		hashrates := c.stats.ActiveHashrates()
+		c.workerWorkBudget = map[string]float64{}
+		for w, hr := range hashrates {
+			// Work, который воркер произведёт за один интервал:
+			// hashrate (H/s) × интервал (s) / 2^32 = difficulty units.
+			intervalWork := hr * float64(c.interval) / diffToHash
+			// Комиссия берёт percent% от этого work.
+			c.workerWorkBudget[w] = intervalWork * c.percent / 100
 		}
-		c.takeBudget += batch
-		c.budgetIssued += batch
 		c.iterationsUsed++
 
 		// Окно изъятия на предстоящий интервал: случайное начало,
@@ -237,15 +258,9 @@ func (c *Commission) iterate(now time.Time) time.Time {
 			c.sessionStart = now.Add(off)
 			c.sessionEnd = c.sessionStart.Add(c.session)
 		}
-		if batch > 0 {
-			if c.session > 0 {
-				log.Printf("[COMMISSION] every %s: batch %d (accepted today=%d, target≈%d, issued=%d, session %s..%s)",
-					c.interval, batch, acceptedToday, target, c.budgetIssued,
-					c.sessionStart.Format("15:04:05"), c.sessionEnd.Format("15:04:05"))
-			} else {
-				log.Printf("[COMMISSION] every %s: batch %d (accepted today=%d, target≈%d, issued=%d)",
-					c.interval, batch, acceptedToday, target, c.budgetIssued)
-			}
+		if len(c.workerWorkBudget) > 0 {
+			log.Printf("[COMMISSION] every %s: work-бюджет по воркерам (workers=%d, percent=%.1f%%)",
+				c.interval, len(c.workerWorkBudget), c.percent)
 		}
 		// Диагностика: сколько work реально изъято за прошедший интервал и
 		// сколько пул зачёл. Наш work должен держаться ровно — если на
@@ -317,16 +332,25 @@ func planBatch(acceptedToday, taken, iterationsLeft int, percent float64) int {
 	return (need + iterationsLeft - 1) / iterationsLeft
 }
 
-// reserve пытается зарезервировать одну шару под комиссию. true — бюджет
-// есть: вызывающий должен переписать воркера шары и отправить её в тот же
-// upstream. Потокобезопасно.
+// reserve пытается зарезервировать шару под комиссию для конкретного воркера.
+// true — бюджет воркера позволяет изъять шару сложностью diff: вызывающий
+// должен переписать воркера шары и отправить её в тот же upstream.
+// Потокобезопасно.
+//
+// В interval-режиме бюджет per-воркерный (work): каждый ASIC получает
+// budget = percent% × его хешрейт × интервал, и шара изымается только
+// если бюджет ВОРКЕРА покрывает её сложность. Так A2xK (diff 1M) платит
+// редкими тяжёлыми шарами, TESTxSETI (diff 16K) — частыми лёгкими, оба
+// пропорционально своему хешрейту.
+//
+// В random-режиме бюджет общий (share), как раньше.
 //
 // Если задано окно изъятия (session > 0), шара забирается только внутри
 // текущего окна; вне окна бюджет не тратится и переносится на следующее окно.
-func (c *Commission) reserve() bool {
+func (c *Commission) reserve(worker string, diff float64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.worker == "" || c.takeBudget <= 0 {
+	if c.worker == "" || worker == "" || diff <= 0 {
 		return false
 	}
 	if c.session > 0 {
@@ -334,6 +358,18 @@ func (c *Commission) reserve() bool {
 		if now.Before(c.sessionStart) || !now.Before(c.sessionEnd) {
 			return false
 		}
+	}
+	if c.interval > 0 {
+		// Interval-режим: per-воркер work-бюджет.
+		if c.workerWorkBudget[worker] < diff {
+			return false
+		}
+		c.workerWorkBudget[worker] -= diff
+		return true
+	}
+	// Random-режим: общий share-бюджет.
+	if c.takeBudget <= 0 {
+		return false
 	}
 	c.takeBudget--
 	return true
@@ -369,24 +405,29 @@ func rewriteSubmitWorker(raw []byte, newWorker string) ([]byte, error) {
 // countSteal / countResult / countFailed обновляют счётчики комиссии.
 // diff — сложность изъятой шары: копим work как сумму сложностей, чтобы
 // сверять реальный вклад с тем, что показывает пул по commission_worker.
-func (c *Commission) countSteal(diff float64) {
+// worker — имя воркера майнера, с которого забрана шара (per-воркер учёт).
+func (c *Commission) countSteal(worker string, diff float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.attempts++
 	c.workIssued += diff
 	c.workSinceTick += diff
+	c.workIssuedByWorker[worker] += diff
 }
 
-func (c *Commission) countResult(accepted bool, diff float64) {
+func (c *Commission) countResult(worker string, accepted bool, diff float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if accepted {
 		c.acceptedCnt++
 		c.taken++
 		c.workAccepted += diff
+		c.workAcceptedByWorker[worker] += diff
+		c.takenByWorker[worker]++
 	} else {
 		c.rejectedCnt++
 		c.workRejected += diff
+		c.workRejectedByWorker[worker] += diff
 	}
 }
 
@@ -398,28 +439,38 @@ func (c *Commission) countFailed() {
 
 // CommissionReport — снимок комиссии для /status.commission.
 type CommissionReport struct {
-	Enabled          bool    `json:"enabled"`
-	Worker           string  `json:"worker,omitempty"`
-	Percent          float64 `json:"percent,omitempty"`
-	Interval         string  `json:"interval,omitempty"`
-	Session          string  `json:"session,omitempty"`
-	SessionStart     string  `json:"session_start,omitempty"`
-	SessionEnd       string  `json:"session_end,omitempty"`
-	IterationsPerDay int     `json:"iterations_per_day,omitempty"`
-	Attempts         int     `json:"attempts"`
-	Accepted         int     `json:"accepted"`
-	Rejected         int     `json:"rejected"`
-	Failed           int     `json:"failed"`
-	WorkIssued       float64 `json:"work_issued"`
-	WorkAccepted     float64 `json:"work_accepted"`
-	WorkRejected     float64 `json:"work_rejected"`
-	AcceptedToday    int     `json:"accepted_today"`
-	TargetToday      int     `json:"target_today"`
-	TakenToday       int     `json:"taken_today"`
-	IterationsUsed   int     `json:"iterations_used"`
-	IterationsLeft   int     `json:"iterations_left"`
-	NextIterationAt  string  `json:"next_iteration_at,omitempty"`
-	WindowEnd        string  `json:"window_end,omitempty"`
+	Enabled          bool                     `json:"enabled"`
+	Worker           string                   `json:"worker,omitempty"`
+	Percent          float64                  `json:"percent,omitempty"`
+	Interval         string                   `json:"interval,omitempty"`
+	Session          string                   `json:"session,omitempty"`
+	SessionStart     string                   `json:"session_start,omitempty"`
+	SessionEnd       string                   `json:"session_end,omitempty"`
+	IterationsPerDay int                      `json:"iterations_per_day,omitempty"`
+	Attempts         int                      `json:"attempts"`
+	Accepted         int                      `json:"accepted"`
+	Rejected         int                      `json:"rejected"`
+	Failed           int                      `json:"failed"`
+	WorkIssued       float64                  `json:"work_issued"`
+	WorkAccepted     float64                  `json:"work_accepted"`
+	WorkRejected     float64                  `json:"work_rejected"`
+	AcceptedToday    int                      `json:"accepted_today"`
+	TargetToday      int                      `json:"target_today"`
+	TakenToday       int                      `json:"taken_today"`
+	IterationsUsed   int                      `json:"iterations_used"`
+	IterationsLeft   int                      `json:"iterations_left"`
+	NextIterationAt  string                   `json:"next_iteration_at,omitempty"`
+	WindowEnd        string                   `json:"window_end,omitempty"`
+	Workers          []WorkerCommissionReport `json:"workers,omitempty"`
+}
+
+// WorkerCommissionReport — изъятие по одному воркеру (для /status.commission).
+type WorkerCommissionReport struct {
+	Worker       string  `json:"worker"`
+	WorkIssued   float64 `json:"work_issued"`
+	WorkAccepted float64 `json:"work_accepted"`
+	WorkRejected float64 `json:"work_rejected"`
+	Taken        int     `json:"taken"`
 }
 
 // intervalString возвращает читаемое представление интервала ("" если 0).
@@ -472,5 +523,18 @@ func (c *Commission) Snapshot() CommissionReport {
 		rep.SessionStart = c.sessionStart.Format(time.RFC3339)
 		rep.SessionEnd = c.sessionEnd.Format(time.RFC3339)
 	}
+	// Per-воркер breakdown: изъятие по каждому ASIC.
+	for w, taken := range c.takenByWorker {
+		rep.Workers = append(rep.Workers, WorkerCommissionReport{
+			Worker:       w,
+			WorkIssued:   c.workIssuedByWorker[w],
+			WorkAccepted: c.workAcceptedByWorker[w],
+			WorkRejected: c.workRejectedByWorker[w],
+			Taken:        taken,
+		})
+	}
+	sort.Slice(rep.Workers, func(i, j int) bool {
+		return rep.Workers[i].Worker < rep.Workers[j].Worker
+	})
 	return rep
 }
