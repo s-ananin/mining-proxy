@@ -220,19 +220,30 @@ func TestIntervalPerWorkerBudget(t *testing.T) {
 		t.Errorf("budgetB/budgetA = %.2f, want ≈3.0 (пропорционально хешрейту)", ratio)
 	}
 
-	// Бюджет воркера A: hr_A × interval / 2^32 × percent / 100.
-	wantA := hashrates["A"] * float64(10*time.Minute) / diffToHash * 0.02
+	// Бюджет воркера A: hr_A × interval(s) / 2^32 × percent / 100.
+	wantA := hashrates["A"] * (10 * time.Minute).Seconds() / diffToHash * 0.02
 	if gotA := budgetA; gotA < wantA*0.9 || gotA > wantA*1.1 {
 		t.Errorf("budgetA = %g, want ≈%g (±10%%)", gotA, wantA)
 	}
 
-	// Шара от B с diff 1M укладывается в бюджет.
-	if !c.reserve("B", 1000000) {
-		t.Errorf("reserve(B, 1M) = false, бюджет B=%g", c.workerWorkBudget["B"])
+	// Бюджет не должен превышать разумную долю произведённого за интервал
+	// work: это ловит баг с Duration→наносекунды.
+	intervalWorkA := hashrates["A"] * (10 * time.Minute).Seconds() / diffToHash
+	if budgetA > intervalWorkA {
+		t.Errorf("budgetA = %g превышает весь work за интервал %g — комиссия заберёт всё",
+			budgetA, intervalWorkA)
 	}
-	// Шара от A с diff 1M может не влезть (бюджет A меньше).
-	budgetAAfter := c.workerWorkBudget["A"]
-	c.reserve("A", budgetAAfter) // забираем весь бюджет A
+
+	// Шара от B с diff 524288 укладывается в бюджет B (~838k).
+	if !c.reserve("B", 524288) {
+		t.Errorf("reserve(B, 524288) = false, бюджет B=%g", c.workerWorkBudget["B"])
+	}
+	// Шара от A с diff 524288 не влезает (бюджет A ~279k) — остаётся майнеру.
+	if c.reserve("A", 524288) {
+		t.Errorf("reserve(A, 524288) = true, но бюджет A=%g", c.workerWorkBudget["A"])
+	}
+	// Забираем весь бюджет A и проверяем, что дальше не выдаётся.
+	c.reserve("A", c.workerWorkBudget["A"])
 	if c.reserve("A", 1) {
 		t.Error("reserve(A, 1) после исчерпания бюджета должен быть false")
 	}

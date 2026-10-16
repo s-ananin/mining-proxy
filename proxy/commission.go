@@ -100,7 +100,8 @@ type Commission struct {
 	// Per-воркер бюджет work (interval-режим): каждый воркер получает
 	// budget = percent% × его хешрейт × интервал. Изымается пропорционально
 	// реальному вкладу каждого ASIC, а не «кто первый отправил шару».
-	workerWorkBudget map[string]float64
+	workerWorkBudget     map[string]float64 // остаток бюджета воркера (уменьшается при изъятии)
+	workerWorkBudgetInit map[string]float64 // бюджет, выставленный на текущий интервал (для отчёта)
 
 	// Диагностика: суммарная сложность (work) изъятых шар по воркерам.
 	workIssued           float64 // work всех изъятых шар
@@ -146,6 +147,7 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 		windowStart:          now,
 		baseAccepted:         stats.Accepted(),
 		workerWorkBudget:     map[string]float64{},
+		workerWorkBudgetInit: map[string]float64{},
 		workIssuedByWorker:   map[string]float64{},
 		workAcceptedByWorker: map[string]float64{},
 		workRejectedByWorker: map[string]float64{},
@@ -223,6 +225,7 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		c.takeBudget = 0
 		c.budgetIssued = 0
 		c.workerWorkBudget = map[string]float64{}
+		c.workerWorkBudgetInit = map[string]float64{}
 		c.workIssuedByWorker = map[string]float64{}
 		c.workAcceptedByWorker = map[string]float64{}
 		c.workRejectedByWorker = map[string]float64{}
@@ -238,12 +241,15 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	if c.interval > 0 {
 		hashrates := c.stats.ActiveHashrates()
 		c.workerWorkBudget = map[string]float64{}
+		c.workerWorkBudgetInit = map[string]float64{}
 		for w, hr := range hashrates {
 			// Work, который воркер произведёт за один интервал:
 			// hashrate (H/s) × интервал (s) / 2^32 = difficulty units.
-			intervalWork := hr * float64(c.interval) / diffToHash
+			intervalWork := hr * c.interval.Seconds() / diffToHash
 			// Комиссия берёт percent% от этого work.
-			c.workerWorkBudget[w] = intervalWork * c.percent / 100
+			budget := intervalWork * c.percent / 100
+			c.workerWorkBudget[w] = budget
+			c.workerWorkBudgetInit[w] = budget
 		}
 		c.iterationsUsed++
 
@@ -467,10 +473,12 @@ type CommissionReport struct {
 // WorkerCommissionReport — изъятие по одному воркеру (для /status.commission).
 type WorkerCommissionReport struct {
 	Worker       string  `json:"worker"`
-	WorkIssued   float64 `json:"work_issued"`
-	WorkAccepted float64 `json:"work_accepted"`
-	WorkRejected float64 `json:"work_rejected"`
-	Taken        int     `json:"taken"`
+	WorkBudget   float64 `json:"work_budget"`   // бюджет work на текущий интервал (= percent% от работы воркера)
+	Remaining    float64 `json:"remaining"`     // остаток бюджета (уменьшается при изъятии)
+	WorkIssued   float64 `json:"work_issued"`   // изъято work всего за окно
+	WorkAccepted float64 `json:"work_accepted"` // зачтено пулом
+	WorkRejected float64 `json:"work_rejected"` // отклонено пулом
+	Taken        int     `json:"taken"`         // изъято шар (принятых)
 }
 
 // intervalString возвращает читаемое представление интервала ("" если 0).
@@ -523,15 +531,29 @@ func (c *Commission) Snapshot() CommissionReport {
 		rep.SessionStart = c.sessionStart.Format(time.RFC3339)
 		rep.SessionEnd = c.sessionEnd.Format(time.RFC3339)
 	}
-	// Per-воркер breakdown: изъятие по каждому ASIC.
-	for w, taken := range c.takenByWorker {
+	// Per-воркер breakdown: бюджет и изъятие по каждому ASIC. Показываем
+	// воркера, даже если он только получил бюджет и ещё не отдал шару.
+	seen := map[string]bool{}
+	addWorker := func(w string) {
+		if seen[w] {
+			return
+		}
+		seen[w] = true
 		rep.Workers = append(rep.Workers, WorkerCommissionReport{
 			Worker:       w,
+			WorkBudget:   c.workerWorkBudgetInit[w],
+			Remaining:    c.workerWorkBudget[w],
 			WorkIssued:   c.workIssuedByWorker[w],
 			WorkAccepted: c.workAcceptedByWorker[w],
 			WorkRejected: c.workRejectedByWorker[w],
-			Taken:        taken,
+			Taken:        c.takenByWorker[w],
 		})
+	}
+	for w := range c.workerWorkBudgetInit {
+		addWorker(w)
+	}
+	for w := range c.takenByWorker {
+		addWorker(w)
 	}
 	sort.Slice(rep.Workers, func(i, j int) bool {
 		return rep.Workers[i].Worker < rep.Workers[j].Worker
