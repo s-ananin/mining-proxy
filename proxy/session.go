@@ -105,20 +105,27 @@ func (s *session) feeDeniedNow() bool {
 
 // setFeeActive помечает, что соединение сейчас авторизовано под
 // commission_worker (служебная переавторизация). Пока флаг стоит, пул→майнер
-// не применяет и не пробрасывает set_difficulty: иначе пул навязывает
-// соединению сложность commission_worker (например 16384 вместо 524288 у
-// майнера), ASIC переезжает на неё, и изъятые шары весят в разы меньше.
+// глотает ПОНИЖЕНИЕ сложности (см. feeSuppressDifficulty): иначе пул навязывает
+// соединению низкую сложность commission_worker (например 16384 вместо 524288
+// у майнера), ASIC переезжает на неё, и изъятые шары весят в разы меньше.
+// Повышение же сложности применяется: если пул поднимает порог (у
+// commission_worker он выше из-за суммарного хешрейта), то шары ASIC на старой
+// низкой сложности он отвергнет как "Low difficulty share".
 func (s *session) setFeeActive(v bool) {
 	s.mu.Lock()
 	s.feeActive = v
 	s.mu.Unlock()
 }
 
-// feeActiveNow сообщает, идёт ли сейчас изъятие на этом соединении.
-func (s *session) feeActiveNow() bool {
+// feeSuppressDifficulty решает, надо ли проглотить set_difficulty на время
+// изъятия. Глотаем только понижение (diff <= текущей): соединение остаётся на
+// сложности ASIC, шары не дешевеют, но при этом валидны (они выше порога пула).
+// Повышение (diff > текущей) не глотаем — иначе ASIC шлёт шары ниже порога и
+// пул отвечает "Low difficulty share". Возвращает текущую сложность для лога.
+func (s *session) feeSuppressDifficulty(diff float64) (suppress bool, current float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.feeActive
+	return s.feeActive && diff <= s.diff, s.diff
 }
 
 // authorize обрабатывает mining.authorize.

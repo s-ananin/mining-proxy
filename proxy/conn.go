@@ -16,13 +16,17 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
 // Таймауты и размеры буферов одной сессии.
 const (
-	// idleTimeout — простой майнера или пула: соединение считается мёртвым.
-	idleTimeout = 10 * time.Minute
+	// idleTimeout — простой соединения: столько без единого сообщения в ЛЮБУЮ
+	// сторону, и соединение считается мёртвым. Считается по последней
+	// активности обоих направлений (см. connActivity), поэтому резервная
+	// сессия ASIC (майнер молчит, пул шлёт job'ы) не рвётся по 10 минут.
+	idleTimeout = 30 * time.Minute
 
 	// upstreamDialTimeout — таймаут TCP-соединения с реальным пулом.
 	upstreamDialTimeout = 10 * time.Second
@@ -122,12 +126,13 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 	// --- 4. Две стороны потока ---
 	done := make(chan struct{}, 2)
 	if stratum {
+		act := newConnActivity()
 		go func() {
-			pipeMinerToPool(clientConn, reader, upstream, se, pass.Commission)
+			pipeMinerToPool(clientConn, reader, upstream, se, pass.Commission, act)
 			done <- struct{}{}
 		}()
 		go func() {
-			pipePoolToMiner(upstream, clientConn, se)
+			pipePoolToMiner(upstream, clientConn, se, act)
 			done <- struct{}{}
 		}()
 	} else {
@@ -159,6 +164,32 @@ func dialUpstream(addr string, ssl bool) (net.Conn, error) {
 		return tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
 	}
 	return net.DialTimeout("tcp", addr, upstreamDialTimeout)
+}
+
+// connActivity — общая метка активности одного соединения для таймаутов
+// простоя. Оба направления (майнер→пул и пул→майнер) отмечают в ней каждое
+// прочитанное сообщение, а ReadDeadline выставляется от последней активности
+// ЛЮБОЙ из сторон. Так поток, молчащий в одну сторону, но живой в другую, не
+// рвётся: у резервного соединения ASIC майнер не шлёт шары, зато пул
+// периодически шлёт job'ы — без общего счётчика сторона майнера умирала бы по
+// idleTimeout и HiveOS пересоздавал бы эту сессию каждые N минут.
+type connActivity struct{ last int64 }
+
+// newConnActivity создаёт метку, «активную прямо сейчас».
+func newConnActivity() *connActivity {
+	a := &connActivity{}
+	a.touch()
+	return a
+}
+
+// touch отмечает активность соединения.
+func (a *connActivity) touch() {
+	atomic.StoreInt64(&a.last, time.Now().UnixNano())
+}
+
+// deadline — момент, до которого соединение считается живым.
+func (a *connActivity) deadline(idle time.Duration) time.Time {
+	return time.Unix(0, atomic.LoadInt64(&a.last)).Add(idle)
 }
 
 // sourceHost превращает RemoteAddr в чистый IP (без эфемерного порта).
@@ -217,7 +248,7 @@ func sniffStratum(reader *bufio.Reader) (bool, [][]byte) {
 // mining.authorize с commission_worker (feeAuth), а params[0] шар приводит к
 // тому же воркеру; когда бюджет исчерпан — возвращает authorize на воркер
 // майнера. job_id/extranonce1 соединения сохраняются, шары остаются валидными.
-func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session, commission *Commission) {
+func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session, commission *Commission, act *connActivity) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
 
@@ -241,11 +272,12 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 	}
 
 	for {
-		clientConn.SetReadDeadline(time.Now().Add(idleTimeout))
+		clientConn.SetReadDeadline(act.deadline(idleTimeout))
 		if !scanner.Scan() {
 			break
 		}
 		line := scanner.Bytes()
+		act.touch()
 
 		if IsMinerSubmit(line) {
 			id, _ := SubmitID(line)
@@ -303,25 +335,34 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 
 // pipePoolToMiner ведёт поток пул → майнер: забирает set_difficulty
 // (сложность для хешрейта) и ответы на шары (accepted/rejected).
-func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
+//
+// На время изъятия (сессия авторизована под commission_worker) сложность
+// обрабатывается гибридно: ПОНИЖЕНИЕ глотается (ASIC остаётся на своей
+// сложности, шары комиссии не дешевеют), ПОВЫШЕНИЕ пробрасывается (иначе
+// шары ниже порога пула → "Low difficulty share").
+func pipePoolToMiner(src net.Conn, dst net.Conn, se *session, act *connActivity) {
 	scanner := bufio.NewScanner(src)
 	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
 
 	for {
-		src.SetReadDeadline(time.Now().Add(idleTimeout))
+		src.SetReadDeadline(act.deadline(idleTimeout))
 		if !scanner.Scan() {
 			break
 		}
 		line := scanner.Bytes()
+		act.touch()
 
 		if diff, ok := ParseSetDifficulty(line); ok {
-			if se.feeActiveNow() {
+			if suppress, current := se.feeSuppressDifficulty(diff); suppress {
 				// Пока соединение авторизовано под commission_worker, пул
-				// присылает сложность изъятия. Не применяем и не пробрасываем
-				// её майнеру — ASIC и сессия остаются на сложности майнера,
-				// иначе шары комиссии весят в разы меньше (см. setFeeActive).
-				log.Printf("[CONN] пул %s: set_difficulty %g скрыта в режиме изъятия (воркер %q)",
-					se.pool, diff, se.workerName())
+				// присылает сложность изъятия. Понижение не применяем и не
+				// пробрасываем майнеру — ASIC и сессия остаются на сложности
+				// майнера, иначе шары комиссии весят в разы меньше. Повышение
+				// же (diff > текущей) НЕ глотаем: если пул поднял порог, шары
+				// ASIC на старой сложности он отвергнет как "Low difficulty
+				// share" — такую сложность применяем и пробрасываем.
+				log.Printf("[CONN] пул %s: set_difficulty %g скрыта в режиме изъятия (текущая %g, воркер %q)",
+					se.pool, diff, current, se.workerName())
 				continue
 			}
 			se.setDifficulty(diff)

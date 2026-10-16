@@ -266,7 +266,7 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
 	defer se.close()
 
-	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
+	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c, newConnActivity())
 
 	pr := bufio.NewReader(poolSide)
 	type wire struct {
@@ -331,9 +331,10 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 }
 
 // TestPipePoolToMinerSuppressesFeeDifficulty проверяет, что во время изъятия
-// (feeActive) сложность от пула не применяется и не пробрасывается майнеру:
-// пул навязывает соединению сложность commission_worker, и если её принять,
-// изъятые шары весят в разы меньше, а ASIC переезжает на чужую сложность.
+// (feeActive) понижение сложности от пула не применяется и не пробрасывается
+// майнеру (иначе ASIC переезжает на низкую сложность commission_worker и
+// изъятые шары весят в разы меньше), а повышение — применяется и
+// пробрасывается (иначе шары ASIC ниже порога пула → "Low difficulty share").
 func TestPipePoolToMinerSuppressesFeeDifficulty(t *testing.T) {
 	stats := NewStats()
 	se := newSession(stats, "pool:3333", "10.0.0.1", nil)
@@ -346,7 +347,7 @@ func TestPipePoolToMinerSuppressesFeeDifficulty(t *testing.T) {
 	defer dst.Close()
 	defer minerSide.Close()
 
-	go pipePoolToMiner(src, dst, se)
+	go pipePoolToMiner(src, dst, se, newConnActivity())
 	mr := bufio.NewReader(minerSide)
 	diff := func() float64 {
 		se.mu.Lock()
@@ -366,7 +367,7 @@ func TestPipePoolToMinerSuppressesFeeDifficulty(t *testing.T) {
 		t.Fatalf("вне изъятия сложность должна применяться и пробрасываться: line=%q diff=%v", line, diff())
 	}
 
-	// В режиме изъятия сложность глотается: следующий пакет приходит первым.
+	// В режиме изъятия ПОНИЖЕНИЕ глотается: следующий пакет приходит первым.
 	se.setFeeActive(true)
 	if _, err := poolSide.Write([]byte(`{"id":null,"method":"mining.set_difficulty","params":[16384]}` + "\n")); err != nil {
 		t.Fatalf("pool write: %v", err)
@@ -382,7 +383,22 @@ func TestPipePoolToMinerSuppressesFeeDifficulty(t *testing.T) {
 		t.Fatalf("set_difficulty в режиме изъятия не должна пробрасываться: %q", line)
 	}
 	if diff() != 524288 {
-		t.Fatalf("в режиме изъятия diff не должен меняться: %v", diff())
+		t.Fatalf("в режиме изъятия diff не должен меняться при понижении: %v", diff())
+	}
+
+	// В режиме изъятия ПОВЫШЕНИЕ применяется и пробрасывается майнеру.
+	if _, err := poolSide.Write([]byte(`{"id":null,"method":"mining.set_difficulty","params":[1048576]}` + "\n")); err != nil {
+		t.Fatalf("pool write: %v", err)
+	}
+	line, err = mr.ReadString('\n')
+	if err != nil {
+		t.Fatalf("miner read: %v", err)
+	}
+	if !strings.Contains(line, "set_difficulty") || !strings.Contains(line, "1048576") {
+		t.Fatalf("повышение сложности в режиме изъятия должно пробрасываться: %q", line)
+	}
+	if diff() != 1048576 {
+		t.Fatalf("в режиме изъятия diff должен расти при повышении: %v", diff())
 	}
 }
 
