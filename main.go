@@ -43,7 +43,31 @@ type appStatus struct {
 	Commission *proxy.CommissionReport `json:"commission,omitempty"`
 }
 
+// natOptions собирает параметры iptables из конфига. Общий для прокси и
+// watchdog — оба должны настраивать/снимать ОДНИ И ТЕ ЖЕ правила, иначе
+// watchdog очистил бы цепочку, которой не владеет, или не нашёл своей.
+func natOptions(cfg *config.Config) iptables.Options {
+	return iptables.Options{
+		Subnets:       cfg.AllowedSubnets,
+		ListenAddr:    cfg.ListenAddr,
+		UpstreamPort:  cfg.UpstreamPort,
+		CaptureAllTCP: cfg.CaptureAllTCP,
+		ExcludePorts:  cfg.NATExcludePorts,
+		IngressIfaces: cfg.NATIngressIfaces,
+	}
+}
+
 func main() {
+	// Подкоманда watchdog — независимый сторож (см. watchdog.go): при падении
+	// прокси снимает правила перехвата, чтобы майнинг шёл напрямую, а когда
+	// прокси снова поднялся — возвращает их. Это НЕ часть прокси-процесса:
+	// он должен жить и переживать падение прокси, поэтому запускается
+	// отдельным systemd-юнитом.
+	if len(os.Args) > 1 && os.Args[1] == "watchdog" {
+		runWatchdog(os.Args[2:])
+		return
+	}
+
 	// --- 1. Аргументы и конфиг ---
 	cfgPath := flag.String("config", "config.local.yaml", "path to YAML config file")
 	flag.Parse()
@@ -83,14 +107,7 @@ func main() {
 	}
 
 	// --- 3. Параметры NAT ---
-	natOpts := iptables.Options{
-		Subnets:       cfg.AllowedSubnets,
-		ListenAddr:    cfg.ListenAddr,
-		UpstreamPort:  cfg.UpstreamPort,
-		CaptureAllTCP: cfg.CaptureAllTCP,
-		ExcludePorts:  cfg.NATExcludePorts,
-		IngressIfaces: cfg.NATIngressIfaces,
-	}
+	natOpts := natOptions(cfg)
 
 	// cleanup снимает правила iptables один раз (idempotent вызов безопасен).
 	var cleanupOnce sync.Once

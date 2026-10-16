@@ -18,6 +18,11 @@ Wants=network-online.target
 Type=simple
 # Команда запуска: бинарник + путь к конфигу.
 ExecStart=/usr/local/bin/mining-proxy --config /etc/mining-proxy/config.yaml
+# Страховка при остановке/убийстве: даже если процесс убили (kill -9) и
+# Cleanup в Go не выполнился — правила DNAT сняются, майнеры уходят в пул
+# напрямую (fail-open). Идемпотентно: при чистом останове уже снято.
+ExecStopPost=-/sbin/iptables -t nat -F MINING_PROXY
+ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -j MINING_PROXY
 # Если процесс упадёт — systemd перезапустит его всегда.
 Restart=always
 # Пауза между перезапусками (чтобы не было цикла рестартов).

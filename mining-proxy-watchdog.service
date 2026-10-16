@@ -1,0 +1,37 @@
+# systemd unit для fail-open сторожа mining-proxy.
+# Копируется в /etc/systemd/system/mining-proxy-watchdog.service.
+#
+# Назначение: переживать падение прокси. Если прокси-процесс умер и правила
+# DNAT остались, watchdog снимает их, чтобы майнеры уходили в пул напрямую
+# (майнинг не прерывается). Когда прокси поднимается обратно — возвращает
+# правила. Сам процесс прокси при этом не обязателен: это отдельный юнит.
+#
+# Управление:
+#   systemctl enable --now mining-proxy-watchdog
+#   journalctl -u mining-proxy-watchdog -f
+
+[Unit]
+Description=Mining Proxy watchdog — fail-open при падении прокси
+# Стартуем после сети. НЕ привязываемся к самому прокси: его упадок как раз
+# должен переживаться, поэтому зависимости от mining-proxy.service нет.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Та же конфигурация, что у прокси: watchdog должен настраивать/снимать те же
+# правила, что и основной процесс.
+ExecStart=/usr/local/bin/mining-proxy watchdog --config /etc/mining-proxy/config.yaml --interval 10s --fail-threshold 3
+Restart=always
+RestartSec=5
+# Сторожу нужны права на iptables (root).
+NoNewPrivileges=no
+ProtectSystem=full
+ReadWritePaths=/etc/sysctl.d
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mining-proxy-watchdog
+
+[Install]
+WantedBy=multi-user.target

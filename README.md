@@ -16,8 +16,10 @@ Stratum V1 JSON-строк: `mining.submit` ↔ ответ пула.
   процент принятия, сложность из `mining.set_difficulty`, хешрейт;
 - `lost` — шары, на которые пул не ответил (обрыв/молчание);
 - HTTP-мониторинг: `GET /status` (JSON) и `GET /health`;
-- fail-open: при остановке правила DNAT снимаются, майнеры уходят
-  в пул напрямую, майнинг не прерывается.
+- fail-open: если прокси остановлен или упал — правила DNAT снимаются, и
+  майнеры уходят в пул напрямую, майнинг не прерывается (в это время просто
+  не изымается комиссия). Снятие выполняет watchdog — отдельный процесс,
+  переживающий падение прокси (см. [systemd](#systemd)).
 
 ## Сборка и запуск
 
@@ -67,14 +69,40 @@ curl -s http://127.0.0.1:9090/health
 
 ## systemd
 
+Обычный запуск через `nohup` опасен: если процесс убить (`kill -9`), правила
+DNAT остаются, а слушателя нет — весь трафик майнеров уходит в мёртвый порт и
+майнинг встаёт. systemd плюс watchdog закрывают это.
+
 ```sh
 sudo cp mining-proxy /usr/local/bin/
 sudo cp config.example.yaml /etc/mining-proxy/config.yaml   # и поправить
 sudo cp mining-proxy.service /etc/systemd/system/
+sudo cp mining-proxy-watchdog.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now mining-proxy
+sudo systemctl enable --now mining-proxy-watchdog
 journalctl -u mining-proxy -f
+journalctl -u mining-proxy-watchdog -f
 ```
+
+Как это обеспечивает доступность:
+
+- `mining-proxy.service` — `Restart=always` (падает → поднимается за секунды)
+  и `ExecStopPost` снимает правила даже при `kill -9`;
+- `mining-proxy-watchdog.service` — независимый сторож: если прокси не слушает
+  несколько проверок подряд, он снимает перехват (`iptables -t nat -F
+  MINING_PROXY`), и майнеры идут в пул напрямую; когда прокси вернулся —
+  возвращает правила. Сторож переживает гибель прокси, потому что это отдельный
+  процесс и отдельный юнит.
+
+## capture_all_tcp
+
+По умолчанию `capture_all_tcp: false` — перехватывается только порт
+`upstream_pool` (обычно `3333`), т.е. только майнинг. Включение
+`capture_all_tcp: true` захватывает весь TCP подсетей: тогда при падении
+прокси недоступным становится и весь прочий трафик этой подсети (включая SSH
+к серверу). Для `capture_all_tcp: true` можно указать `nat_exclude_ports`
+(по умолчанию `["22"]`), чтобы управляющий доступ не перехватывался.
 
 ## Тестовый стенд
 
