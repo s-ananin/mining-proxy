@@ -132,6 +132,21 @@ func TestUniqStrings(t *testing.T) {
 	}
 }
 
+// normalizePorts оставляет только валидные порты 1..65535, убирая мусор:
+// некорректный порт в исключениях не должен попасть в правило iptables.
+func TestNormalizePorts(t *testing.T) {
+	got := normalizePorts([]string{"22", " 2222 ", "22", "0", "70000", "abc", ""})
+	want := []string{"22", "2222"}
+	if len(got) != len(want) {
+		t.Fatalf("normalizePorts = %v, хотели %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("normalizePorts[%d] = %q, хотели %q", i, got[i], want[i])
+		}
+	}
+}
+
 // Статус без правил и без sysctl обязан честно перечислить проблемы:
 // это то, что оператор читает в /status, когда трафик не доходит.
 func TestStatusWithoutSubnetsReportsProblem(t *testing.T) {

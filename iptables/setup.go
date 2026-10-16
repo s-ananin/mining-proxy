@@ -26,6 +26,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -58,6 +59,12 @@ type Options struct {
 	// контейнеров), а `upstream_pool` в конфиге — лишь значение по
 	// умолчанию для pass-through.
 	CaptureAllTCP bool
+
+	// ExcludePorts порты, которые НЕ перехватываются. Критично при
+	// CaptureAllTCP: иначе весь TCP подсети (включая SSH-доступ оператора к
+	// серверу) уходит в прокси, и при его падении или `kill -9` (правила
+	// остаются, порт прокси мёртв) оператор теряет доступ к машине.
+	ExcludePorts []string
 
 	// IngressIfaces — входящие интерфейсы вручную. Пусто = определить
 	// автоматически по маршруту к подсетям.
@@ -158,6 +165,10 @@ func Setup(opts Options) error {
 	// его через SO_ORIGINAL_DST. Если указать -d <ip>, то заработает только
 	// один IP-пул, а ASIC с другим пулом (или IP:port) пройдёт мимо.
 	portFilter := !opts.CaptureAllTCP && opts.UpstreamPort != ""
+	exclude := normalizePorts(opts.ExcludePorts)
+	if len(exclude) > 0 {
+		log.Printf("[IPTABLES] исключаю из перехвата порты %v (напр. SSH)", exclude)
+	}
 	for _, subnet := range opts.Subnets {
 		// Правило создаём ОТДЕЛЬНО для каждой пары (подсеть, интерфейс).
 		//
@@ -173,6 +184,19 @@ func Setup(opts Options) error {
 			subIfaces = []string{""}
 		}
 		for _, ifc := range subIfaces {
+			// Сначала исключения: эти порты RETURN-им (мимо DNAT), чтобы
+			// управляющий доступ (SSH) не зависел от жизни прокси.
+			for _, port := range exclude {
+				args := []string{"-t", "nat", "-A", chainName, "-s", subnet, "-p", "tcp"}
+				if ifc != "" {
+					args = append(args, "-i", ifc)
+				}
+				args = append(args, "--dport", port, "-j", "RETURN")
+				if err := runCmd("iptables", args...); err != nil {
+					return fmt.Errorf("добавить исключение порта %s для %s: %w", port, subnet, err)
+				}
+			}
+
 			args := []string{"-t", "nat", "-A", chainName, "-s", subnet, "-p", "tcp"}
 			if ifc != "" {
 				args = append(args, "-i", ifc)
@@ -617,6 +641,23 @@ func uniqStrings(in []string) []string {
 		}
 		seen[s] = true
 		out = append(out, s)
+	}
+	return out
+}
+
+// normalizePorts приводит список портов к каноничному виду: убирает пустые и
+// повторы, проверяет, что это числа в диапазоне 1..65535. Возвращает только
+// валидные (некорректные молча отбрасываются — Setup не должен падать из-за
+// опечатки в необязательном списке исключений).
+func normalizePorts(in []string) []string {
+	var out []string
+	for _, p := range uniqStrings(in) {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			log.Printf("[IPTABLES] игнорирую некорректный порт в исключениях: %q", p)
+			continue
+		}
+		out = append(out, p)
 	}
 	return out
 }

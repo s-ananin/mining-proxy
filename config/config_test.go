@@ -169,3 +169,36 @@ monitor_addr: "127.0.0.1:9091"
 		t.Errorf("UpstreamPort = %q, want 3333", cfg.UpstreamPort)
 	}
 }
+
+// Не заданный nat_exclude_ports защищает SSH (22): при capture_all_tcp иначе
+// падение прокси блокирует доступ оператора к серверу.
+func TestLoadNATExcludePortsDefaultsToSSH(t *testing.T) {
+	path := writeTmp(t, "upstream_pool: \"pool:3333\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.NATExcludePorts) != 1 || cfg.NATExcludePorts[0] != "22" {
+		t.Errorf("NATExcludePorts = %v, хотели [22]", cfg.NATExcludePorts)
+	}
+}
+
+// Явный список исключений используется как есть.
+func TestLoadNATExcludePortsExplicit(t *testing.T) {
+	path := writeTmp(t, "upstream_pool: \"pool:3333\"\nnat_exclude_ports: [\"22\", \"2222\"]\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.NATExcludePorts) != 2 || cfg.NATExcludePorts[1] != "2222" {
+		t.Errorf("NATExcludePorts = %v, хотели [22 2222]", cfg.NATExcludePorts)
+	}
+}
+
+// Некорректный порт в исключениях — ошибка конфига, а не тихий пропуск.
+func TestLoadNATExcludePortsInvalidFails(t *testing.T) {
+	path := writeTmp(t, "upstream_pool: \"pool:3333\"\nnat_exclude_ports: [\"abc\"]\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("nat_exclude_ports с нечисловым портом должен давать ошибку")
+	}
+}

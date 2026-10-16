@@ -17,13 +17,21 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"mining-proxy/config"
 	"mining-proxy/iptables"
 	"mining-proxy/monitor"
 	"mining-proxy/proxy"
 )
+
+// shutdownGrace — сколько ждём завершения активных сессий после сигнала,
+// прежде чем выйти принудительно. Без ограничения Serve.Shutdown() ждал бы
+// wg.Wait() (соединения майнеров живут до idleTimeout), и процесс завис бы,
+// не сняв iptables.
+const shutdownGrace = 5 * time.Second
 
 // appStatus итоговый ответ /status: показатели шар + диагностика NAT.
 // Встроенная Report разворачивается в верхний уровень JSON.
@@ -80,7 +88,18 @@ func main() {
 		ListenAddr:    cfg.ListenAddr,
 		UpstreamPort:  cfg.UpstreamPort,
 		CaptureAllTCP: cfg.CaptureAllTCP,
+		ExcludePorts:  cfg.NATExcludePorts,
 		IngressIfaces: cfg.NATIngressIfaces,
+	}
+
+	// cleanup снимает правила iptables один раз (idempotent вызов безопасен).
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			if cfg.SetupIPTables {
+				iptables.Cleanup(natOpts)
+			}
+		})
 	}
 
 	// --- 4. Listener ДО перехвата (см. doc пакета) ---
@@ -106,7 +125,7 @@ func main() {
 		if err := iptables.Setup(natOpts); err != nil {
 			log.Fatalf("[FATAL] iptables: %v", err)
 		}
-		defer iptables.Cleanup(natOpts)
+		defer cleanup()
 	} else {
 		log.Printf("[MAIN] iptables: setup_iptables=false — перехват настроен вручную")
 	}
@@ -143,7 +162,23 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	log.Printf("[MAIN] shutdown: waiting for active sessions...")
-	srv.Shutdown() // дожидается текущих соединений; defer снимет iptables
-	log.Printf("[MAIN] stopped")
+	// Снимаем iptables СРАЗУ (fail-open): пока прокси доигрывает активные
+	// сессии, трафик майнеров и SSH уже идёт напрямую в пул. Так падение или
+	// остановка прокси не блокирует доступ к серверу и майнинг.
+	log.Printf("[MAIN] shutdown: снимаю iptables и останавливаю сервер")
+	cleanup()
+
+	done := make(chan struct{})
+	go func() {
+		srv.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("[MAIN] stopped")
+	case <-sig:
+		log.Printf("[MAIN] повторный сигнал — выходим немедленно")
+	case <-time.After(shutdownGrace):
+		log.Printf("[MAIN] активные сессии не завершились за %s — выходим принудительно", shutdownGrace)
+	}
 }

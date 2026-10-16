@@ -48,6 +48,14 @@ type Config struct {
 	// порт UpstreamPool. Нужно, если майнеры ходят на разные порты пулов.
 	CaptureAllTCP bool `yaml:"capture_all_tcp"`
 
+	// NATExcludePorts порты, которые НЕ перехватываются (RETURN в DNAT-цепочке).
+	// Критично при CaptureAllTCP: иначе весь TCP подсети, включая SSH-доступ
+	// оператора к серверу, уходит в прокси — и при его падении или `kill -9`
+	// (правила остаются, порт прокси мёртв) доступ к машине теряется.
+	// nil (поле не задано) → по умолчанию ["22"]; явный пустой [] отключает
+	// исключения.
+	NATExcludePorts []string `yaml:"nat_exclude_ports"`
+
 	// MonitorAddr адрес HTTP-мониторинга (/status, /health).
 	// Дефолт "127.0.0.1:9090"; наружу не выставляйте без firewall.
 	MonitorAddr string `yaml:"monitor_addr"`
@@ -136,6 +144,18 @@ func Load(path string) (*Config, error) {
 	for _, ifc := range cfg.NATIngressIfaces {
 		if strings.TrimSpace(ifc) == "" {
 			return nil, fmt.Errorf("invalid nat_ingress_ifaces: пустое имя интерфейса")
+		}
+	}
+
+	// Исключения из перехвата. Если поле не задано — по умолчанию защищаем
+	// SSH (22): при capture_all_tcp иначе весь TCP подсети, включая доступ
+	// оператора, уходит в прокси, и его падение блокирует вход на сервер.
+	if cfg.NATExcludePorts == nil {
+		cfg.NATExcludePorts = []string{"22"}
+	}
+	for _, p := range cfg.NATExcludePorts {
+		if n, err := strconv.Atoi(strings.TrimSpace(p)); err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("invalid nat_exclude_ports %q: ожидается порт 1..65535", p)
 		}
 	}
 
