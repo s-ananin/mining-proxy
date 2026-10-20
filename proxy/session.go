@@ -225,7 +225,7 @@ func (s *session) resolve(resp PoolResponse) bool {
 	}
 	if p.commission {
 		if s.commission != nil {
-			s.commission.countResult(resp.Accepted, p.diff)
+			s.commission.countResult(s.pool, resp.Accepted, p.diff)
 			if resp.Accepted {
 				log.Printf("[COMMISSION] пул %s зачёл шару воркера %q (diff %g)",
 					s.pool, s.commission.worker, p.diff)

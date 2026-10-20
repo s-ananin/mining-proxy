@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -57,7 +58,38 @@ const (
 	// commissionAuthID — тот же id в виде, в котором его вернёт пул в ответе.
 	commissionAuthTag = "__commission_switch__"
 	commissionAuthID  = `"` + commissionAuthTag + `"`
+
+	// commissionBreakerDenies — сколько отказов служебной переавторизации
+	// подряд по пулу открывают «предохранитель».
+	commissionBreakerDenies = 3
 )
+
+// commissionBreakerCooldown — на сколько пул исключается из изъятия после
+// срабатывания предохранителя. Переменная (не const), чтобы тесты могли
+// задавать короткую паузу.
+var commissionBreakerCooldown = 10 * time.Minute
+
+// poolCommission — счётчики изъятия по конкретному пулу. Нужны, чтобы при
+// работе с несколькими пулами видеть, где комиссия фактически идёт, а где
+// пул не знает commission_worker.
+type poolCommission struct {
+	attempts     int
+	accepted     int
+	rejected     int
+	failed       int
+	workIssued   float64
+	workAccepted float64
+	workRejected float64
+}
+
+// poolBreaker — предохранитель по пулу: если пул несколько раз подряд
+// отклонил служебную переавторизацию (нет commission_worker на этом пуле),
+// изъятие с него приостанавливается на cooldown, чтобы не долбить пул и не
+// задерживать шары майнера.
+type poolBreaker struct {
+	denies   int
+	openTill time.Time
+}
 
 // Commission — сборщик комиссии. Потокобезопасен (mu).
 //
@@ -103,6 +135,11 @@ type Commission struct {
 	workRejected  float64 // work отклонённых пулом
 	workSinceTick float64 // work, изъятый с прошлого тика (сбрасывается в iterate)
 
+	// Разбивка по пулам и предохранители (мультипул).
+	perPool     map[string]*poolCommission
+	breakers    map[string]*poolBreaker
+	breakerLogs map[string]time.Time // последний лог открытия breaker (антиспам)
+
 	rng *rand.Rand
 }
 
@@ -136,6 +173,9 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 		stats:            stats,
 		windowStart:      now,
 		baseAccepted:     stats.Accepted(),
+		perPool:          map[string]*poolCommission{},
+		breakers:         map[string]*poolBreaker{},
+		breakerLogs:      map[string]time.Time{},
 		rng:              rand.New(rand.NewSource(now.UnixNano())),
 	}
 }
@@ -317,16 +357,49 @@ func planBatch(acceptedToday, taken, iterationsLeft int, percent float64) int {
 	return (need + iterationsLeft - 1) / iterationsLeft
 }
 
-// reserve пытается зарезервировать одну шару под комиссию. true — бюджет
-// есть: вызывающий должен переписать воркера шары и отправить её в тот же
-// upstream. Потокобезопасно.
+// poolLocked возвращает (создавая при необходимости) счётчики по пулу.
+func (c *Commission) poolLocked(pool string) *poolCommission {
+	p, ok := c.perPool[pool]
+	if !ok {
+		p = &poolCommission{}
+		c.perPool[pool] = p
+	}
+	return p
+}
+
+// poolOpenLocked true, если предохранитель пула открыт (изъятие
+// приостановлено) на момент now.
+func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
+	b, ok := c.breakers[pool]
+	if !ok {
+		return false
+	}
+	if now.Before(b.openTill) {
+		return true
+	}
+	// Cooldown истёк — предохранитель закрывается, счётчик отказов сброшен.
+	b.denies = 0
+	b.openTill = time.Time{}
+	return false
+}
+
+// reserve пытается зарезервировать одну шару под комиссию для соединения к
+// пулу pool. true — бюджет есть: вызывающий должен переписать воркера шары
+// и отправить её в тот же upstream. Потокобезопасно.
+//
+// Пул с открытым предохранителем (несколько отказов переавторизации подряд)
+// пропускается: бюджет не тратится на пул, который не знает
+// commission_worker.
 //
 // Если задано окно изъятия (session > 0), шара забирается только внутри
 // текущего окна; вне окна бюджет не тратится и переносится на следующее окно.
-func (c *Commission) reserve() bool {
+func (c *Commission) reserve(pool string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.worker == "" || c.takeBudget <= 0 {
+		return false
+	}
+	if c.poolOpenLocked(pool, time.Now()) {
 		return false
 	}
 	if c.session > 0 {
@@ -337,6 +410,41 @@ func (c *Commission) reserve() bool {
 	}
 	c.takeBudget--
 	return true
+}
+
+// reportDeny сообщает об отказе пула переавторизовать соединение под
+// commission_worker. После нескольких отказов подряд пул временно
+// исключается из изъятия (предохранитель).
+func (c *Commission) reportDeny(pool string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b, ok := c.breakers[pool]
+	if !ok {
+		b = &poolBreaker{}
+		c.breakers[pool] = b
+	}
+	b.denies++
+	if b.denies >= commissionBreakerDenies && time.Now().After(b.openTill) {
+		b.openTill = time.Now().Add(commissionBreakerCooldown)
+		b.denies = 0
+		// Антиспам: лог об открытии не чаще раза в cooldown.
+		if last, ok := c.breakerLogs[pool]; !ok || time.Since(last) >= commissionBreakerCooldown {
+			log.Printf("[COMMISSION] пул %s: %d отказов переавторизации — изъятие приостановлено на %s",
+				pool, commissionBreakerDenies, commissionBreakerCooldown)
+			c.breakerLogs[pool] = time.Now()
+		}
+	}
+}
+
+// reportAuthOK сбрасывает счётчик отказов пула после успешной
+// переавторизации (пул знает commission_worker).
+func (c *Commission) reportAuthOK(pool string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if b, ok := c.breakers[pool]; ok {
+		b.denies = 0
+		b.openTill = time.Time{}
+	}
 }
 
 // rewriteSubmitWorker переписывает в mining.submit имя воркера (params[0])
@@ -369,57 +477,81 @@ func rewriteSubmitWorker(raw []byte, newWorker string) ([]byte, error) {
 // countSteal / countResult / countFailed обновляют счётчики комиссии.
 // diff — сложность изъятой шары: копим work как сумму сложностей, чтобы
 // сверять реальный вклад с тем, что показывает пул по commission_worker.
-func (c *Commission) countSteal(diff float64) {
+// pool — адресат соединения: ведём и общие, и поразбивочные счётчики.
+func (c *Commission) countSteal(pool string, diff float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.attempts++
 	c.workIssued += diff
 	c.workSinceTick += diff
+	p := c.poolLocked(pool)
+	p.attempts++
+	p.workIssued += diff
 }
 
-func (c *Commission) countResult(accepted bool, diff float64) {
+func (c *Commission) countResult(pool string, accepted bool, diff float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	p := c.poolLocked(pool)
 	if accepted {
 		c.acceptedCnt++
 		c.taken++
 		c.workAccepted += diff
+		p.accepted++
+		p.workAccepted += diff
 	} else {
 		c.rejectedCnt++
 		c.workRejected += diff
+		p.rejected++
+		p.workRejected += diff
 	}
 }
 
-func (c *Commission) countFailed() {
+func (c *Commission) countFailed(pool string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.failedCnt++
+	c.poolLocked(pool).failed++
+}
+
+// PoolCommissionReport — снимок изъятия по одному пулу.
+type PoolCommissionReport struct {
+	Pool         string  `json:"pool"`
+	Attempts     int     `json:"attempts"`
+	Accepted     int     `json:"accepted"`
+	Rejected     int     `json:"rejected"`
+	Failed       int     `json:"failed"`
+	WorkIssued   float64 `json:"work_issued"`
+	WorkAccepted float64 `json:"work_accepted"`
+	WorkRejected float64 `json:"work_rejected"`
+	BreakerOpen  bool    `json:"breaker_open,omitempty"`
 }
 
 // CommissionReport — снимок комиссии для /status.commission.
 type CommissionReport struct {
-	Enabled          bool    `json:"enabled"`
-	Worker           string  `json:"worker,omitempty"`
-	Percent          float64 `json:"percent,omitempty"`
-	Interval         string  `json:"interval,omitempty"`
-	Session          string  `json:"session,omitempty"`
-	SessionStart     string  `json:"session_start,omitempty"`
-	SessionEnd       string  `json:"session_end,omitempty"`
-	IterationsPerDay int     `json:"iterations_per_day,omitempty"`
-	Attempts         int     `json:"attempts"`
-	Accepted         int     `json:"accepted"`
-	Rejected         int     `json:"rejected"`
-	Failed           int     `json:"failed"`
-	WorkIssued       float64 `json:"work_issued"`
-	WorkAccepted     float64 `json:"work_accepted"`
-	WorkRejected     float64 `json:"work_rejected"`
-	AcceptedToday    int     `json:"accepted_today"`
-	TargetToday      int     `json:"target_today"`
-	TakenToday       int     `json:"taken_today"`
-	IterationsUsed   int     `json:"iterations_used"`
-	IterationsLeft   int     `json:"iterations_left"`
-	NextIterationAt  string  `json:"next_iteration_at,omitempty"`
-	WindowEnd        string  `json:"window_end,omitempty"`
+	Enabled          bool                   `json:"enabled"`
+	Worker           string                 `json:"worker,omitempty"`
+	Percent          float64                `json:"percent,omitempty"`
+	Interval         string                 `json:"interval,omitempty"`
+	Session          string                 `json:"session,omitempty"`
+	SessionStart     string                 `json:"session_start,omitempty"`
+	SessionEnd       string                 `json:"session_end,omitempty"`
+	IterationsPerDay int                    `json:"iterations_per_day,omitempty"`
+	Attempts         int                    `json:"attempts"`
+	Accepted         int                    `json:"accepted"`
+	Rejected         int                    `json:"rejected"`
+	Failed           int                    `json:"failed"`
+	WorkIssued       float64                `json:"work_issued"`
+	WorkAccepted     float64                `json:"work_accepted"`
+	WorkRejected     float64                `json:"work_rejected"`
+	AcceptedToday    int                    `json:"accepted_today"`
+	TargetToday      int                    `json:"target_today"`
+	TakenToday       int                    `json:"taken_today"`
+	IterationsUsed   int                    `json:"iterations_used"`
+	IterationsLeft   int                    `json:"iterations_left"`
+	NextIterationAt  string                 `json:"next_iteration_at,omitempty"`
+	WindowEnd        string                 `json:"window_end,omitempty"`
+	Pools            []PoolCommissionReport `json:"pools,omitempty"`
 }
 
 // intervalString возвращает читаемое представление интервала ("" если 0).
@@ -472,5 +604,33 @@ func (c *Commission) Snapshot() CommissionReport {
 		rep.SessionStart = c.sessionStart.Format(time.RFC3339)
 		rep.SessionEnd = c.sessionEnd.Format(time.RFC3339)
 	}
+	now := time.Now()
+	seen := map[string]bool{}
+	for name, p := range c.perPool {
+		seen[name] = true
+		rep.Pools = append(rep.Pools, PoolCommissionReport{
+			Pool:         name,
+			Attempts:     p.attempts,
+			Accepted:     p.accepted,
+			Rejected:     p.rejected,
+			Failed:       p.failed,
+			WorkIssued:   p.workIssued,
+			WorkAccepted: p.workAccepted,
+			WorkRejected: p.workRejected,
+			BreakerOpen:  c.poolOpenLocked(name, now),
+		})
+	}
+	// Пулы, где известен только предохранитель (изъятия ещё не было или
+	// все попытки отвергнуты до счётчика).
+	for name := range c.breakers {
+		if seen[name] {
+			continue
+		}
+		rep.Pools = append(rep.Pools, PoolCommissionReport{
+			Pool:        name,
+			BreakerOpen: c.poolOpenLocked(name, now),
+		})
+	}
+	sort.Slice(rep.Pools, func(i, j int) bool { return rep.Pools[i].Pool < rep.Pools[j].Pool })
 	return rep
 }

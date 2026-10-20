@@ -242,13 +242,13 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if IsMinerSubmit(line) {
 			id, _ := SubmitID(line)
 			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() {
-				if commission.reserve() {
+				if commission.reserve(se.pool) {
 					rewritten, err := rewriteSubmitWorker(line, commission.worker)
 					if err == nil && (feeAuth || writeAuthorize(commission.worker)) {
 						feeAuth = true
 						diff := se.markCommissionSubmit(id)
 						ack := se.armCommissionAck()
-						commission.countSteal(diff)
+						commission.countSteal(se.pool, diff)
 						log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s, diff %g)",
 							commission.worker, se.pool, id, diff)
 						line = rewritten
@@ -266,7 +266,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 						continue
 					}
 					// Не удалось — fail-open: шару не трогаем.
-					commission.countFailed()
+					commission.countFailed(se.pool)
 				} else if feeAuth {
 					// Бюджет исчерпан — возвращаем соединение майнеру.
 					if w := se.workerName(); w != "" && writeAuthorize(w) {
@@ -314,10 +314,16 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 				// но пишем в лог — по нему видно, принял ли пул смену воркера.
 				if resp.Accepted {
 					log.Printf("[COMMISSION] пул %s подтвердил переавторизацию", se.pool)
+					if se.commission != nil {
+						se.commission.reportAuthOK(se.pool)
+					}
 				} else {
 					log.Printf("[COMMISSION] пул %s ОТКЛОНИЛ переавторизацию: %s — изъятие на этом соединении остановлено",
 						se.pool, resp.Error)
 					se.denyFee()
+					if se.commission != nil {
+						se.commission.reportDeny(se.pool)
+					}
 				}
 				continue
 			}

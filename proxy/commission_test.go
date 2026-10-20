@@ -71,7 +71,7 @@ func TestCommissionDisabled(t *testing.T) {
 	if c.Enabled() {
 		t.Error("пустой worker — комиссия должна быть выключена")
 	}
-	if c.reserve() {
+	if c.reserve("pool:3333") {
 		t.Error("reserve должен вернуть false при выключенной комиссии")
 	}
 	if c.Snapshot().Enabled {
@@ -91,7 +91,7 @@ func TestCommissionStealAndCount(t *testing.T) {
 	line := []byte(`{"id":7,"method":"mining.submit","params":["w","j","n2","nt","nc"]}`)
 
 	// Шара 1: забрана, пул принял.
-	if !c.reserve() {
+	if !c.reserve("pool:3333") {
 		t.Fatal("первый reserve должен выдать бюджет")
 	}
 	rewritten, err := rewriteSubmitWorker(line, c.worker)
@@ -109,21 +109,21 @@ func TestCommissionStealAndCount(t *testing.T) {
 		t.Errorf("переписанная шара: id=%d worker=%q, want 7/test.com", rew.ID, rew.Params[0])
 	}
 	se.setDifficulty(2)
-	c.countSteal(se.markCommissionSubmit("7"))
+	c.countSteal(se.pool, se.markCommissionSubmit("7"))
 	if !se.resolve(PoolResponse{ID: "7", Accepted: true}) {
 		t.Fatal("resolve комиссионной шары должен вернуть true")
 	}
 
 	// Шара 2: забрана, пул отклонил.
-	if !c.reserve() {
+	if !c.reserve("pool:3333") {
 		t.Fatal("второй reserve должен выдать бюджет")
 	}
 	se.setDifficulty(4)
-	c.countSteal(se.markCommissionSubmit("8"))
+	c.countSteal(se.pool, se.markCommissionSubmit("8"))
 	se.resolve(PoolResponse{ID: "8", Accepted: false, Error: "unknown job id"})
 
 	// Шара 3: бюджет исчерпан — остаётся майнеру.
-	if c.reserve() {
+	if c.reserve("pool:3333") {
 		t.Fatal("третий reserve не должен выдавать бюджет")
 	}
 	se.submit("9", "w")
@@ -341,7 +341,7 @@ func TestCommissionSessionGatesReserve(t *testing.T) {
 	// Окно активно сейчас.
 	c.sessionStart = now.Add(-time.Minute)
 	c.sessionEnd = now.Add(time.Minute)
-	if !c.reserve() {
+	if !c.reserve("pool:3333") {
 		t.Fatal("внутри окна reserve должен вернуть true")
 	}
 	if c.takeBudget != 4 {
@@ -351,7 +351,7 @@ func TestCommissionSessionGatesReserve(t *testing.T) {
 	// Окно ещё не началось.
 	c.sessionStart = now.Add(time.Minute)
 	c.sessionEnd = now.Add(2 * time.Minute)
-	if c.reserve() {
+	if c.reserve("pool:3333") {
 		t.Fatal("до начала окна reserve должен вернуть false")
 	}
 	if c.takeBudget != 4 {
@@ -361,7 +361,7 @@ func TestCommissionSessionGatesReserve(t *testing.T) {
 	// Окно уже закончилось.
 	c.sessionStart = now.Add(-2 * time.Minute)
 	c.sessionEnd = now.Add(-time.Minute)
-	if c.reserve() {
+	if c.reserve("pool:3333") {
 		t.Fatal("после окна reserve должен вернуть false")
 	}
 }
@@ -397,5 +397,78 @@ func TestIterateSetsSessionWindow(t *testing.T) {
 	}
 	if c.sessionEnd.After(now.Add(interval)) {
 		t.Errorf("окно %v..%v выходит за интервал (тик %v)", c.sessionStart, c.sessionEnd, now)
+	}
+}
+
+// TestCommissionPerPoolBreakdown: счётчики комиссии разбиваются по пулам —
+// Accepted/WorkIssued считаются отдельно, Snapshot отдаёт pools.
+func TestCommissionPerPoolBreakdown(t *testing.T) {
+	c := NewCommission("fee.worker", 5, 40, 0, 0, NewStats())
+
+	c.countSteal("gate:3333", 2)
+	c.countResult("gate:3333", true, 2)
+	c.countSteal("other:4444", 4)
+	c.countResult("other:4444", false, 4)
+	c.countFailed("other:4444")
+
+	rep := c.Snapshot()
+	if len(rep.Pools) != 2 {
+		t.Fatalf("pools = %d, want 2: %+v", len(rep.Pools), rep.Pools)
+	}
+	// Сортировка по имени пула.
+	gate, other := rep.Pools[0], rep.Pools[1]
+	if gate.Pool != "gate:3333" || other.Pool != "other:4444" {
+		t.Fatalf("порядок пулов неверен: %q, %q", gate.Pool, other.Pool)
+	}
+	if gate.Attempts != 1 || gate.Accepted != 1 || gate.WorkAccepted != 2 {
+		t.Errorf("gate: %+v", gate)
+	}
+	if other.Attempts != 1 || other.Rejected != 1 || other.Failed != 1 || other.WorkRejected != 4 {
+		t.Errorf("other: %+v", other)
+	}
+	// Общие счётчики суммируют пулы.
+	if rep.Attempts != 2 || rep.Accepted != 1 || rep.Rejected != 1 || rep.Failed != 1 {
+		t.Errorf("общие счётчики: %+v", rep)
+	}
+}
+
+// TestCommissionBreaker: после нескольких отказов переавторизации пул
+// исключается из изъятия (reserve не выдаёт бюджет), затем по истечении
+// cooldown снова участвует.
+func TestCommissionBreaker(t *testing.T) {
+	saved := commissionBreakerCooldown
+	commissionBreakerCooldown = 20 * time.Millisecond
+	defer func() { commissionBreakerCooldown = saved }()
+
+	c := NewCommission("fee.worker", 5, 40, 0, 0, NewStats())
+	c.takeBudget = 100
+
+	// Отказы на один пул, но другой пул не задет.
+	for i := 0; i < commissionBreakerDenies; i++ {
+		c.reportDeny("bad:3333")
+	}
+	if c.reserve("bad:3333") {
+		t.Fatal("пул с открытым breaker не должен получать бюджет")
+	}
+	if !c.reserve("good:3333") {
+		t.Fatal("другой пул должен получать бюджет")
+	}
+	if rep := c.Snapshot(); !rep.Pools[0].BreakerOpen {
+		t.Errorf("breaker bad:3333 должен быть открыт: %+v", rep.Pools)
+	}
+
+	// Успешная переавторизация сбрасывает счётчик отказов.
+	c.reportDeny("good:3333")
+	c.reportAuthOK("good:3333")
+	for i := 0; i < commissionBreakerDenies; i++ {
+		c.reportDeny("good:3333")
+	}
+	if c.reserve("good:3333") {
+		t.Fatal("после повторных отказов breaker должен открыться")
+	}
+
+	time.Sleep(commissionBreakerCooldown + 10*time.Millisecond)
+	if !c.reserve("bad:3333") {
+		t.Fatal("после cooldown пул должен снова получать бюджет")
 	}
 }
