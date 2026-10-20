@@ -1,3 +1,13 @@
+// Файл conn.go — обработка одного соединения майнера.
+//
+// Схема:
+//
+//	майнер <---> мы <---> реальный пул (адресат из iptables DNAT)
+//
+// Прокси прозрачно: каждая строка уходит байт-в-байт в обе стороны,
+// парсинг нужен ТОЛЬКО для подсчёта шар (mining.submit, ответы пула,
+// mining.set_difficulty). Всё, что не Stratum (TLS, HTTP, прочий TCP
+// из перехваченной подсети), пробросывается сырой трубой без разбора.
 package proxy
 
 import (
@@ -9,23 +19,19 @@ import (
 	"time"
 )
 
-// Таймауты и размеры буферов обработки одного соединения.
+// Таймауты и размеры буферов одной сессии.
 const (
-	// idleTimeout — таймаут неактивности ASIC-сессии (Stratum). Если от
-	// майнера не пришло данных дольше — соединение разрывается (ASIC «умер»).
-	// Требование заказчика: сброс «умершей» сессии ~10 минут.
+	// idleTimeout — простой майнера или пула: соединение считается мёртвым.
 	idleTimeout = 10 * time.Minute
 
-	// upstreamDialTimeout — таймаут установки TCP-соединения с пулом.
+	// upstreamDialTimeout — таймаут TCP-соединения с реальным пулом.
 	upstreamDialTimeout = 10 * time.Second
 
-	// writeTimeout — таймаут записи в пул. TCP-буфер пула может быть полон —
-	// без таймаута writeLine зависла бы навсегда, съев goroutine. С таймаутом
-	// соединение рвётся и ресурсы освобождаются (fail-open уровня сессии).
+	// writeTimeout — таймаут записи: TCP-буфер может быть полон, без
+	// дедлайна goroutine завис бы навсегда.
 	writeTimeout = time.Minute
 
-	// sniffTimeout — сколько ждём первые байты, чтобы понять: это Stratum
-	// или просто поток (TLS/HTTP/…). Даже медленный ASIC шлёт subscribe сразу.
+	// sniffTimeout — сколько ждём первые байты, чтобы определить протокол.
 	sniffTimeout = 10 * time.Second
 
 	// lineBuf / maxLineSize — буфер строки Stratum (JSON редко > 1КБ).
@@ -33,53 +39,35 @@ const (
 	maxLineSize = 16 * 1024
 )
 
-// ProxyPass — параметры проксирования одного соединения: куда ходить по
-// умолчанию (fallback) и как определять реальный адресат.
+// ProxyPass — параметры проксирования одного соединения.
 type ProxyPass struct {
-	// ListenAddr адрес нашего listener (host:port). Нужен, чтобы отличить
-	// «прямой» коннект от DNAT-перенаправленного (см. dest.go isProxyAddr).
+	// ListenAddr адрес нашего listener — чтобы отличить прямой коннект
+	// от DNAT-перенаправленного (см. dest.go isProxyAddr).
 	ListenAddr string
 
-	// Fallback реальный пул из конфига (upstream_pool) — используется, если
-	// прозрачность выключена или исходный адресат не удалось восстановить
-	// (локальный тест без iptables).
+	// Fallback реальный пул из конфига (upstream_pool): используется при
+	// прямом подключении к прокси мимо iptables (локальный тест).
 	Fallback string
 
-	// FallbackSSL использовать TLS при подключении к Fallback (для прямого
-	// теста без iptables). В прозрачном режиме TLS не терминируем никогда:
-	// клиент сам держит TLS с пулом через нашу байтовую трубу.
+	// FallbackSSL TLS к Fallback. В прозрачном режиме не применяется:
+	// клиент сам держит TLS-сессию с пулом сквозь нашу трубу.
 	FallbackSSL bool
 
-	// Transparent включает определение реального адресата через
-	// SO_ORIGINAL_DST (iptables DNAT). По умолчанию true (см. config).
+	// Transparent включает определение адресата через SO_ORIGINAL_DST.
 	Transparent bool
 
-	// ResolveDest — необязательный переопределитель определения адресата.
-	// Нужен только для тестов: позволяет эмулировать несколько пулов
-	// (разные IP:port) без root и реального iptables. Если задан, вызывается
-	// вместо resolveDestination и возвращает (адресат, ssl). В проде — nil.
+	// ResolveDest переопределение адресата — ТОЛЬКО для тестов
+	// (эмуляция DNAT без root и iptables). В проде nil.
 	ResolveDest func(net.Conn) (string, bool)
 }
 
-// HandleConnection обрабатывает одно соединение от ASIC-майнера (или любого
-// другого TCP-потока из разрешённой подсети).
-//
-// Схема:
-//   клиент <---> мы <---> реальный пул (настоящий адресат из iptables DNAT)
-//                    |
-//                    +--> целевой пул («укушенная» копия шары)
-//
-// В прозрачном режиме адресат каждого соединения свой (у разных клиентов
-// разные пулы). Для каждого соединения сначала смотрим первые строки:
-//
-//   - похоже на Stratum (JSON с методом mining.*) → построчный разбор,
-//     копирование каждой mining.submit в реальный пул + опциональная «кража»;
-//   - всё остальное (TLS, HTTP, что угодно ещё из подсети) → сквозная
-//     байтовая труба без разбора (прозрачно, как требует заказчик).
-func HandleConnection(clientConn net.Conn, pass ProxyPass, stealer *ShareStealer, disc *Discovery) {
+// HandleConnection обслуживает одно соединение от майнера до самого конца:
+// определяет адресат, подключается к пулу, проксирует обе стороны и
+// наполняет реестр статистики шар.
+func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 	defer clientConn.Close()
 
-	// --- 1. Определяем настоящий адресат (пул конкретного клиента) ---
+	// --- 1. Реальный адресат (пул именно этого майнера) ---
 	var dest string
 	var destSSL bool
 	if pass.ResolveDest != nil {
@@ -87,185 +75,210 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stealer *ShareStealer
 	} else {
 		dest, destSSL = resolveDestination(clientConn, pass)
 	}
+	if dest == "" {
+		log.Printf("[CONN] %s: не удалось определить адресат (нет SO_ORIGINAL_DST и upstream_pool)", clientConn.RemoteAddr())
+		return
+	}
 
-	// --- 1a. Регистрируем пул в реестре «базы» (пул+воркер) ---
-	// Даже если пул сейчас недоступен, факт обращения полезен оператору.
-	disc.ObservePool(dest)
+	source := sourceHost(clientConn.RemoteAddr())
+	se := newSession(stats, dest, source)
+	defer se.close()
 
-	// --- 2. Подключаемся к нему (TCP; TLS — только в fallback-режиме). ---
+	// --- 2. Подключаемся к реальному пулу ---
 	upstream, err := dialUpstream(dest, destSSL)
 	if err != nil {
-		log.Printf("[CONN] upstream dial %s: %v", dest, err)
+		log.Printf("[CONN] upstream %s: %v", dest, err)
 		return
 	}
 	defer upstream.Close()
 
-	log.Printf("[CONN] %s <-> %s (listen=%s)", clientConn.RemoteAddr(), dest, pass.ListenAddr)
+	log.Printf("[CONN] %s -> %s", source, dest)
 
-	// --- 3. Смотрим первые байты: Stratum или прозрачный поток? ---
-	// Читаем через bufio.Reader, чтобы прочитанное можно было переиспользовать
-	// в обоих режимах (raw io.Copy или scanner). Возвращённые sniffedLines уже
-	// извлечены из буфера reader и должны быть пересланы в пул вызывающим.
+	// --- 3. Определяем протокол по первым байтам ---
+	// Stratum начинается с JSON-строки ('{'), всё остальное (TLS-хендшейк,
+	// HTTP, бинарь) уходит сырой трубой.
 	reader := bufio.NewReaderSize(clientConn, lineBuf)
 	clientConn.SetReadDeadline(time.Now().Add(sniffTimeout))
-	stratum, sniffedLines := sniffStratum(reader)
+	stratum, sniffed := sniffStratum(reader)
 	clientConn.SetReadDeadline(time.Time{})
 
-	// Пересылаем всё, что sniffer уже прочитал и извлёк из буфера reader.
-	// Без этого pipeMinerToPool (или io.Copy) заблокируется на чтении следующей
-	// строки от клиента — а клиент ждёт ответа на подписку и стоит.
-	if len(sniffedLines) > 0 {
-		upstream.SetWriteDeadline(time.Now().Add(writeTimeout))
-		for _, line := range sniffedLines {
-			if _, err := upstream.Write(line); err != nil {
-				log.Printf("[CONN] write sniffed to upstream: %v", err)
-				return
-			}
+	// Прочитанное sniffer-ом нужно переслать сразу: без этого пул не
+	// получит subscribe и соединение «повиснет» до таймаута.
+	for _, piece := range sniffed {
+		if _, err := upstream.Write(piece); err != nil {
+			log.Printf("[CONN] write sniffed to upstream: %v", err)
+			return
 		}
 	}
 
+	// --- 4. Две стороны потока ---
 	done := make(chan struct{}, 2)
-
 	if stratum {
-		// Поток 1: майнер -> пул, построчно, с перехватом mining.submit.
 		go func() {
-			pipeMinerToPool(clientConn, reader, dest, upstream, stealer, disc)
+			pipeMinerToPool(clientConn, reader, upstream, se)
+			done <- struct{}{}
+		}()
+		go func() {
+			pipePoolToMiner(upstream, clientConn, se)
 			done <- struct{}{}
 		}()
 	} else {
-		// Поток 1: не-стратум — прозрачная байтовая труба в обе стороны.
 		go func() {
-			if _, err := io.Copy(upstream, reader); err != nil {
-				log.Printf("[CONN] miner->pool copy: %v", err)
-			}
+			io.Copy(upstream, reader)
+			done <- struct{}{}
+		}()
+		go func() {
+			io.Copy(clientConn, upstream)
 			done <- struct{}{}
 		}()
 	}
 
-	// Поток 2: пул -> майнер, всегда прозрачный passthrough.
-	go func() {
-		if _, err := io.Copy(clientConn, upstream); err != nil {
-			log.Printf("[CONN] pool->miner copy: %v", err)
-		}
-		done <- struct{}{}
-	}()
-
-	// Ждём завершения любого из потоков — это означает разрыв соединения.
+	// Первая завершившаяся сторона = обрыв. Закрываем обе, ждём вторую —
+	// только после этого сессия считается закрытой (никаких гонок с
+	// deferred se.close()).
 	<-done
-	log.Printf("[DISCONNECT] %s", clientConn.RemoteAddr())
+	clientConn.Close()
+	upstream.Close()
+	<-done
+	log.Printf("[DISCONNECT] %s (pool=%s)", source, dest)
 }
 
-// dialUpstream создаёт TCP или TLS соединение с пулом.
+// dialUpstream создаёт TCP или TLS соединение с реальным пулом.
 func dialUpstream(addr string, ssl bool) (net.Conn, error) {
 	if ssl {
-		// InsecureSkipVerify — публичные пулы часто с самоподписанными
-		// сертификатами; необходимо для работы (риск осознан, см. ARCHITECTURE).
+		// InsecureSkipVerify — публичные пулы часто работают на
+		// самоподписанных сертификатах (риск осознан: это fallback).
 		return tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
 	}
 	return net.DialTimeout("tcp", addr, upstreamDialTimeout)
 }
 
-// sniffStratum определяет, ведёт ли соединение Stratum-майнер: реальный ASIC
-// начинает с mining.subscribe / mining.authorize (JSON, метод "mining.*").
-// Читаем не более нескольких строк; прочитанные строки возвращаются — это
-// данные, которые sniffer уже извлёк из буфера, их обязан переслать вызывающий.
-// Таймаут на чтение (sniffTimeout) уже выставлен вызывающей стороной.
-func sniffStratum(reader *bufio.Reader) (stratum bool, lines [][]byte) {
-	for i := 0; i < 3; i++ {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			// Нет данных (таймаут, обрыв, TLS-блоб без \n) — это не стратум:
-			// обрабатываем как обычный поток.
-			return false, lines
-		}
-		lines = append(lines, line)
-		if LooksLikeStratum(line) {
-			return true, lines
-		}
+// sourceHost превращает RemoteAddr в чистый IP (без эфемерного порта).
+func sourceHost(addr net.Addr) string {
+	if addr == nil {
+		return ""
 	}
-	return false, lines
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
 }
 
-// pipeMinerToPool копирует данные от майнера к пулу построчно (Stratum V1:
-// каждое сообщение = одна строка JSON + '\n'). Для каждой строки решаем:
-// это mining.submit? Если да и stealer решил «укусить» — копия уходит
-// целевому пулу; оригинал ВСЕГДА идёт реальному пулу.
+// sniffStratum определяет протокол соединения по первым байтам.
 //
-// Заодно наполняем реестр discovery: authorize/submit дают воркера,
-// submit — счётчики (pool+worker), что нужно для правил кражи (этап 4).
+// Возвращает режим (stratum/сырой) и ВСЕ прочитанные байты — их обязан
+// переслать вызывающий: sniffer уже извлёк их из буфера reader.
 //
-// clientConn нужен для таймаутов чтения (deadline ставится на сам TCP-сокет,
-// сканер читает через буфер reader). pool — адресат этого соединения.
-func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, pool string, dst net.Conn, stealer *ShareStealer, disc *Discovery) {
+// Логика: Stratum V1 — построчный JSON, первая строка начинается с '{'.
+// Первый байт не '{' (TLS 0x16, HTTP 'G'…) → сырой поток сразу, без
+// ожидания таймаута. Началось с '{' — дочитываем строки (до трёх) и
+// ищем метод mining.*.
+func sniffStratum(reader *bufio.Reader) (bool, [][]byte) {
+	var consumed [][]byte
+	for i := 0; i < 3; i++ {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return false, consumed
+		}
+		if b != '{' {
+			consumed = append(consumed, []byte{b})
+			return false, consumed
+		}
+		rest, err := reader.ReadSlice('\n')
+		line := append([]byte{b}, rest...)
+		consumed = append(consumed, line)
+		if err != nil {
+			// Обрыв/таймаут посреди строки: отдаём что есть, разбирать
+			// нечего (не-стратум режим безопасен — труба всё пропустит).
+			return false, consumed
+		}
+		if LooksLikeStratum(line) {
+			return true, consumed
+		}
+	}
+	return false, consumed
+}
+
+// pipeMinerToPool ведёт поток майнер → пул построчно и считает шары:
+// authorize привязывает воркера, submit штампуется сложностью и
+// регистрируется в таблице ожидающих ответа.
+func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
 
-	// Таймаут чтения: если майнер «молчит» дольше idleTimeout — Read вернёт
-	// таймаут, соединение закроется. Deadline обновляется при каждом чтении.
-	clientConn.SetReadDeadline(time.Now().Add(idleTimeout))
-
-	// Источник (IP клиента) — один раз, для записи в реестр.
-	source := ""
-	if a := clientConn.RemoteAddr(); a != nil {
-		source = a.String()
-	}
-
-	for scanner.Scan() {
-		// Получили данные — отодвигаем таймаут неактивности ещё на idleTimeout.
+	for {
 		clientConn.SetReadDeadline(time.Now().Add(idleTimeout))
-
+		if !scanner.Scan() {
+			break
+		}
 		line := scanner.Bytes()
 
-		// Scanner переиспользует буфер, поэтому сохраняем КОПИЮ строки —
-		// она может понадобиться в отдельной goroutine (асинхронная отправка).
-		lineCopy := make([]byte, len(line))
-		copy(lineCopy, line)
-
-		// Наполняем «базу» пул+воркер из живого трафика.
 		switch {
-		case IsMinerAuthorize(lineCopy):
-			disc.ObserveWorker(pool, ExtractWorkerFromAuthorize(lineCopy), source)
-		case IsMinerSubmit(lineCopy):
-			worker := ExtractWorkerFromSubmit(lineCopy)
-			disc.ObserveSubmit(pool, worker, source)
-
-			// Оригинал ВСЕГДА уходит — иначе майнер не получит ответ на submit.
-			// Для submit-ов дополнительно решаем, не «укусить» ли копию, с
-			// учётом правил allowlist (пул+воркер, этап 4).
-			if stealer.ShouldStealFor(pool, worker) {
-				go func(data []byte) {
-					if err := stealer.ForwardToTarget(data); err != nil {
-						log.Printf("[REDIRECT] forward to target: %v", err)
-					}
-				}(lineCopy)
-			}
+		case IsMinerAuthorize(line):
+			se.authorize(WorkerFromAuthorize(line))
+		case IsMinerSubmit(line):
+			id, _ := SubmitID(line)
+			se.submit(id, WorkerFromSubmit(line))
 		}
 
-		// Таймаут записи, чтобы зависшая запись не держала goroutine вечно.
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-		if err := writeLine(dst, lineCopy); err != nil {
-			log.Printf("[CONN] write to upstream: %v", err)
+		if err := writeLine(dst, line); err != nil {
+			log.Printf("[CONN] miner->pool write: %v", err)
 			return
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		// При превышении idleTimeout ловим таймаут и закрываем «умершую» сессию.
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			log.Printf("[CONN] idle timeout, closing session: %s", clientConn.RemoteAddr())
-		} else if err == bufio.ErrTooLong {
-			log.Printf("[CONN] oversized stratum line, closing: %s", clientConn.RemoteAddr())
-		} else {
-			log.Printf("[CONN] scanner: %v", err)
-		}
-	}
+	logReadErr("miner", clientConn, scanner.Err())
 }
 
-// writeLine пишет данные и терминальный '\n' в dst.
+// pipePoolToMiner ведёт поток пул → майнер: забирает set_difficulty
+// (сложность для хешрейта) и ответы на шары (accepted/rejected).
+func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
+	scanner := bufio.NewScanner(src)
+	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
+
+	for {
+		src.SetReadDeadline(time.Now().Add(idleTimeout))
+		if !scanner.Scan() {
+			break
+		}
+		line := scanner.Bytes()
+
+		if diff, ok := ParseSetDifficulty(line); ok {
+			se.setDifficulty(diff)
+		} else if resp, ok := ParsePoolResponse(line); ok {
+			se.resolve(resp)
+		} else if jobID, ok := JobIDFromNotify(line); ok {
+			se.setJobID(jobID)
+		}
+
+		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err := writeLine(dst, line); err != nil {
+			log.Printf("[CONN] pool->miner write: %v", err)
+			return
+		}
+	}
+	logReadErr("pool", src, scanner.Err())
+}
+
+// writeLine пишет строку и терминальный '\n' (scanner его съел).
 func writeLine(dst io.Writer, data []byte) error {
 	buf := make([]byte, 0, len(data)+1)
 	buf = append(buf, data...)
 	buf = append(buf, '\n')
 	_, err := dst.Write(buf)
 	return err
+}
+
+// logReadErr различает таймаут неактивности (майнер/пул «умер») и прочие
+// ошибки чтения — полезно для диагностики в логах.
+func logReadErr(side string, conn net.Conn, err error) {
+	if err == nil || err == io.EOF {
+		return
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		log.Printf("[CONN] idle timeout (%s), closing: %s", side, conn.RemoteAddr())
+		return
+	}
+	log.Printf("[CONN] read %s: %v", side, err)
 }
