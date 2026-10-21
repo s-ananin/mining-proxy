@@ -80,6 +80,63 @@ type poolCommission struct {
 	workIssued   float64
 	workAccepted float64
 	workRejected float64
+
+	// Диагностика скорости изъятия: время и сложность последних изъятых
+	// шар. По ним считается мгновенный и средний хешрейт комиссии.
+	lastStealAt time.Time
+	samples     []stealSample
+}
+
+// stealSample — изъятая шара для расчёта хешрейта комиссии.
+type stealSample struct {
+	at   time.Time
+	diff float64
+}
+
+// commissionRateWindow — окно усреднения хешрейта изъятия (как у Stats).
+const commissionRateWindow = 10 * time.Minute
+
+// diffToHash переводит сложность в хеш (дублирует stats.diffToHash как
+// float64 — та же размерность, чтобы TH/s были сопоставимы).
+const diffToHashF = 4294967296.0
+
+// stealRateLocked считает мгновенный (относительно предыдущей изъятой шары)
+// и средний (скользящее окно) хешрейт изъятия по пулу. Мгновенный — 0, если
+// это первая шара. now и diff — текущая изъятая шара.
+func (p *poolCommission) stealRateLocked(now time.Time, diff float64) (instant, avg float64) {
+	if !p.lastStealAt.IsZero() {
+		if dt := now.Sub(p.lastStealAt).Seconds(); dt > 0 {
+			instant = diff * diffToHashF / dt
+		}
+	}
+	p.lastStealAt = now
+	p.samples = append(p.samples, stealSample{at: now, diff: diff})
+	// Обрезаем старое окно.
+	cut := 0
+	for cut < len(p.samples) && now.Sub(p.samples[cut].at) > commissionRateWindow {
+		cut++
+	}
+	if cut > 0 {
+		p.samples = append([]stealSample(nil), p.samples[cut:]...)
+	}
+	return instant, p.avgRateLocked()
+}
+
+// avgRateLocked средний хешрейт изъятия по накопленным сэмплам (hash/s).
+func (p *poolCommission) avgRateLocked() float64 {
+	if len(p.samples) < 2 {
+		return 0
+	}
+	var sum float64
+	first := p.samples[0].at
+	last := p.samples[len(p.samples)-1].at
+	for _, s := range p.samples {
+		sum += s.diff
+	}
+	if span := last.Sub(first).Seconds(); span > 0 {
+		return sum * diffToHashF / span
+	}
+	return 0
 }
 
 // poolBreaker — предохранитель по пулу: если пул несколько раз подряд
@@ -290,9 +347,14 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		// Диагностика: сколько work реально изъято за прошедший интервал и
 		// сколько пул зачёл. Наш work должен держаться ровно — если на
 		// диаграмме пула воркер «затухает», а здесь ровно, причина на пуле.
+		// Сверяем фактический хешрейт изъятия с ожидаемым (percent% от
+		// хешрейта майнеров) в TH/s — так сразу видно недостачу.
 		if c.workSinceTick > 0 {
-			log.Printf("[COMMISSION] за интервал work изъято=%.0f (issued=%.0f, зачтено=%.0f, отклонено=%.0f)",
-				c.workSinceTick, c.workIssued, c.workAccepted, c.workRejected)
+			actualTh := c.workSinceTick * diffToHashF / c.interval.Seconds() / 1e12
+			expectedTh := float64(c.stats.Report().Totals.Hashrate) / 1e12 * c.percent / 100
+			log.Printf("[COMMISSION] за интервал work изъято=%.0f (issued=%.0f, зачтено=%.0f, отклонено=%.0f), изъятие %.2f TH/s, ожидалось %.2f TH/s (%.1f%% от %.2f TH/s)",
+				c.workSinceTick, c.workIssued, c.workAccepted, c.workRejected,
+				actualTh, expectedTh, c.percent, float64(c.stats.Report().Totals.Hashrate)/1e12)
 			c.workSinceTick = 0
 		}
 		next := c.windowStart.Add(time.Duration(c.iterationsUsed) * c.interval)
@@ -478,7 +540,8 @@ func rewriteSubmitWorker(raw []byte, newWorker string) ([]byte, error) {
 // diff — сложность изъятой шары: копим work как сумму сложностей, чтобы
 // сверять реальный вклад с тем, что показывает пул по commission_worker.
 // pool — адресат соединения: ведём и общие, и поразбивочные счётчики.
-func (c *Commission) countSteal(pool string, diff float64) {
+// Возвращает мгновенный и средний хешрейт изъятия по пулу (hash/s).
+func (c *Commission) countSteal(pool string, diff float64) (instant, avg float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.attempts++
@@ -487,6 +550,7 @@ func (c *Commission) countSteal(pool string, diff float64) {
 	p := c.poolLocked(pool)
 	p.attempts++
 	p.workIssued += diff
+	return p.stealRateLocked(time.Now(), diff)
 }
 
 func (c *Commission) countResult(pool string, accepted bool, diff float64) {
@@ -524,6 +588,7 @@ type PoolCommissionReport struct {
 	WorkIssued   float64 `json:"work_issued"`
 	WorkAccepted float64 `json:"work_accepted"`
 	WorkRejected float64 `json:"work_rejected"`
+	StealThs     float64 `json:"steal_ths"` // фактический хешрейт изъятия, TH/s
 	BreakerOpen  bool    `json:"breaker_open,omitempty"`
 }
 
@@ -617,6 +682,7 @@ func (c *Commission) Snapshot() CommissionReport {
 			WorkIssued:   p.workIssued,
 			WorkAccepted: p.workAccepted,
 			WorkRejected: p.workRejected,
+			StealThs:     p.avgRateLocked() / 1e12,
 			BreakerOpen:  c.poolOpenLocked(name, now),
 		})
 	}

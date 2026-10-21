@@ -400,6 +400,35 @@ func TestIterateSetsSessionWindow(t *testing.T) {
 	}
 }
 
+// TestCommissionStealRate: мгновенный и средний хешрейт изъятия считаются
+// из сложности и времени между изъятыми шарами.
+func TestCommissionStealRate(t *testing.T) {
+	c := NewCommission("fee.worker", 5, 40, 0, 0, NewStats())
+	p := c.poolLocked("gate:3333")
+	base := time.Now()
+
+	// Первая шара: мгновенный = 0 (нет предыдущей).
+	if inst, _ := p.stealRateLocked(base, 100); inst != 0 {
+		t.Errorf("первая шара: instant = %v, want 0", inst)
+	}
+	// Вторая через 10с, diff 100: instant = 100·2³²/10.
+	inst, _ := p.stealRateLocked(base.Add(10*time.Second), 100)
+	want := 100 * diffToHashF / 10
+	if inst != want {
+		t.Errorf("instant = %v, want %v", inst, want)
+	}
+	// Средний: две шары по 100 за 10с → 200·2³²/10.
+	if avg := p.avgRateLocked(); avg != 2*want {
+		t.Errorf("avg = %v, want %v", avg, 2*want)
+	}
+	// Пул-разбивка отдаёт TH/s.
+	c.countSteal("gate:3333", 100)
+	rep := c.Snapshot()
+	if len(rep.Pools) != 1 || rep.Pools[0].StealThs <= 0 {
+		t.Errorf("StealThs должен быть > 0: %+v", rep.Pools)
+	}
+}
+
 // TestCommissionPerPoolBreakdown: счётчики комиссии разбиваются по пулам —
 // Accepted/WorkIssued считаются отдельно, Snapshot отдаёт pools.
 func TestCommissionPerPoolBreakdown(t *testing.T) {
