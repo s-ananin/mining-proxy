@@ -330,6 +330,151 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	}
 }
 
+// TestFeeDifficultyNotLeakedToMiner проверяет, что сложность, которую пул
+// назначает воркеру комиссии (vardiff), не доходит до майнера: иначе ASIC
+// начнёт сдавать копеечные шары и его сложность в сессии затрётся.
+// После возврата authorize майнеру сложность пула снова передаётся.
+func TestFeeDifficultyNotLeakedToMiner(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats)
+	c.takeBudget = 1
+
+	// Четыре пайпа: майнер→прокси, прокси→пул, пул→прокси, прокси→майнер.
+	clientConn, minerIn := net.Pipe()
+	defer clientConn.Close()
+	defer minerIn.Close()
+	dst, poolOut := net.Pipe()
+	defer dst.Close()
+	defer poolOut.Close()
+	poolIn, poolSrc := net.Pipe()
+	defer poolIn.Close()
+	defer poolSrc.Close()
+	minerDst, minerOut := net.Pipe()
+	defer minerDst.Close()
+	defer minerOut.Close()
+
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+
+	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
+	go pipePoolToMiner(poolSrc, minerDst, se)
+
+	pr := bufio.NewReader(poolOut)
+	mr := bufio.NewReader(minerOut)
+
+	toMiner := func(s string) {
+		if _, err := minerIn.Write([]byte(s + "\n")); err != nil {
+			t.Fatalf("miner write: %v", err)
+		}
+	}
+	toPool := func(s string) {
+		if _, err := poolIn.Write([]byte(s + "\n")); err != nil {
+			t.Fatalf("pool write: %v", err)
+		}
+	}
+	fromPool := func() string {
+		line, err := pr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("pool read: %v", err)
+		}
+		return strings.TrimSpace(line)
+	}
+	fromMiner := func() string {
+		minerOut.SetReadDeadline(time.Now().Add(2 * time.Second))
+		line, err := mr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("miner read: %v", err)
+		}
+		return strings.TrimSpace(line)
+	}
+	// Ничего не должно прийти к майнеру за d.
+	expectNoMinerLine := func(d time.Duration) {
+		minerOut.SetReadDeadline(time.Now().Add(d))
+		if line, err := mr.ReadString('\n'); err == nil {
+			t.Fatalf("к майнеру пролегла лишняя строка: %q", strings.TrimSpace(line))
+		}
+	}
+
+	// Авторизация майнера.
+	toMiner(`{"id":1,"method":"mining.authorize","params":["client.w","x"]}`)
+	if a := fromPool(); !strings.Contains(a, `"client.w"`) {
+		t.Fatalf("authorize майнера не проброшен в пул: %s", a)
+	}
+
+	// Шара забирается комиссией: прокси шлёт authorize(fee.worker).
+	toMiner(`{"id":"2","method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
+	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
+		t.Fatalf("ожидался служебный authorize fee.worker: %s", a)
+	}
+	if s := fromPool(); !strings.Contains(s, `"fee.worker"`) {
+		t.Fatalf("ожидалась подменённая шара fee.worker: %s", s)
+	}
+
+	// Пул назначает воркеру комиссии свою сложность — она НЕ должна
+	// попасть к майнеру.
+	toPool(`{"id":null,"method":"mining.set_difficulty","params":[256]}`)
+	expectNoMinerLine(200 * time.Millisecond)
+	if d := se.feeDifficulty(); d != 256 {
+		t.Fatalf("сложность воркера комиссии не записана: %v", d)
+	}
+
+	// Ответ пула по изъятой шаре разблокирует следующую и пересылается
+	// майнеру как обычный ответ.
+	toPool(`{"id":"2","result":true,"error":null}`)
+	if r := fromMiner(); !strings.Contains(r, `"result":true`) {
+		t.Fatalf("ответ пула по шаре не дошёл до майнера: %s", r)
+	}
+
+	// Бюджет исчерпан → прокси возвращает authorize(client.w).
+	toMiner(`{"id":"3","method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
+	if a := fromPool(); !strings.Contains(a, `"client.w"`) {
+		t.Fatalf("ожидался возврат authorize на client.w: %s", a)
+	}
+	if s := fromPool(); !strings.Contains(s, `"client.w"`) {
+		t.Fatalf("ожидалась шара майнера: %s", s)
+	}
+
+	// Теперь сложность пула снова доходит до майнера.
+	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
+	if line := fromMiner(); !strings.Contains(line, "set_difficulty") {
+		t.Fatalf("майнер получил не set_difficulty: %q", line)
+	}
+	if d := se.difficulty(); d != 16384 {
+		t.Fatalf("сложность сессии не обновилась: %v", d)
+	}
+}
+
+// TestCommissionWorkCountedAtFeeDifficulty проверяет, что work изъятой
+// шары считается по сложности воркера комиссии (по ней пул зачитывает
+// шару), а не по сложности майнера.
+func TestCommissionWorkCountedAtFeeDifficulty(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats)
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+
+	se.setDifficulty(16384)
+	se.setFeeActive(true)
+
+	// Пул ещё не прислал сложность воркера комиссии — действует сложность
+	// сессии (та, по которой пул сейчас засчитывает шары).
+	if d := se.markCommissionSubmit("1"); d != 16384 {
+		t.Fatalf("work первой шары посчитан по %v, ожидалось 16384", d)
+	}
+
+	// Пул прислал сложность воркера комиссии — дальше считаем по ней.
+	se.setFeeDiff(256)
+	if d := se.markCommissionSubmit("2"); d != 256 {
+		t.Fatalf("work шары посчитан по %v, ожидалось 256", d)
+	}
+
+	// Сложность воркера комиссии видна в отчёте.
+	rep := c.Snapshot()
+	if len(rep.Pools) != 1 || rep.Pools[0].FeeDiff != 256 {
+		t.Fatalf("fee_diff в отчёте: %+v", rep.Pools)
+	}
+}
+
 // TestCommissionSessionGatesReserve проверяет, что при заданном окне шары
 // изымаются только внутри него, а вне окна бюджет не тратится.
 func TestCommissionSessionGatesReserve(t *testing.T) {

@@ -85,6 +85,11 @@ type poolCommission struct {
 	// шар. По ним считается мгновенный и средний хешрейт комиссии.
 	lastStealAt time.Time
 	samples     []stealSample
+
+	// Сложность, которую пул назначил воркеру комиссии (vardiff). По ней
+	// пул зачитывает изъятые шары: если она падает, комиссия обесценивается
+	// (каждая шара стоит всё меньше work).
+	feeDiff float64
 }
 
 // stealSample — изъятая шара для расчёта хешрейта комиссии.
@@ -578,6 +583,15 @@ func (c *Commission) countFailed(pool string) {
 	c.poolLocked(pool).failed++
 }
 
+// setFeeDiff запоминает сложность, которую пул назначил воркеру комиссии.
+// По ней пул зачитывает изъятые шары: падение сложности = обесценивание
+// комиссии.
+func (c *Commission) setFeeDiff(pool string, diff float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.poolLocked(pool).feeDiff = diff
+}
+
 // PoolCommissionReport — снимок изъятия по одному пулу.
 type PoolCommissionReport struct {
 	Pool         string  `json:"pool"`
@@ -588,6 +602,7 @@ type PoolCommissionReport struct {
 	WorkIssued   float64 `json:"work_issued"`
 	WorkAccepted float64 `json:"work_accepted"`
 	WorkRejected float64 `json:"work_rejected"`
+	FeeDiff      float64 `json:"fee_diff"`  // сложность воркера комиссии на пуле
 	StealThs     float64 `json:"steal_ths"` // фактический хешрейт изъятия, TH/s
 	BreakerOpen  bool    `json:"breaker_open,omitempty"`
 }
@@ -682,6 +697,7 @@ func (c *Commission) Snapshot() CommissionReport {
 			WorkIssued:   p.workIssued,
 			WorkAccepted: p.workAccepted,
 			WorkRejected: p.workRejected,
+			FeeDiff:      p.feeDiff,
 			StealThs:     p.avgRateLocked() / 1e12,
 			BreakerOpen:  c.poolOpenLocked(name, now),
 		})

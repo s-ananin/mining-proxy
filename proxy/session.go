@@ -41,6 +41,8 @@ type session struct {
 	commission *Commission   // сборщик комиссии; nil — выключена
 	feeDenied  bool          // пул отклонил служебный authorize — не изымаем
 	commAck    chan struct{} // ответ пула на текущую изъятую шару (сериализация)
+	feeActive  bool          // соединение сейчас авторизовано под commission_worker
+	feeDiff    float64       // сложность, которую пул назначил воркеру комиссии
 }
 
 // newSession регистрирует соединение в реестре.
@@ -100,6 +102,58 @@ func (s *session) feeDeniedNow() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.feeDenied
+}
+
+// setFeeActive включает/выключает режим «соединение под commission_worker».
+// Пока режим включён, mining.set_difficulty от пула (vardiff воркера
+// комиссии) НЕ прокидывается майнеру — иначе пул уронит сложность ASIC
+// до минимума, и изъятие обесценится.
+func (s *session) setFeeActive(active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.feeActive = active
+	if active {
+		// Сложность воркера комиссии на этом витке ещё неизвестна: пул
+		// пришлёт её после нашего authorize. До этого действует сложность
+		// сессии — та, по которой пул сейчас засчитывает шары.
+		s.feeDiff = 0
+	}
+}
+
+// suppressDifficulty сообщает, надо ли выбросить mining.set_difficulty,
+// пришедший от пула: только пока соединение авторизовано под воркером
+// комиссии.
+func (s *session) suppressDifficulty() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.feeActive
+}
+
+// setFeeDiff запоминает сложность, которую пул назначил воркеру комиссии.
+// По ней видно, как пул (vardiff) опускает сложность забираемых шар.
+func (s *session) setFeeDiff(diff float64) {
+	s.mu.Lock()
+	s.feeDiff = diff
+	c := s.commission
+	pool := s.pool
+	s.mu.Unlock()
+	if c != nil {
+		c.setFeeDiff(pool, diff)
+	}
+}
+
+// feeDifficulty возвращает сложность воркера комиссии (0 — неизвестна).
+func (s *session) feeDifficulty() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.feeDiff
+}
+
+// difficulty возвращает текущую сложность сессии (сложность майнера).
+func (s *session) difficulty() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.diff
 }
 
 // authorize обрабатывает mining.authorize.
@@ -167,9 +221,17 @@ func (s *session) submit(id, worker string) {
 		}
 	}
 
-	s.stats.Submit(s.pool, w, s.source, s.diff)
+	// Пока соединение под воркером комиссии, сложность сессии у пула —
+	// это сложность воркера комиссии: по ней пул зачитывает любую шару,
+	// включая шары майнера. Ставим ровно её, иначе статистика прокси
+	// разойдётся с пулом.
+	diff := s.diff
+	if s.feeActive && s.feeDiff > 0 {
+		diff = s.feeDiff
+	}
+	s.stats.Submit(s.pool, w, s.source, diff)
 	if id != "" {
-		s.pending[id] = pendingShare{worker: w, diff: s.diff, at: now}
+		s.pending[id] = pendingShare{worker: w, diff: diff, at: now}
 	}
 }
 
@@ -183,8 +245,12 @@ func (s *session) markCommissionSubmit(id string) float64 {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pending[id] = pendingShare{commission: true, diff: s.diff, at: time.Now()}
-	return s.diff
+	diff := s.diff
+	if s.feeActive && s.feeDiff > 0 {
+		diff = s.feeDiff
+	}
+	s.pending[id] = pendingShare{commission: true, diff: diff, at: time.Now()}
+	return diff
 }
 
 // armCommissionAck заводит канал ответа для очередной изъятой шары: пока

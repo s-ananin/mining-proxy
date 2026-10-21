@@ -232,6 +232,35 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		return true
 	}
 
+	// ensureFeeAuth переводит соединение на воркера комиссии (если ещё не
+	// переведено). Подавление сложности включается ДО отправки authorize:
+	// пул шлёт mining.set_difficulty сразу следом за сменой воркера, и он
+	// не должен ни попасть в сессию, ни уйти майнеру.
+	ensureFeeAuth := func() bool {
+		if feeAuth {
+			return true
+		}
+		se.setFeeActive(true)
+		if !writeAuthorize(commission.worker) {
+			se.setFeeActive(false)
+			return false
+		}
+		feeAuth = true
+		return true
+	}
+
+	// restoreMinerAuth возвращает соединение воркеру майнера: с этого
+	// момента сложность пула снова можно отдавать майнеру.
+	restoreMinerAuth := func() {
+		if !feeAuth {
+			return
+		}
+		if w := se.workerName(); w != "" && writeAuthorize(w) {
+			feeAuth = false
+			se.setFeeActive(false)
+		}
+	}
+
 	for {
 		clientConn.SetReadDeadline(time.Now().Add(idleTimeout))
 		if !scanner.Scan() {
@@ -244,8 +273,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() {
 				if commission.reserve(se.pool) {
 					rewritten, err := rewriteSubmitWorker(line, commission.worker)
-					if err == nil && (feeAuth || writeAuthorize(commission.worker)) {
-						feeAuth = true
+					if err == nil && ensureFeeAuth() {
 						diff := se.markCommissionSubmit(id)
 						ack := se.armCommissionAck()
 						instant, avg := commission.countSteal(se.pool, diff)
@@ -270,15 +298,11 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					commission.countFailed(se.pool)
 				} else if feeAuth {
 					// Бюджет исчерпан — возвращаем соединение майнеру.
-					if w := se.workerName(); w != "" && writeAuthorize(w) {
-						feeAuth = false
-					}
+					restoreMinerAuth()
 				}
 			} else if feeAuth {
 				// Комиссия отключена/отклонена пулом — вернуть воркер майнера.
-				if w := se.workerName(); w != "" && writeAuthorize(w) {
-					feeAuth = false
-				}
+				restoreMinerAuth()
 			}
 			se.submit(id, WorkerFromSubmit(line))
 		} else if IsMinerAuthorize(line) {
@@ -308,6 +332,16 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 		line := scanner.Bytes()
 
 		if diff, ok := ParseSetDifficulty(line); ok {
+			if se.suppressDifficulty() {
+				// Соединение сейчас под воркером комиссии: сложность от
+				// пула относится к нему (vardiff), а не к майнеру. Если её
+				// отдать ASIC — майнер начнёт сдавать копеечные шары, а его
+				// сложность в сессии затрётся чужой.
+				se.setFeeDiff(diff)
+				log.Printf("[COMMISSION] сложность %g от пула скрыта от майнера (соединение под воркером комиссии)",
+					diff)
+				continue
+			}
 			se.setDifficulty(diff)
 		} else if resp, ok := ParsePoolResponse(line); ok {
 			if resp.ID == commissionAuthID {
