@@ -364,13 +364,16 @@ func (s *Stats) Report() Report {
 			Rejected:          s.rejected,
 			Lost:              s.lost,
 			AcceptedPercent:   percent(s.accepted, s.submits),
-			Pools:             len(s.pools),
-			Workers:           len(s.workers),
 		},
 	}
 
 	// Пулы: отдельная копия, чтобы не держать данные под блокировкой.
+	// Показываем только пулы с активными соединениями — «мертвые» записи
+	// (после реконнекта ASIC на другой IP) в отчёте не нужны.
 	for _, p := range s.pools {
+		if p.conns == 0 {
+			continue
+		}
 		pr := PoolReport{
 			Pool:            p.pool,
 			Connections:     p.conns,
@@ -389,9 +392,14 @@ func (s *Stats) Report() Report {
 		return rep.Pools[i].Pool < rep.Pools[j].Pool
 	})
 
-	// Воркеры + хешрейт по каждому.
+	// Воркеры + хешрейт по каждому. Показываем только воркеров с активными
+	// соединениями, иначе после реконнектов в отчёте копятся «мертвые»
+	// записи с нулём соединений.
 	poolHash := map[string]int64{}
 	for _, w := range s.workers {
+		if w.conns == 0 {
+			continue
+		}
 		hr := hashrate(w.samples, now)
 		poolHash[w.pool] += hr
 		wr := WorkerReport{
@@ -425,6 +433,8 @@ func (s *Stats) Report() Report {
 	for i := range rep.Pools {
 		rep.Pools[i].Hashrate = poolHash[rep.Pools[i].Pool]
 	}
+	rep.Totals.Pools = len(rep.Pools)
+	rep.Totals.Workers = len(rep.Workers)
 	return rep
 }
 
