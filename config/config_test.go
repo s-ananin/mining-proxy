@@ -169,3 +169,32 @@ monitor_addr: "127.0.0.1:9091"
 		t.Errorf("UpstreamPort = %q, want 3333", cfg.UpstreamPort)
 	}
 }
+
+func TestLoadCommissionWorkerRotate(t *testing.T) {
+	path := writeTmp(t, "commission_worker: \"me\"\ncommission_worker_rotate: true\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.CommissionWorkerRotate {
+		t.Error("commission_worker_rotate должен быть включён")
+	}
+}
+
+func TestLoadCommissionWorkerRotateWithoutWorkerFails(t *testing.T) {
+	path := writeTmp(t, "commission_worker_rotate: true\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("commission_worker_rotate без commission_worker должен давать ошибку")
+	}
+}
+
+func TestLoadCommissionSuggestDifficulty(t *testing.T) {
+	path := writeTmp(t, "commission_worker: \"me\"\ncommission_suggest_difficulty: true\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.CommissionSuggestDifficulty {
+		t.Error("commission_suggest_difficulty должен быть включён")
+	}
+}

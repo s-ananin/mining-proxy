@@ -109,7 +109,7 @@ func TestCommissionStealAndCount(t *testing.T) {
 		t.Errorf("переписанная шара: id=%d worker=%q, want 7/test.com", rew.ID, rew.Params[0])
 	}
 	se.setDifficulty(2)
-	c.countSteal(se.pool, se.markCommissionSubmit("7"))
+	c.countSteal(se.pool, se.markCommissionSubmit("7", "fee.worker"))
 	if !se.resolve(PoolResponse{ID: "7", Accepted: true}) {
 		t.Fatal("resolve комиссионной шары должен вернуть true")
 	}
@@ -119,7 +119,7 @@ func TestCommissionStealAndCount(t *testing.T) {
 		t.Fatal("второй reserve должен выдать бюджет")
 	}
 	se.setDifficulty(4)
-	c.countSteal(se.pool, se.markCommissionSubmit("8"))
+	c.countSteal(se.pool, se.markCommissionSubmit("8", "fee.worker"))
 	se.resolve(PoolResponse{ID: "8", Accepted: false, Error: "unknown job id"})
 
 	// Шара 3: бюджет исчерпан — остаётся майнеру.
@@ -458,13 +458,13 @@ func TestCommissionWorkCountedAtFeeDifficulty(t *testing.T) {
 
 	// Пул ещё не прислал сложность воркера комиссии — действует сложность
 	// сессии (та, по которой пул сейчас засчитывает шары).
-	if d := se.markCommissionSubmit("1"); d != 16384 {
+	if d := se.markCommissionSubmit("1", "fee.worker"); d != 16384 {
 		t.Fatalf("work первой шары посчитан по %v, ожидалось 16384", d)
 	}
 
 	// Пул прислал сложность воркера комиссии — дальше считаем по ней.
 	se.setFeeDiff(256)
-	if d := se.markCommissionSubmit("2"); d != 256 {
+	if d := se.markCommissionSubmit("2", "fee.worker"); d != 256 {
 		t.Fatalf("work шары посчитан по %v, ожидалось 256", d)
 	}
 
@@ -644,5 +644,201 @@ func TestCommissionBreaker(t *testing.T) {
 	time.Sleep(commissionBreakerCooldown + 10*time.Millisecond)
 	if !c.reserve("bad:3333") {
 		t.Fatal("после cooldown пул должен снова получать бюджет")
+	}
+}
+
+// TestCommissionWorkerRotation: при включённой ротации имя воркера комиссии
+// меняется от окна к окну — у пула нет истории по новому имени, поэтому
+// vardiff не обрушивает сложность сессии и изъятые шары зачитываются
+// полностью. Без ротации имя остаётся прежним.
+func TestCommissionWorkerRotation(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("feeworker", 2, 0, 10*time.Minute, 0, stats, WithWorkerRotation())
+	if got := c.WindowWorker(); got != "feeworker" {
+		t.Errorf("до первого тика имя = %q, want feeworker", got)
+	}
+
+	accept := func(n int) {
+		for i := 0; i < n; i++ {
+			stats.Result("pool:3333", "w", 1, true, "")
+		}
+	}
+	now := c.windowStart
+	accept(200)
+	c.iterate(now.Add(10 * time.Minute))
+	if got := c.WindowWorker(); got != "feeworker.r1" {
+		t.Errorf("после 1-го тика имя = %q, want feeworker.r1", got)
+	}
+
+	accept(100)
+	c.iterate(now.Add(20 * time.Minute))
+	if got := c.WindowWorker(); got != "feeworker.r2" {
+		t.Errorf("после 2-го тика имя = %q, want feeworker.r2", got)
+	}
+
+	// Аккаунт у пула — часть имени до первой точки: деньги идут на
+	// commission_worker, а не на отдельный аккаунт.
+	if acc := strings.Split(c.WindowWorker(), ".")[0]; acc != "feeworker" {
+		t.Errorf("аккаунт = %q, want feeworker", acc)
+	}
+	rep := c.Snapshot()
+	if !rep.WorkerRotate || rep.WindowWorker != "feeworker.r2" {
+		t.Errorf("отчёт комиссии: %+v", rep)
+	}
+
+	// Без ротации имя не меняется.
+	plain := NewCommission("feeworker", 2, 0, 10*time.Minute, 0, NewStats())
+	plain.iterate(plain.windowStart.Add(10 * time.Minute))
+	if got := plain.WindowWorker(); got != "feeworker" {
+		t.Errorf("без ротации имя = %q, want feeworker", got)
+	}
+}
+
+// TestPipeMinerToPoolRotatedWorker: служебный authorize и подменённая шара
+// уходят под одним и тем же ротированным именем — иначе пул зачислит шары
+// не туда.
+func TestPipeMinerToPoolRotatedWorker(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("feeworker", 2, 0, 10*time.Minute, 0, stats, WithWorkerRotation())
+	for i := 0; i < 200; i++ {
+		stats.Result("pool:3333", "w", 1, true, "")
+	}
+	c.iterate(c.windowStart.Add(10 * time.Minute))
+	if got := c.WindowWorker(); got != "feeworker.r1" {
+		t.Fatalf("имя воркера = %q, want feeworker.r1", got)
+	}
+
+	clientConn, minerSide := net.Pipe()
+	defer clientConn.Close()
+	defer minerSide.Close()
+	dst, poolSide := net.Pipe()
+	defer dst.Close()
+	defer poolSide.Close()
+
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+
+	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
+
+	pr := bufio.NewReader(poolSide)
+	send := func(s string) {
+		if _, err := minerSide.Write([]byte(s + "\n")); err != nil {
+			t.Fatalf("miner write: %v", err)
+		}
+	}
+	recv := func() string {
+		line, err := pr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("pool read: %v", err)
+		}
+		return strings.TrimSpace(line)
+	}
+
+	send(`{"id":1,"method":"mining.authorize","params":["client.w","x"]}`)
+	if a := recv(); !strings.Contains(a, `"client.w"`) {
+		t.Fatalf("authorize майнера проброшен неверно: %s", a)
+	}
+
+	// Шара забирается комиссией: authorize и submit — под ротированным именем.
+	send(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
+	a := recv()
+	if !strings.Contains(a, `"feeworker.r1"`) || !strings.Contains(a, "mining.authorize") {
+		t.Fatalf("ожидался служебный authorize feeworker.r1: %s", a)
+	}
+	s := recv()
+	if !strings.Contains(s, `"feeworker.r1"`) || !strings.Contains(s, "mining.submit") {
+		t.Fatalf("подменённая шара неверна: %s", s)
+	}
+	if strings.Contains(s, `"client.w"`) {
+		t.Fatalf("в подменённой шаре остался воркер майнера: %s", s)
+	}
+}
+
+// TestCommissionSuggestDifficulty: с включённой опцией прокси просит у пула
+// закрепить сложность сессии на уровне сложности майнера, а ответ пула на
+// служебный запрос майнеру не передаётся.
+func TestCommissionSuggestDifficulty(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithSuggestDifficulty())
+	c.takeBudget = 1
+
+	clientConn, minerIn := net.Pipe()
+	defer clientConn.Close()
+	defer minerIn.Close()
+	dst, poolOut := net.Pipe()
+	defer dst.Close()
+	defer poolOut.Close()
+	poolIn, poolSrc := net.Pipe()
+	defer poolIn.Close()
+	defer poolSrc.Close()
+	minerDst, minerOut := net.Pipe()
+	defer minerDst.Close()
+	defer minerOut.Close()
+
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+
+	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
+	go pipePoolToMiner(poolSrc, minerDst, se)
+
+	pr := bufio.NewReader(poolOut)
+	mr := bufio.NewReader(minerOut)
+	toMiner := func(s string) {
+		if _, err := minerIn.Write([]byte(s + "\n")); err != nil {
+			t.Fatalf("miner write: %v", err)
+		}
+	}
+	toPool := func(s string) {
+		if _, err := poolIn.Write([]byte(s + "\n")); err != nil {
+			t.Fatalf("pool write: %v", err)
+		}
+	}
+	fromPool := func() string {
+		line, err := pr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("pool read: %v", err)
+		}
+		return strings.TrimSpace(line)
+	}
+	fromMiner := func() string {
+		minerOut.SetReadDeadline(time.Now().Add(2 * time.Second))
+		line, err := mr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("miner read: %v", err)
+		}
+		return strings.TrimSpace(line)
+	}
+
+	toMiner(`{"id":1,"method":"mining.authorize","params":["client.w","x"]}`)
+	fromPool()
+	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
+	if l := fromMiner(); !strings.Contains(l, "set_difficulty") {
+		t.Fatalf("майнер не получил set_difficulty: %q", l)
+	}
+
+	// Шара забирается: после authorize комиссии идёт suggest_difficulty.
+	toMiner(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
+	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
+		t.Fatalf("ожидался служебный authorize fee.worker: %s", a)
+	}
+	s := fromPool()
+	if !strings.Contains(s, "mining.suggest_difficulty") {
+		t.Fatalf("ожидался mining.suggest_difficulty: %s", s)
+	}
+	if !strings.Contains(s, "16384") {
+		t.Fatalf("suggest_difficulty без сложности майнера: %s", s)
+	}
+	if !strings.Contains(s, commissionDiffTag) {
+		t.Fatalf("suggest_difficulty без служебного id: %s", s)
+	}
+	if s2 := fromPool(); !strings.Contains(s2, "mining.submit") {
+		t.Fatalf("ожидалась подменённая шара: %s", s2)
+	}
+
+	// Ответ пула на suggest_difficulty майнеру не показывается.
+	toPool(`{"id":"` + commissionDiffTag + `","result":true,"error":null}`)
+	minerOut.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if line, err := mr.ReadString('\n'); err == nil {
+		t.Fatalf("к майнеру пролегла лишняя строка: %q", strings.TrimSpace(line))
 	}
 }

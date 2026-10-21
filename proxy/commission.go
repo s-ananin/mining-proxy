@@ -41,6 +41,7 @@ import (
 	"log"
 	"math/rand"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -62,6 +63,12 @@ const (
 	// commissionBreakerDenies — сколько отказов служебной переавторизации
 	// подряд по пулу открывают «предохранитель».
 	commissionBreakerDenies = 3
+
+	// commissionDiffTag — id служебного mining.suggest_difficulty: им прокси
+	// просит у пула закрепить сложность сессии на уровне сложности майнера.
+	// commissionDiffID — тот же id в виде, в котором его вернёт пул.
+	commissionDiffTag = "__commission_diff__"
+	commissionDiffID  = `"` + commissionDiffTag + `"`
 )
 
 // commissionBreakerCooldown — на сколько пул исключается из изъятия после
@@ -173,6 +180,21 @@ type Commission struct {
 	session          time.Duration // >0 — окно изъятия внутри интервала
 	stats            *Stats
 
+	// Ротация имени воркера комиссии. У пула с vardiff сложность
+	// воркера падает в разы, если воркер шлёт мало шар (а комиссия шлёт их
+	// мало по определению): изъятые шары зачитываются в десятки раз
+	// дешевле, и комиссия обесценивается. У нового имени истории нет —
+	// пул не трогает сложность сессии, и комиссия остаётся полной.
+	// Имя вида "<worker>.rN": аккаунт у пула — часть до первой точки, так
+	// что деньги по-прежнему идут на commission_worker.
+	rotateWorkers bool
+	workerSeq     int
+	windowWorker  string // имя воркера, действующее в текущем окне изъятия
+
+	// suggestDiff — после служебного authorize просить у пула закрепить
+	// сложность сессии на уровне сложности майнера (mining.suggest_difficulty).
+	suggestDiff bool
+
 	// Состояние суточного окна.
 	windowStart     time.Time
 	baseAccepted    int // stats.Accepted() в момент начала окна
@@ -205,6 +227,26 @@ type Commission struct {
 	rng *rand.Rand
 }
 
+// CommissionOption — дополнительная настройка комиссии, не влияющая на
+// расчёт порций.
+type CommissionOption func(*Commission)
+
+// WithWorkerRotation включает ротацию имени воркера комиссии: в каждом окне
+// изъятия используется новое имя ("<worker>.r1", "<worker>.r2" и т.д.).
+// Нужно пулам с vardiff: у нового воркера нет истории, поэтому пул не
+// обрушивает сложность сессии и изъятые шары зачитываются полностью.
+func WithWorkerRotation() CommissionOption {
+	return func(c *Commission) { c.rotateWorkers = true }
+}
+
+// WithSuggestDifficulty включает запрос сложности сессии у пула
+// (mining.suggest_difficulty) сразу после служебного authorize: пул
+// закрепляет сложность на уровне сложности майнера, даже если у воркера
+// комиссии свой vardiff.
+func WithSuggestDifficulty() CommissionOption {
+	return func(c *Commission) { c.suggestDiff = true }
+}
+
 // NewCommission создаёт сборщик комиссии. worker == "" — комиссия
 // выключена: Redirect всегда вернёт false, Start ничего не планирует.
 //
@@ -214,7 +256,7 @@ type Commission struct {
 //
 // session > 0 (только вместе с interval) ограничивает изъятие одним окном
 // такой длины внутри каждого интервала; начало окна выбирается случайно.
-func NewCommission(worker string, percent float64, iterationsPerDay int, interval, session time.Duration, stats *Stats) *Commission {
+func NewCommission(worker string, percent float64, iterationsPerDay int, interval, session time.Duration, stats *Stats, opts ...CommissionOption) *Commission {
 	now := time.Now()
 	if interval > 0 {
 		iterationsPerDay = int(commissionWindow / interval)
@@ -225,7 +267,7 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 	if session < 0 || session > interval {
 		session = 0
 	}
-	return &Commission{
+	c := &Commission{
 		stop:             make(chan struct{}),
 		worker:           worker,
 		percent:          percent,
@@ -240,6 +282,42 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 		breakerLogs:      map[string]time.Time{},
 		rng:              rand.New(rand.NewSource(now.UnixNano())),
 	}
+	c.windowWorker = worker
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
+	return c
+}
+
+// WindowWorker возвращает имя воркера комиссии, действующее в текущем окне
+// изъятия. При ротации это новое имя в каждом окне; без ротации —
+// commission_worker как есть.
+func (c *Commission) WindowWorker() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.windowWorker
+}
+
+// SuggestDifficulty сообщает, нужно ли просить у пула закрепить сложность
+// сессии (mining.suggest_difficulty) после служебного authorize.
+func (c *Commission) SuggestDifficulty() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.suggestDiff
+}
+
+// advanceWindowWorkerLocked готовит имя воркера для нового окна изъятия:
+// при ротации — следующее по счёту имя, без ротации — имя как есть.
+// Вызывается под c.mu.
+func (c *Commission) advanceWindowWorkerLocked() {
+	if !c.rotateWorkers || c.worker == "" {
+		c.windowWorker = c.worker
+		return
+	}
+	c.workerSeq++
+	c.windowWorker = c.worker + ".r" + strconv.Itoa(c.workerSeq)
 }
 
 // Enabled true, если комиссия сконфигурирована (worker задан).
@@ -327,6 +405,12 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		c.takeBudget += batch
 		c.budgetIssued += batch
 		c.iterationsUsed++
+		if batch > 0 {
+			// Новое окно изъятия — новое имя воркера (если включена
+			// ротация): у пула нет истории по этому имени, поэтому
+			// сложность сессии не обрушивается.
+			c.advanceWindowWorkerLocked()
+		}
 
 		// Окно изъятия на предстоящий интервал: случайное начало,
 		// длина ровно session (влезает в интервал: offset ≤ interval-session).
@@ -380,6 +464,10 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	batch := planBatch(acceptedToday, c.taken, iterationsLeft, c.percent)
 	c.takeBudget += batch
 	c.iterationsUsed++
+	if batch > 0 {
+		// Новое окно изъятия — новое имя воркера (если включена ротация).
+		c.advanceWindowWorkerLocked()
+	}
 	if batch > 0 {
 		log.Printf("[COMMISSION] iteration %d/%d: batch %d (accepted today=%d, target≈%d, taken=%d)",
 			c.iterationsUsed, c.iterationsPerDay, batch, acceptedToday,
@@ -611,6 +699,8 @@ type PoolCommissionReport struct {
 type CommissionReport struct {
 	Enabled          bool                   `json:"enabled"`
 	Worker           string                 `json:"worker,omitempty"`
+	WindowWorker     string                 `json:"window_worker,omitempty"`
+	WorkerRotate     bool                   `json:"worker_rotate,omitempty"`
 	Percent          float64                `json:"percent,omitempty"`
 	Interval         string                 `json:"interval,omitempty"`
 	Session          string                 `json:"session,omitempty"`
@@ -658,6 +748,8 @@ func (c *Commission) Snapshot() CommissionReport {
 	rep := CommissionReport{
 		Enabled:          true,
 		Worker:           c.worker,
+		WindowWorker:     c.windowWorker,
+		WorkerRotate:     c.rotateWorkers,
 		Percent:          c.percent,
 		Interval:         intervalString(c.interval),
 		Session:          intervalString(c.session),

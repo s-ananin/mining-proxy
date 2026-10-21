@@ -49,17 +49,24 @@ func main() {
 	log.Printf("[MAIN] listen: %s | fallback pool: %q | monitor: http://%s/status",
 		cfg.ListenAddr, cfg.UpstreamPool, cfg.MonitorAddr)
 	if cfg.CommissionWorker != "" {
+		extra := ""
+		if cfg.CommissionWorkerRotate {
+			extra += " rotate"
+		}
+		if cfg.CommissionSuggestDifficulty {
+			extra += " suggest_diff"
+		}
 		if cfg.CommissionEvery > 0 {
 			if cfg.CommissionSessionEvery > 0 {
-				log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s session=%s",
-					cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery, cfg.CommissionSessionEvery)
+				log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s session=%s%s",
+					cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery, cfg.CommissionSessionEvery, extra)
 			} else {
-				log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s",
-					cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery)
+				log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s%s",
+					cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery, extra)
 			}
 		} else {
-			log.Printf("[MAIN] commission: worker=%q percent=%v%% iterations/day=%d",
-				cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration)
+			log.Printf("[MAIN] commission: worker=%q percent=%v%% iterations/day=%d%s",
+				cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, extra)
 		}
 	}
 
@@ -69,7 +76,14 @@ func main() {
 	// --- 2.1. Комиссия (если задан commission_worker) ---
 	var commission *proxy.Commission
 	if cfg.CommissionWorker != "" {
-		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, cfg.CommissionSessionEvery, stats)
+		var opts []proxy.CommissionOption
+		if cfg.CommissionWorkerRotate {
+			opts = append(opts, proxy.WithWorkerRotation())
+		}
+		if cfg.CommissionSuggestDifficulty {
+			opts = append(opts, proxy.WithSuggestDifficulty())
+		}
+		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, cfg.CommissionSessionEvery, stats, opts...)
 		commission.Start()
 		defer commission.Close()
 	}

@@ -80,6 +80,22 @@ type Config struct {
 	// не больше него.
 	CommissionSession string `yaml:"commission_session"`
 
+	// CommissionWorkerRotate включает ротацию имени воркера комиссии: в
+	// каждом окне изъятия используется новое имя ("<worker>.r1", "<worker>.r2"
+	// и т.д.). Нужно для пулов с vardiff: сложность воркера падает в разы,
+	// если воркер шлёт мало шар (а комиссия шлёт их мало по определению), и
+	// изъятые шары зачитываются в десятки раз дешевле. У нового воркера
+	// истории нет — пул не трогает сложность сессии, и комиссия остаётся
+	// полной. Деньги при этом идут на тот же аккаунт: пул берёт аккаунт из
+	// части имени до первой точки ("anton425.r1" → аккаунт "anton425").
+	CommissionWorkerRotate bool `yaml:"commission_worker_rotate"`
+
+	// CommissionSuggestDifficulty: после служебного authorize прокси
+	// просит у пула закрепить сложность сессии на уровне сложности майнера
+	// (mining.suggest_difficulty). Пул, не знающий метода, ответит ошибкой
+	// (или проигнорирует) — поэтому включать только для проверенных пулов.
+	CommissionSuggestDifficulty bool `yaml:"commission_suggest_difficulty"`
+
 	// CommissionEvery распарсенный CommissionInterval — производное поле
 	// (не читается из файла).
 	CommissionEvery time.Duration `yaml:"-"`
@@ -192,6 +208,8 @@ func Load(path string) (*Config, error) {
 			}
 			cfg.CommissionSessionEvery = d
 		}
+	} else if cfg.CommissionWorkerRotate || cfg.CommissionSuggestDifficulty {
+		return nil, fmt.Errorf("commission_worker_rotate и commission_suggest_difficulty требуют непустого commission_worker")
 	}
 
 	return &cfg, nil

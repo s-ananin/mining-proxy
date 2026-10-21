@@ -79,6 +79,19 @@ func miningAuthorizeLine(worker, tag string) []byte {
 	return raw
 }
 
+// miningSuggestDifficultyLine собирает служебный mining.suggest_difficulty
+// (params = [сложность]). Используется комиссией: пул закрепляет сложность
+// сессии на указанном уровне, даже если у воркера комиссии свой vardiff.
+// tag — служебный id; ответ пула на него майнеру не показывается.
+func miningSuggestDifficultyLine(diff float64, tag string) []byte {
+	raw, _ := json.Marshal(struct {
+		ID     string    `json:"id"`
+		Method string    `json:"method"`
+		Params []float64 `json:"params"`
+	}{ID: tag, Method: "mining.suggest_difficulty", Params: []float64{diff}})
+	return raw
+}
+
 // WorkerFromAuthorize достаёт воркера из mining.authorize: params[0].
 // Возвращает полное имя, как его шлёт майнер ("pool.worker").
 func WorkerFromAuthorize(raw []byte) string {
