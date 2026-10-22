@@ -43,6 +43,7 @@ type session struct {
 	commAck    chan struct{} // ответ пула на текущую изъятую шару (сериализация)
 	feeActive  bool          // соединение сейчас авторизовано под commission_worker
 	feeDiff    float64       // сложность, которую пул назначил воркеру комиссии
+	feeDiffCh  chan struct{} // сигнал об изменении сложности воркера комиссии
 }
 
 // newSession регистрирует соединение в реестре.
@@ -53,6 +54,7 @@ func newSession(stats *Stats, pool, source string, commission *Commission) *sess
 		source:     source,
 		pending:    map[string]pendingShare{},
 		commission: commission,
+		feeDiffCh:  make(chan struct{}, 1),
 	}
 	s.stats.Connect(pool)
 	return s
@@ -134,11 +136,57 @@ func (s *session) suppressDifficulty() bool {
 func (s *session) setFeeDiff(diff float64) {
 	s.mu.Lock()
 	s.feeDiff = diff
+	ch := s.feeDiffCh
 	c := s.commission
 	pool := s.pool
 	s.mu.Unlock()
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
 	if c != nil {
 		c.setFeeDiff(pool, diff)
+	}
+}
+
+// waitFeeDiff ждёт, пока пул подтвердит сложность сессии target (например,
+// сложность майнера после mining.suggest_difficulty).
+//
+// Пока в сессии держится vardiff воркера комиссии, пул зачисляет изъятые
+// шары по его цене — в десятки раз дешевле. Поэтому отправка шар
+// откладывается до подтверждения.
+//
+// Если пул не прислал сложность вовсе, сессия осталась прежней: ждать
+// дальше бессмысленно, и через grace ожидание заканчивается успехом.
+//
+// true — сложность подтверждена (или не менялась), false — пул не
+// подтвердил за отведённое время.
+func (s *session) waitFeeDiff(target float64, timeout, grace time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	graceAt := time.Now().Add(grace)
+	for {
+		s.mu.Lock()
+		cur := s.feeDiff
+		ch := s.feeDiffCh
+		s.mu.Unlock()
+		if cur == target {
+			return true
+		}
+		if cur == 0 && time.Now().After(graceAt) {
+			// Сложность от пула так и не пришла — она не менялась.
+			return true
+		}
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return false
+		}
+		timer := time.NewTimer(remain)
+		select {
+		case <-ch:
+			timer.Stop()
+		case <-timer.C:
+			return false
+		}
 	}
 }
 

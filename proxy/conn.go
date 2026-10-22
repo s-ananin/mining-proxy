@@ -270,6 +270,15 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if commission.SuggestDifficulty() {
 			if d := se.difficulty(); d > 0 {
 				writeSuggestDifficulty(d)
+				// Ждём, пока пул применит предложенную сложность: пока в
+				// сессии держится vardiff воркера комиссии, любые шары
+				// (в том числе изъятые) зачисляются по его цене. Ожидание
+				// короткое — за это время майнер просто не успевает отдать
+				// очередную шару.
+				if !se.waitFeeDiff(d, commissionDiffWaitTimeout, commissionDiffGrace) {
+					log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — изъятые шары могут быть зачтены дешевле (сложность воркера комиссии %g)",
+						se.pool, d, commissionDiffWaitTimeout, se.feeDifficulty())
+				}
 			}
 		}
 		return true
@@ -284,6 +293,14 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if w := se.workerName(); w != "" && writeAuthorize(w) {
 			feeAuth = false
 			se.setFeeActive(false)
+			// Возвращаем сложность сессии на уровень сложности майнера:
+			// после служебного authorize пул мог оставить в сессии vardiff
+			// воркера комиссии, и шары майнера стали бы зачисляться дешевле.
+			if commission != nil && commission.SuggestDifficulty() {
+				if d := se.difficulty(); d > 0 {
+					writeSuggestDifficulty(d)
+				}
+			}
 		}
 	}
 

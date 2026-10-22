@@ -69,6 +69,16 @@ const (
 	// commissionDiffID — тот же id в виде, в котором его вернёт пул.
 	commissionDiffTag = "__commission_diff__"
 	commissionDiffID  = `"` + commissionDiffTag + `"`
+
+	// commissionDiffWaitTimeout — сколько ждём подтверждения сложности
+	// сессии после mining.suggest_difficulty, прежде чем отправлять изъятые
+	// шары: пока в сессии держится vardiff воркера комиссии, пул зачисляет
+	// их в десятки раз дешевле.
+	commissionDiffWaitTimeout = 20 * time.Second
+
+	// commissionDiffGrace — сколько ждём первого mining.set_difficulty от
+	// пула, если он вообще придёт: не пришёл — сложность сессии не менялась.
+	commissionDiffGrace = 3 * time.Second
 )
 
 // commissionBreakerCooldown — на сколько пул исключается из изъятия после
