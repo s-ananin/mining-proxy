@@ -44,6 +44,7 @@ type session struct {
 	feeActive  bool          // соединение сейчас авторизовано под commission_worker
 	feeDiff    float64       // сложность, которую пул назначил воркеру комиссии
 	feeDiffCh  chan struct{} // сигнал об изменении сложности воркера комиссии
+	suggestAt  time.Time     // когда последний раз просили у пула закрепить сложность
 }
 
 // newSession регистрирует соединение в реестре.
@@ -119,6 +120,12 @@ func (s *session) setFeeActive(active bool) {
 		// пришлёт её после нашего authorize. До этого действует сложность
 		// сессии — та, по которой пул сейчас засчитывает шары.
 		s.feeDiff = 0
+		// Старые сигналы об изменении сложности относятся к предыдущему
+		// окну — сбрасываем их, чтобы не ждать их заново.
+		select {
+		case <-s.feeDiffCh:
+		default:
+		}
 	}
 }
 
@@ -147,6 +154,52 @@ func (s *session) setFeeDiff(diff float64) {
 	if c != nil {
 		c.setFeeDiff(pool, diff)
 	}
+}
+
+// waitFeeDiffUpdate ждёт, пока пул пришлёт сложность воркера комиссии
+// (mining.set_difficulty — пул шлёт его, только если сложность изменилась).
+// Возвращает сложность и признак «пул её прислал». Если пул ничего не
+// прислал — сложность сессии не менялась, и просить закрепление не нужно.
+func (s *session) waitFeeDiffUpdate(timeout time.Duration) (float64, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.mu.Lock()
+		cur := s.feeDiff
+		ch := s.feeDiffCh
+		s.mu.Unlock()
+		if cur > 0 {
+			return cur, true
+		}
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return 0, false
+		}
+		timer := time.NewTimer(remain)
+		select {
+		case <-ch:
+			timer.Stop()
+		case <-timer.C:
+			return 0, false
+		}
+	}
+}
+
+// allowSuggest сообщает, можно ли сейчас просить пул закрепить сложность
+// сессии: не чаще раза в commissionSuggestInterval. Пул и сам ограничивает
+// частоту запросов ("Frequency limit exceeded"), поэтому лишних просьб не
+// шлём.
+func (s *session) allowSuggest() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Since(s.suggestAt) >= commissionSuggestInterval
+}
+
+// markSuggestSent запоминает момент последней просьбы о закреплении
+// сложности.
+func (s *session) markSuggestSent() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.suggestAt = time.Now()
 }
 
 // waitFeeDiff ждёт, пока пул подтвердит сложность сессии target (например,

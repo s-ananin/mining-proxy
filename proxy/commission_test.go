@@ -816,11 +816,13 @@ func TestCommissionSuggestDifficulty(t *testing.T) {
 		t.Fatalf("майнер не получил set_difficulty: %q", l)
 	}
 
-	// Шара забирается: после authorize комиссии идёт suggest_difficulty.
+	// Шара забирается: после authorize комиссии пул присылает vardiff
+	// воркера комиссии — тогда прокси просит закрепить сложность сессии.
 	toMiner(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
 	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
 		t.Fatalf("ожидался служебный authorize fee.worker: %s", a)
 	}
+	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16]}`)
 	s := fromPool()
 	if !strings.Contains(s, "mining.suggest_difficulty") {
 		t.Fatalf("ожидался mining.suggest_difficulty: %s", s)
@@ -901,17 +903,18 @@ func TestCommissionSuggestWaitsForPoolDiff(t *testing.T) {
 		t.Fatalf("майнер не получил set_difficulty: %q (%v)", l, err)
 	}
 
-	// Шара забирается комиссией.
+	// Шара забирается комиссией: пул присылает vardiff воркера комиссии —
+	// прокси просит закрепить сложность сессии.
 	toMiner(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
 	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
 		t.Fatalf("ожидался служебный authorize fee.worker: %s", a)
 	}
+	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16]}`)
 	if s := fromPool(); !strings.Contains(s, "mining.suggest_difficulty") {
 		t.Fatalf("ожидался mining.suggest_difficulty: %s", s)
 	}
 
-	// Пул прислал vardiff воркера комиссии — шара ждёт подтверждения.
-	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16]}`)
+	// Пул ещё не подтвердил сложность — шара ждёт.
 	poolOut.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if l, err := pr.ReadString('\n'); err == nil {
 		t.Fatalf("шара ушла до подтверждения сложности: %q", strings.TrimSpace(l))
@@ -922,5 +925,74 @@ func TestCommissionSuggestWaitsForPoolDiff(t *testing.T) {
 	poolOut.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if s, err := pr.ReadString('\n'); err != nil || !strings.Contains(s, "mining.submit") {
 		t.Fatalf("ожидалась подменённая шара: %q (%v)", s, err)
+	}
+}
+
+// TestCommissionNoSuggestWhenPoolKeepsDifficulty: если пул не роняет
+// сложность воркера комиссии, прокси не просит закрепление (пул
+// ограничивает частоту таких запросов).
+func TestCommissionNoSuggestWhenPoolKeepsDifficulty(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithSuggestDifficulty())
+	c.takeBudget = 1
+
+	clientConn, minerIn := net.Pipe()
+	defer clientConn.Close()
+	defer minerIn.Close()
+	dst, poolOut := net.Pipe()
+	defer dst.Close()
+	defer poolOut.Close()
+	poolIn, poolSrc := net.Pipe()
+	defer poolIn.Close()
+	defer poolSrc.Close()
+	minerDst, minerOut := net.Pipe()
+	defer minerDst.Close()
+	defer minerOut.Close()
+
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+
+	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
+	go pipePoolToMiner(poolSrc, minerDst, se)
+
+	pr := bufio.NewReader(poolOut)
+	toMiner := func(s string) {
+		if _, err := minerIn.Write([]byte(s + "\n")); err != nil {
+			t.Fatalf("miner write: %v", err)
+		}
+	}
+	toPool := func(s string) {
+		if _, err := poolIn.Write([]byte(s + "\n")); err != nil {
+			t.Fatalf("pool write: %v", err)
+		}
+	}
+	fromPool := func() string {
+		line, err := pr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("pool read: %v", err)
+		}
+		return strings.TrimSpace(line)
+	}
+
+	toMiner(`{"id":1,"method":"mining.authorize","params":["client.w","x"]}`)
+	fromPool()
+	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
+	minerOut.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if l, err := bufio.NewReader(minerOut).ReadString('\n'); err != nil || !strings.Contains(l, "set_difficulty") {
+		t.Fatalf("майнер не получил set_difficulty: %q (%v)", l, err)
+	}
+
+	// Пул не присылает сложность воркера комиссии — значит, не менял её.
+	toMiner(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
+	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
+		t.Fatalf("ожидался служебный authorize fee.worker: %s", a)
+	}
+	if s := fromPool(); !strings.Contains(s, "mining.submit") {
+		t.Fatalf("ожидалась подменённая шара: %s", s)
+	}
+	// Запроса закрепления сложности быть не должно.
+	poolOut.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if l, err := pr.ReadString('\n'); err == nil {
+		t.Fatalf("прокси зря запросил закрепление сложности: %q", strings.TrimSpace(l))
 	}
 }

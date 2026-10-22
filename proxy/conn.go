@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -264,24 +265,40 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			return false
 		}
 		feeAuth = true
-		// Просим пул держать сложность сессии на уровне сложности
-		// майнера: иначе vardiff воркера комиссии обрушит её, и изъятые
-		// шары будут зачтены в десятки раз дешевле.
-		if commission.SuggestDifficulty() {
-			if d := se.difficulty(); d > 0 {
-				writeSuggestDifficulty(d)
-				// Ждём, пока пул применит предложенную сложность: пока в
-				// сессии держится vardiff воркера комиссии, любые шары
-				// (в том числе изъятые) зачисляются по его цене. Ожидание
-				// короткое — за это время майнер просто не успевает отдать
-				// очередную шару.
-				if !se.waitFeeDiff(d, commissionDiffWaitTimeout, commissionDiffGrace) {
-					log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — изъятые шары могут быть зачтены дешевле (сложность воркера комиссии %g)",
-						se.pool, d, commissionDiffWaitTimeout, se.feeDifficulty())
-				}
-			}
-		}
 		return true
+	}
+
+	// ensurePoolDifficulty добивается, чтобы сложность сессии у пула была не
+	// ниже сложности майнера: пока в сессии держится vardiff воркера комиссии
+	// (наблюдалось падение 16384 -> 8192 -> ... -> 16), любые шары — в том
+	// числе изъятые — зачисляются в десятки раз дешевле.
+	ensurePoolDifficulty := func() {
+		if commission == nil || !commission.SuggestDifficulty() {
+			return
+		}
+		target := se.difficulty()
+		if target <= 0 {
+			return
+		}
+		// Ждём, пока пул сообщит свою сложность для воркера комиссии: если он
+		// её не менял — просить закрепление незачем (и пул не сочтёт запрос
+		// слишком частым).
+		d, changed := se.waitFeeDiffUpdate(commissionDiffGrace)
+		if !changed || d >= target {
+			return
+		}
+		if !se.allowSuggest() {
+			log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g, но закрепление уже запрашивали недавно — ждём следующего окна",
+				se.pool, d, target)
+			return
+		}
+		// Просим пул закрепить сложность сессии на уровне сложности майнера.
+		writeSuggestDifficulty(target)
+		se.markSuggestSent()
+		if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
+			log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — изъятые шары могут быть зачтены дешевле (сложность воркера комиссии %g)",
+				se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
+		}
 	}
 
 	// restoreMinerAuth возвращает соединение воркеру майнера: с этого
@@ -293,12 +310,16 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if w := se.workerName(); w != "" && writeAuthorize(w) {
 			feeAuth = false
 			se.setFeeActive(false)
-			// Возвращаем сложность сессии на уровень сложности майнера:
-			// после служебного authorize пул мог оставить в сессии vardiff
-			// воркера комиссии, и шары майнера стали бы зачисляться дешевле.
+			// Возвращаем сложность сессии на уровень сложности майнера: если
+			// пул оставил в сессии заниженную сложность воркера комиссии, шары
+			// майнера зачислялись бы дешевле.
 			if commission != nil && commission.SuggestDifficulty() {
-				if d := se.difficulty(); d > 0 {
-					writeSuggestDifficulty(d)
+				target := se.difficulty()
+				if target > 0 {
+					if d := se.feeDifficulty(); d > 0 && d < target {
+						writeSuggestDifficulty(target)
+						se.markSuggestSent()
+					}
 				}
 			}
 		}
@@ -320,6 +341,11 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					// шара (authorize и submit должны совпадать).
 					rewritten, err := []byte(nil), error(nil)
 					if ensureFeeAuth() {
+						// Перед отправкой изъятой шары убеждаемся, что
+						// сложность сессии у пула не ниже сложности
+						// майнера, — иначе шара зачислится в разы
+						// дешевле.
+						ensurePoolDifficulty()
 						rewritten, err = rewriteSubmitWorker(line, feeWorker)
 					}
 					if err == nil && rewritten != nil {
@@ -423,6 +449,12 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 				// сессии на уровне сложности майнера.
 				if resp.Accepted {
 					log.Printf("[COMMISSION] пул %s подтвердил закрепление сложности %g", se.pool, se.difficulty())
+				} else if strings.Contains(resp.Error, "Frequency limit") {
+					// Пул ограничивает частоту таких запросов — это не
+					// поломка: следующую просьбу сделаем не раньше чем
+					// через commissionSuggestInterval.
+					log.Printf("[COMMISSION] пул %s ограничил частоту запросов закрепления сложности (%s) — вернёмся к этому в следующем окне",
+						se.pool, resp.Error)
 				} else {
 					log.Printf("[COMMISSION] пул %s отклонил mining.suggest_difficulty: %s", se.pool, resp.Error)
 				}

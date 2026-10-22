@@ -76,9 +76,14 @@ const (
 	// их в десятки раз дешевле.
 	commissionDiffWaitTimeout = 20 * time.Second
 
-	// commissionDiffGrace — сколько ждём первого mining.set_difficulty от
-	// пула, если он вообще придёт: не пришёл — сложность сессии не менялась.
-	commissionDiffGrace = 3 * time.Second
+	// commissionDiffGrace — сколько ждём сложности от пула, если он её не
+	// присылает: не прислал — сложность сессии не менялась.
+	commissionDiffGrace = 2 * time.Second
+
+	// commissionSuggestInterval — не чаще как часто просим у пула закрепить
+	// сложность сессии: пул ограничивает частоту таких запросов
+	// ("Frequency limit exceeded").
+	commissionSuggestInterval = 60 * time.Second
 )
 
 // commissionBreakerCooldown — на сколько пул исключается из изъятия после
