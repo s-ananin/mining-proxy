@@ -272,6 +272,8 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 	// ниже сложности майнера: пока в сессии держится vardiff воркера комиссии
 	// (наблюдалось падение 16384 -> 8192 -> ... -> 16), любые шары — в том
 	// числе изъятые — зачисляются в десятки раз дешевле.
+	// Также не даём пула поднять сложность воркера выше сложности майнера:
+	// шары, найденные на сложности майнера, будут отклонены как "Low difficulty share".
 	ensurePoolDifficulty := func() {
 		if commission == nil || !commission.SuggestDifficulty() {
 			return
@@ -284,12 +286,20 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		// её не менял — просить закрепление незачем (и пул не сочтёт запрос
 		// слишком частым).
 		d, changed := se.waitFeeDiffUpdate(commissionDiffGrace)
-		if !changed || d >= target {
+		if !changed {
+			return
+		}
+		if d == target {
 			return
 		}
 		if !se.allowSuggest() {
-			log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g, но закрепление уже запрашивали недавно — ждём следующего окна",
-				se.pool, d, target)
+			if d < target {
+				log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g, но закрепление уже запрашивали недавно — ждём следующего окна",
+					se.pool, d, target)
+			} else {
+				log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g выше сложности майнера %g, но закрепление уже запрашивали недавно — ждём следующего окна",
+					se.pool, d, target)
+			}
 			return
 		}
 		// Просим пул закрепить сложность сессии на уровне сложности майнера.
