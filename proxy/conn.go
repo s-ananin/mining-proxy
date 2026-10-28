@@ -380,9 +380,15 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 						// майнера, — иначе шара зачислится в разы
 						// дешевле.
 						if ensurePoolDifficulty() {
-							if fd := se.feeDifficulty(); fd > 0 && se.difficulty() > 0 && fd > se.difficulty()+1e-12 {
+							md := se.difficulty()
+							fd := se.feeDifficulty()
+							if fd > 0 && md > 0 && fd > md+1e-12 {
 								log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g выше сложности майнера %g — пропускаем изъятие (низкая сложность)",
-									se.pool, fd, se.difficulty())
+									se.pool, fd, md)
+								rewritten = nil
+							} else if fd > 0 && md > 0 && fd < md-1e-12 {
+								log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g — пропускаем изъятие (обесценивание)",
+									se.pool, fd, md)
 								rewritten = nil
 							} else {
 								rewritten, err = rewriteSubmitWorker(line, feeWorker)
