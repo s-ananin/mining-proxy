@@ -74,7 +74,7 @@ const (
 	// сессии после mining.suggest_difficulty, прежде чем отправлять изъятые
 	// шары: пока в сессии держится vardiff воркера комиссии, пул зачисляет
 	// их в десятки раз дешевле.
-	commissionDiffWaitTimeout = 20 * time.Second
+	commissionDiffWaitTimeout = 15 * time.Second
 
 	// commissionDiffGrace — сколько ждём сложности от пула, если он её не
 	// присылает: не прислал — сложность сессии не менялась.
