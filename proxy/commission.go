@@ -187,6 +187,11 @@ type Commission struct {
 	stop chan struct{}
 	wg   sync.WaitGroup
 
+	// Глобальная сериализация авторизаций под комиссионного воркера
+	// для снижения лавины переавторизаций у пула с vardiff по аккаунту.
+	authMu sync.Mutex
+	lastAuth time.Time
+
 	// Параметры (worker == "" → комиссия выключена).
 	worker           string
 	percent          float64
@@ -254,12 +259,29 @@ func WithWorkerRotation() CommissionOption {
 	return func(c *Commission) { c.rotateWorkers = true }
 }
 
-// WithSuggestDifficulty включает запрос сложности сессии у пула
-// (mining.suggest_difficulty) сразу после служебного authorize: пул
-// закрепляет сложность на уровне сложности майнера, даже если у воркера
-// комиссии свой vardiff.
+	// WithSuggestDifficulty включает запрос сложности сессии у пула
+	// (mining.suggest_difficulty) сразу после служебного authorize: пул
+	// закрепляет сложность на уровне сложности майнера, даже если у воркера
+	// комиссии свой vardiff.
 func WithSuggestDifficulty() CommissionOption {
 	return func(c *Commission) { c.suggestDiff = true }
+}
+
+func (c *Commission) throttleAuth() {
+	if c == nil {
+		return
+	}
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if c.lastAuth.IsZero() {
+		c.lastAuth = time.Now()
+		return
+	}
+	since := time.Since(c.lastAuth)
+	if since < 500*time.Millisecond {
+		time.Sleep(500*time.Millisecond - since)
+	}
+	c.lastAuth = time.Now()
 }
 
 // NewCommission создаёт сборщик комиссии. worker == "" — комиссия
