@@ -426,11 +426,10 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					if feeAuth {
 						restoreMinerAuth()
 					}
-					if skipped {
-						commission.countFailed(se.pool)
-					} else {
+					if !skipped {
 						commission.countFailed(se.pool)
 					}
+					// Если skipped — просто возвращаем шару майнеру без учёта в failed
 				} else if feeAuth {
 					// Бюджет исчерпан — возвращаем соединение майнеру.
 					restoreMinerAuth()
