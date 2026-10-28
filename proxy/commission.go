@@ -83,7 +83,7 @@ const (
 	// commissionSuggestInterval — не чаще как часто просим у пула закрепить
 	// сложность сессии: пул ограничивает частоту таких запросов
 	// ("Frequency limit exceeded").
-	commissionSuggestInterval = 60 * time.Second
+	commissionSuggestInterval = 90 * time.Second
 )
 
 // commissionBreakerCooldown — на сколько пул исключается из изъятия после
@@ -273,7 +273,7 @@ func (c *Commission) throttleAuth() {
 	}
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
-	min := 800 * time.Millisecond
+	min := 1200 * time.Millisecond
 	if c.lastAuth.IsZero() {
 		c.lastAuth = time.Now()
 		return

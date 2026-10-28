@@ -44,7 +44,8 @@ type session struct {
 	feeActive  bool          // соединение сейчас авторизовано под commission_worker
 	feeDiff    float64       // сложность, которую пул назначил воркеру комиссии
 	feeDiffCh  chan struct{} // сигнал об изменении сложности воркера комиссии
-	suggestAt  time.Time     // когда последний раз просили у пула закрепить сложность
+	suggestAt       time.Time     // когда последний раз просили у пула закрепить сложность
+	freqLimitUntil  time.Time     // бэк-офф при "Frequency limit exceeded"
 }
 
 // newSession регистрирует соединение в реестре.
@@ -191,7 +192,19 @@ func (s *session) waitFeeDiffUpdate(timeout time.Duration) (float64, bool) {
 func (s *session) allowSuggest() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.freqLimitUntil.IsZero() && time.Now().Before(s.freqLimitUntil) {
+		return false
+	}
 	return time.Since(s.suggestAt) >= commissionSuggestInterval
+}
+
+// markSuggestFrequencyLimited ставит бэк-офф после "Frequency limit exceeded".
+func (s *session) markSuggestFrequencyLimited() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.freqLimitUntil.IsZero() || time.Now().Add(3*time.Minute).After(s.freqLimitUntil) {
+		s.freqLimitUntil = time.Now().Add(3 * time.Minute)
+	}
 }
 
 // markSuggestSent запоминает момент последней просьбы о закреплении

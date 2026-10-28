@@ -263,9 +263,6 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if commission != nil {
 			commission.throttleAuth()
 		}
-		if commission != nil {
-			commission.throttleAuth()
-		}
 		if !writeAuthorize(feeWorker) {
 			se.setFeeActive(false)
 			return false
@@ -526,7 +523,8 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 					// Пул ограничивает частоту таких запросов — это не
 					// поломка: следующую просьбу сделаем не раньше чем
 					// через commissionSuggestInterval.
-					log.Printf("[COMMISSION] пул %s ограничил частоту запросов закрепления сложности (%s) — вернёмся к этому в следующем окне",
+					se.markSuggestFrequencyLimited()
+					log.Printf("[COMMISSION] пул %s ограничил частоту запросов закрепления сложности (%s) — бэк-офф 3м",
 						se.pool, resp.Error)
 				} else {
 					log.Printf("[COMMISSION] пул %s отклонил mining.suggest_difficulty: %s", se.pool, resp.Error)
