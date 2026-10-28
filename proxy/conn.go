@@ -308,16 +308,18 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			}
 			writeSuggestDifficulty(target)
 			se.markSuggestSent()
-			if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
-				// Если не успели подтвердить, но текущая сложность воркера не выше майнера - можно попробовать один раз
-				if fd := se.feeDifficulty(); fd > 0 && fd <= target+1e-12 {
-					return true
-				}
-				log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
-					se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
-				return false
+		if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
+			if fd := se.feeDifficulty(); fd > 0 && fd <= target+1e-12 {
+				return true
 			}
-			return true
+			if fd := se.feeDifficulty(); fd <= target {
+				return true
+			}
+			log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
+				se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
+			return false
+		}
+		return true
 		}
 		if !se.allowSuggest() {
 			log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g, но закрепление уже запрашивали недавно — пропускаем изъятие",
@@ -329,6 +331,11 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		se.markSuggestSent()
 		if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
 			if fd := se.feeDifficulty(); fd > 0 && fd >= target-1e-12 {
+				// Пул уже поднял сложность до нужной или выше - можно изымать
+				return true
+			}
+			// Даже если не подтвердил точное совпадение, если feeDiff >= target - ок
+			if fd := se.feeDifficulty(); fd >= target {
 				return true
 			}
 			log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
