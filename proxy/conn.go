@@ -379,12 +379,15 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			id, _ := SubmitID(line)
 			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() {
 				if commission.reserve(se.pool) {
-					// Сначала открываем служебную авторизацию: она
-					// фиксирует имя воркера, под которым пойдёт эта
-					// шара (authorize и submit должны совпадать).
-					rewritten, err := []byte(nil), error(nil)
+					// Если уже идёт переключение под комиссионного воркера
+					// другим соединением — не изымать в этом витке.
+					rewritten := []byte(nil)
+					var err error
 					skipped := false
-					if ensureFeeAuth() {
+					if commission != nil && commission.authBusy(se) {
+						rewritten = nil
+						skipped = true
+					} else if ensureFeeAuth() {
 						// Перед отправкой изъятой шары убеждаемся, что
 						// сложность сессии у пула не ниже сложности
 						// майнера, — иначе шара зачислится в разы
@@ -409,6 +412,9 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 							rewritten = nil
 							skipped = true
 						}
+					} else {
+						rewritten = nil
+						skipped = true
 					}
 					if err == nil && rewritten != nil {
 						diff := se.markCommissionSubmit(id, feeWorker)

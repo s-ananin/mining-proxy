@@ -318,6 +318,15 @@ func (c *Commission) doneAuth(se *session) {
 	}
 }
 
+func (c *Commission) authBusy(se *session) bool {
+	if c == nil {
+		return false
+	}
+	c.authSerialize.Lock()
+	defer c.authSerialize.Unlock()
+	return c.authInFlight != 0 && c.authOwner != se
+}
+
 // NewCommission создаёт сборщик комиссии. worker == "" — комиссия
 // выключена: Redirect всегда вернёт false, Start ничего не планирует.
 //
