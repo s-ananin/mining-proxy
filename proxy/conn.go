@@ -374,6 +374,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					// фиксирует имя воркера, под которым пойдёт эта
 					// шара (authorize и submit должны совпадать).
 					rewritten, err := []byte(nil), error(nil)
+					skipped := false
 					if ensureFeeAuth() {
 						// Перед отправкой изъятой шары убеждаемся, что
 						// сложность сессии у пула не ниже сложности
@@ -386,15 +387,18 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 								log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g выше сложности майнера %g — пропускаем изъятие (низкая сложность)",
 									se.pool, fd, md)
 								rewritten = nil
+								skipped = true
 							} else if fd > 0 && md > 0 && fd < md-1e-12 {
 								log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g — пропускаем изъятие (обесценивание)",
 									se.pool, fd, md)
 								rewritten = nil
+								skipped = true
 							} else {
 								rewritten, err = rewriteSubmitWorker(line, feeWorker)
 							}
 						} else {
 							rewritten = nil
+							skipped = true
 						}
 					}
 					if err == nil && rewritten != nil {
@@ -422,7 +426,11 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					if feeAuth {
 						restoreMinerAuth()
 					}
-					commission.countFailed(se.pool)
+					if skipped {
+						commission.countFailed(se.pool)
+					} else {
+						commission.countFailed(se.pool)
+					}
 				} else if feeAuth {
 					// Бюджет исчерпан — возвращаем соединение майнеру.
 					restoreMinerAuth()
