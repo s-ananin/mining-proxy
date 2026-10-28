@@ -273,13 +273,14 @@ func (c *Commission) throttleAuth() {
 	}
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
+	min := 800 * time.Millisecond
 	if c.lastAuth.IsZero() {
 		c.lastAuth = time.Now()
 		return
 	}
 	since := time.Since(c.lastAuth)
-	if since < 500*time.Millisecond {
-		time.Sleep(500*time.Millisecond - since)
+	if since < min {
+		time.Sleep(min - since)
 	}
 	c.lastAuth = time.Now()
 }

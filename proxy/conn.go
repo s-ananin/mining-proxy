@@ -263,6 +263,9 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if commission != nil {
 			commission.throttleAuth()
 		}
+		if commission != nil {
+			commission.throttleAuth()
+		}
 		if !writeAuthorize(feeWorker) {
 			se.setFeeActive(false)
 			return false
