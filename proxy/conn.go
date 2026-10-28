@@ -258,18 +258,15 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if feeAuth {
 			return true
 		}
-		if commission != nil && !commission.tryAuth(se) {
-			return false
-		}
 		se.setFeeActive(true)
 		feeWorker = commission.WindowWorker()
 		if commission != nil {
 			commission.throttleAuth()
 		}
+		if commission != nil {
+			commission.throttleAuth()
+		}
 		if !writeAuthorize(feeWorker) {
-			if commission != nil {
-				commission.doneAuth(se)
-			}
 			se.setFeeActive(false)
 			return false
 		}
@@ -350,9 +347,6 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if writeAuthorize(w) {
 			feeAuth = false
 			se.setFeeActive(false)
-			if commission != nil {
-				commission.doneAuth(se)
-			}
 			// Возвращаем сложность сессии на уровень сложности майнера: если
 			// пул оставил в сессии заниженную сложность воркера комиссии, шары
 			// майнера зачислялись бы дешевле.

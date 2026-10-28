@@ -187,10 +187,6 @@ type Commission struct {
 	stop chan struct{}
 	wg   sync.WaitGroup
 
-	authSerialize sync.Mutex
-	authInFlight  int32
-	authOwner     *session
-
 	// Глобальная сериализация авторизаций под комиссионного воркера
 	// для снижения лавины переавторизаций у пула с vardiff по аккаунту.
 	authMu sync.Mutex
@@ -287,35 +283,6 @@ func (c *Commission) throttleAuth() {
 		time.Sleep(min - since)
 	}
 	c.lastAuth = time.Now()
-}
-
-func (c *Commission) tryAuth(se *session) bool {
-	if c == nil {
-		return true
-	}
-	c.authSerialize.Lock()
-	defer c.authSerialize.Unlock()
-	if c.authInFlight == 0 {
-		c.authInFlight = 1
-		c.authOwner = se
-		return true
-	}
-	if c.authOwner == se {
-		return true
-	}
-	return false
-}
-
-func (c *Commission) doneAuth(se *session) {
-	if c == nil {
-		return
-	}
-	c.authSerialize.Lock()
-	defer c.authSerialize.Unlock()
-	if c.authOwner == se {
-		c.authInFlight = 0
-		c.authOwner = nil
-	}
 }
 
 // NewCommission создаёт сборщик комиссии. worker == "" — комиссия
