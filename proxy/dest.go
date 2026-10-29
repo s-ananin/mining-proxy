@@ -1,16 +1,10 @@
 // Файл dest.go — восстановление ИСХОДНОГО адресата соединения.
 //
-// До этапа 2 прокси знал только ОДИН пул (upstream_pool из конфига) и
-// все соединения слал в него. Но у заказчика в одной подсети (контейнере)
-// стоят разные клиенты с разными пулами — viabtc, ampool, hairpool или
-// голый `IP:port` (при DNS-блокировках). iptables DNAT перенаправляет на
-// прокси ВЕСЬ их TCP-трафик (см. capture_all_tcp), и прокси должен понять,
-// куда именно шёл ASIC.
-//
-// Ответ: getsockopt(fd, SOL_IP, SO_ORIGINAL_DST) — ядро возвращает
-// настоящий адрес назначения ДО DNAT (по conntrack). Реализовано через
-// syscall.Syscall6 (без golang.org/x/sys, чтобы не тянуть зависимость и
-// сохранить совместимость с Go 1.13).
+// ASIC не знает о прокси: он шлёт TCP на адрес своего пула, iptables DNAT
+// подменяет назначение на наш порт, а настоящий адрес ядро хранит в
+// conntrack и отдаёт через getsockopt(SO_ORIGINAL_DST). Реализовано через
+// syscall.Syscall6 — без golang.org/x/sys, чтобы не тянуть зависимость
+// и сохранить совместимость с Go 1.13.
 package proxy
 
 import (
@@ -51,8 +45,8 @@ type rawSockaddrV6 struct {
 func ntohs(v uint16) uint16 { return v>>8 | v<<8 }
 
 // getOriginalDst возвращает исходный адрес назначения DNAT-перенаправленного
-// соединения. Если соединение пришло к нам напрямую (без iptables) — ядро
-// вернёт адрес нашего же listener; это "прямой" коннект (см. isProxyAddr).
+// соединения. Если соединение пришло напрямую (без iptables) — ядро вернёт
+// адрес нашего же listener; это «прямой» коннект (см. isProxyAddr).
 func getOriginalDst(conn *net.TCPConn) (net.Addr, bool) {
 	rawConn, err := conn.SyscallConn()
 	if err != nil {
@@ -68,10 +62,9 @@ func getOriginalDst(conn *net.TCPConn) (net.Addr, bool) {
 	return addr, ok
 }
 
-// sockOriginalDst выполняет сам getsockopt. Сначала пробуем IPv4 (SO_ORIGINAL_DST),
+// sockOriginalDst выполняет сам getsockopt: сначала IPv4 (SO_ORIGINAL_DST),
 // при неудаче — IPv6 (IP6T_SO_ORIGINAL_DST).
 func sockOriginalDst(fd uintptr) (net.Addr, bool) {
-	// IPv4.
 	var v4 rawSockaddrV4
 	l4 := unsafe.Sizeof(v4)
 	_, _, errno := syscall.Syscall6(syscall.SYS_GETSOCKOPT, fd, solIP, soOriginalDst,
@@ -82,7 +75,6 @@ func sockOriginalDst(fd uintptr) (net.Addr, bool) {
 		return &net.TCPAddr{IP: ip, Port: int(ntohs(v4.portBE))}, true
 	}
 
-	// IPv6.
 	var v6 rawSockaddrV6
 	l6 := unsafe.Sizeof(v6)
 	_, _, errno = syscall.Syscall6(syscall.SYS_GETSOCKOPT, fd, solIPV6, soOriginalDst,
@@ -97,7 +89,7 @@ func sockOriginalDst(fd uintptr) (net.Addr, bool) {
 }
 
 // originalDstAddr возвращает адрес вида host:port из net.Addr.
-// Возвращает пустую строку, если тип неожиданный.
+// Пустая строка, если тип неожиданный.
 func originalDstAddr(dst net.Addr) string {
 	if dst == nil {
 		return ""
@@ -111,16 +103,15 @@ func originalDstAddr(dst net.Addr) string {
 // resolveDestination решает, на какой адрес подключаться для данного
 // соединения:
 //
-//   - Transparent=true и DNAT-адрес получен (и это НЕ наш listener) →
-//     идём на реальный пул ASIC'а (порт/пул сохраняются);
-//   - иначе (прямой локальный тест, прозрачность выключена, DNAT-адрес
-//     недоступен) → fallback (upstream_pool из конфига).
+//   - адресат восстановлен из DNAT и это не наш listener → реальный пул
+//     конкретного ASIC (у разных клиентов может быть свой пул);
+//   - иначе (прямой коннект мимо iptables, локальный тест) → fallback
+//     из конфига (upstream_pool).
 func resolveDestination(conn net.Conn, pass ProxyPass) (addr string, ssl bool) {
 	addr, ssl = pass.Fallback, pass.FallbackSSL
 	if !pass.Transparent {
 		return addr, ssl
 	}
-
 	tcp, ok := conn.(*net.TCPConn)
 	if !ok {
 		return addr, ssl
@@ -129,26 +120,21 @@ func resolveDestination(conn net.Conn, pass ProxyPass) (addr string, ssl bool) {
 	if !ok {
 		return addr, ssl
 	}
-	// Исходный адрес = наш listener (прямой коннект, без iptables DNAT) —
-	// это локальный тест/разработка: проксируем в настроенный upstream.
 	if isProxyAddr(dst, pass.ListenAddr) {
 		return addr, ssl
 	}
-
-	// Реальный пул клиента. Порт и адрес сохраняются — в том числе для
-	// пулов на нестандартных портах и «голых» IP:port. TLS здесь НЕ
-	// терминируем: клиент говорит с пулом напрямую через нас (байты).
+	// TLS здесь НЕ терминируется: клиент говорит с пулом напрямую через
+	// нашу байтовую трубу, поэтому ssl=false всегда.
 	return originalDstAddr(dst), false
 }
 
-// isProxyAddr проверяет, является ли адрес назначения нашим же listener
-// (т.е. соединение пришло напрямую, а не через DNAT).
+// isProxyAddr проверяет, что адрес назначения — наш же listener,
+// то есть соединение пришло напрямую, а не через DNAT.
 func isProxyAddr(dst net.Addr, listenAddr string) bool {
 	tcp, ok := dst.(*net.TCPAddr)
 	if !ok {
 		return false
 	}
-
 	_, portStr, err := net.SplitHostPort(listenAddr)
 	if err != nil {
 		return false
@@ -166,8 +152,8 @@ func isProxyAddr(dst net.Addr, listenAddr string) bool {
 	if tcp.IP.IsLoopback() {
 		return true
 	}
-	// Могли прийти напрямую на реальный (не loopback) IP сервера —
-	// сверяемся с адресами наших интерфейсов.
+	// Пришли на реальный (не loopback) IP сервера — сверяем с нашими
+	// интерфейсами.
 	for _, our := range ourIPs() {
 		if tcp.IP.Equal(our) {
 			return true

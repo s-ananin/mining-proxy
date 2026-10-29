@@ -1,5 +1,5 @@
 # systemd unit для mining-proxy.
-# Копируется в /etc/systemd/system/mining-proxy.service скриптом scripts/setup.sh.
+# Копируется в /etc/systemd/system/mining-proxy.service.
 #
 # Управление:
 #   systemctl start mining-proxy    — запустить
@@ -8,7 +8,7 @@
 #   journalctl -u mining-proxy -f   — логи
 
 [Unit]
-Description=Mining Proxy — Stratum Share Redirector
+Description=Mining Proxy — прозрачный Stratum-прокси со статистикой шар
 # Запускаемся только после поднятия сети.
 After=network.target
 Wants=network-online.target
@@ -22,26 +22,18 @@ ExecStart=/usr/local/bin/mining-proxy --config /etc/mining-proxy/config.yaml
 Restart=always
 # Пауза между перезапусками (чтобы не было цикла рестартов).
 RestartSec=5
-# Watchdog: systemd убивает сервис, если процесс перестал шлaть WATCHDOG=1
-# (sd_notify в systemd.go) в течение этого времени. Прокси не зависнет
-# навсегда — после убийства Restart=always поднимет его заново, а
-# scripts/watchdog.sh в этот момент снимает DNAT (fail-open).
-WatchdogSec=60
 # Лимит открытых файловых дескрипторов: 65536.
-# Нужно для обслуживания тысяч одновременных TCP-соединений от ASIC.
+# Нужен для обслуживания тысяч одновременных TCP-соединений от ASIC.
 LimitNOFILE=65536
 
 # --- Безопасность (systemd hardening) ---
-# Запрет поднятия привилегий через setuid-бинарники (не мешает iptables,
-# т.к. прокси не выполняет команды с повышенными правами).
+# Прокси настраивает iptables и пишет sysctl — права root ему нужны.
 NoNewPrivileges=no
 # ProtectSystem=full делает /etc доступным только на чтение. Исключение —
 # /etc/sysctl.d: туда пишутся постоянные настройки ядра (ip_forward,
-# route_localnet) на случай, если setup.sh их не создал. Без этой строки
-# прокси падает с "Read-only file system" при первой попытке записи sysctl.
+# route_localnet) на случай, если setup.sh их не создал.
 ReadWritePaths=/etc/sysctl.d
 # Защита системных директорий от записи (/usr, /boot, /etc).
-# Конфиг читается, а не пишется — полный доступ к записи не нужен.
 ProtectSystem=full
 
 # --- Логи ---
