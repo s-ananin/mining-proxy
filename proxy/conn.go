@@ -268,6 +268,8 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			return false
 		}
 		feeAuth = true
+		log.Printf("[COMMISSION] запрос переавторизации miner=%s pool=%s worker=%q",
+			se.source, se.pool, feeWorker)
 		return true
 	}
 
@@ -305,18 +307,18 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			}
 			writeSuggestDifficulty(target)
 			se.markSuggestSent()
-		if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
-			if fd := se.feeDifficulty(); fd > 0 && fd <= target+1e-12 {
-				return true
+			if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
+				if fd := se.feeDifficulty(); fd > 0 && fd <= target+1e-12 {
+					return true
+				}
+				if fd := se.feeDifficulty(); fd <= target {
+					return true
+				}
+				log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
+					se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
+				return false
 			}
-			if fd := se.feeDifficulty(); fd <= target {
-				return true
-			}
-			log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
-				se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
-			return false
-		}
-		return true
+			return true
 		}
 		if !se.allowSuggest() {
 			log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g, но закрепление уже запрашивали недавно — пропускаем изъятие",
@@ -358,6 +360,8 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if writeAuthorize(w) {
 			feeAuth = false
 			se.setFeeActive(false)
+			log.Printf("[COMMISSION] запрос возврата авторизации miner=%s pool=%s worker=%q",
+				se.source, se.pool, w)
 			// Возвращаем сложность сессии на уровень сложности майнера: если
 			// пул оставил в сессии заниженную сложность воркера комиссии, шары
 			// майнера зачислялись бы дешевле.
@@ -499,13 +503,13 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 				// Ответ на служебный authorize: майнеру не показываем,
 				// но пишем в лог — по нему видно, принял ли пул смену воркера.
 				if resp.Accepted {
-					log.Printf("[COMMISSION] пул %s подтвердил переавторизацию", se.pool)
+					log.Printf("[COMMISSION] пул %s подтвердил переавторизацию miner=%s", se.pool, se.source)
 					if se.commission != nil {
 						se.commission.reportAuthOK(se.pool)
 					}
 				} else {
-					log.Printf("[COMMISSION] пул %s ОТКЛОНИЛ переавторизацию: %s — изъятие на этом соединении остановлено",
-						se.pool, resp.Error)
+					log.Printf("[COMMISSION] пул %s ОТКЛОНИЛ переавторизацию miner=%s: %s — изъятие на этом соединении остановлено",
+						se.pool, se.source, resp.Error)
 					se.denyFee()
 					if se.commission != nil {
 						se.commission.reportDeny(se.pool)

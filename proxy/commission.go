@@ -91,6 +91,10 @@ const (
 // задавать короткую паузу.
 var commissionBreakerCooldown = 10 * time.Minute
 
+// commissionAuthMinGap — минимальный интервал между служебными authorize.
+// Переменная также позволяет нагрузочным тестам не ждать реальную паузу.
+var commissionAuthMinGap = 1200 * time.Millisecond
+
 // poolCommission — счётчики изъятия по конкретному пулу. Нужны, чтобы при
 // работе с несколькими пулами видеть, где комиссия фактически идёт, а где
 // пул не знает commission_worker.
@@ -189,7 +193,7 @@ type Commission struct {
 
 	// Глобальная сериализация авторизаций под комиссионного воркера
 	// для снижения лавины переавторизаций у пула с vardiff по аккаунту.
-	authMu sync.Mutex
+	authMu   sync.Mutex
 	lastAuth time.Time
 
 	// Параметры (worker == "" → комиссия выключена).
@@ -259,10 +263,10 @@ func WithWorkerRotation() CommissionOption {
 	return func(c *Commission) { c.rotateWorkers = true }
 }
 
-	// WithSuggestDifficulty включает запрос сложности сессии у пула
-	// (mining.suggest_difficulty) сразу после служебного authorize: пул
-	// закрепляет сложность на уровне сложности майнера, даже если у воркера
-	// комиссии свой vardiff.
+// WithSuggestDifficulty включает запрос сложности сессии у пула
+// (mining.suggest_difficulty) сразу после служебного authorize: пул
+// закрепляет сложность на уровне сложности майнера, даже если у воркера
+// комиссии свой vardiff.
 func WithSuggestDifficulty() CommissionOption {
 	return func(c *Commission) { c.suggestDiff = true }
 }
@@ -273,7 +277,7 @@ func (c *Commission) throttleAuth() {
 	}
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
-	min := 1200 * time.Millisecond
+	min := commissionAuthMinGap
 	if c.lastAuth.IsZero() {
 		c.lastAuth = time.Now()
 		return

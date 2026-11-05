@@ -30,22 +30,22 @@ type pendingShare struct {
 
 // session — привязка соединения к реестру статистики.
 type session struct {
-	mu         sync.Mutex
-	stats      *Stats
-	pool       string // адресат соединения (реальный пул из DNAT)
-	source     string // IP майнера (без порта)
-	worker     string // текущий воркер (пусто, пока не авторизовался)
-	diff       float64
-	pending    map[string]pendingShare
-	closed     bool
-	commission *Commission   // сборщик комиссии; nil — выключена
-	feeDenied  bool          // пул отклонил служебный authorize — не изымаем
-	commAck    chan struct{} // ответ пула на текущую изъятую шару (сериализация)
-	feeActive  bool          // соединение сейчас авторизовано под commission_worker
-	feeDiff    float64       // сложность, которую пул назначил воркеру комиссии
-	feeDiffCh  chan struct{} // сигнал об изменении сложности воркера комиссии
-	suggestAt       time.Time     // когда последний раз просили у пула закрепить сложность
-	freqLimitUntil  time.Time     // бэк-офф при "Frequency limit exceeded"
+	mu             sync.Mutex
+	stats          *Stats
+	pool           string // адресат соединения (реальный пул из DNAT)
+	source         string // IP майнера (без порта)
+	worker         string // текущий воркер (пусто, пока не авторизовался)
+	diff           float64
+	pending        map[string]pendingShare
+	closed         bool
+	commission     *Commission   // сборщик комиссии; nil — выключена
+	feeDenied      bool          // пул отклонил служебный authorize — не изымаем
+	commAck        chan struct{} // ответ пула на текущую изъятую шару (сериализация)
+	feeActive      bool          // соединение сейчас авторизовано под commission_worker
+	feeDiff        float64       // сложность, которую пул назначил воркеру комиссии
+	feeDiffCh      chan struct{} // сигнал об изменении сложности воркера комиссии
+	suggestAt      time.Time     // когда последний раз просили у пула закрепить сложность
+	freqLimitUntil time.Time     // бэк-офф при "Frequency limit exceeded"
 }
 
 // newSession регистрирует соединение в реестре.
@@ -417,6 +417,10 @@ func (s *session) resolve(resp PoolResponse) bool {
 		}
 		s.signalCommission()
 		return true
+	}
+	if !resp.Accepted {
+		log.Printf("[SHARE] отклонена пулом %s (miner=%s worker=%q id=%s): %s",
+			s.pool, s.source, p.worker, resp.ID, resp.Error)
 	}
 	s.stats.Result(s.pool, p.worker, p.diff, resp.Accepted, resp.Error)
 	return true
