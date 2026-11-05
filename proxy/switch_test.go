@@ -2,17 +2,16 @@ package proxy
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"net"
 	"testing"
 	"time"
 )
 
-// Reproduce the incident: fee shares are accepted, restoring authorize is
-// acknowledged but no new job arrives, and the ASIC sends 25 old-job submits.
-// Both sockets must close after the first loss, before the restore timeout.
-func TestTransitionStaleBurstClosesConnectionImmediately(t *testing.T) {
+// Reproduce a pool that would acknowledge restoring authorize but withhold
+// its notify. Successful batch completion must reconnect without entering
+// that restore interval, even if the ASIC still has 25 old-job submits queued.
+func TestCommissionCompletionReconnectsBeforeOldShareBurst(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("fee.worker", 1, 40, 0, 0, stats)
 	c.takeBudget = 1
@@ -85,7 +84,7 @@ func TestTransitionStaleBurstClosesConnectionImmediately(t *testing.T) {
 	select {
 	case <-finished:
 	case <-time.After(2 * time.Second):
-		t.Fatal("still waiting for restore instead of reconnecting after first stale")
+		t.Fatal("still waiting for restore instead of reconnecting after completion")
 	}
 	<-writerDone
 	<-poolFinished
@@ -93,13 +92,13 @@ func TestTransitionStaleBurstClosesConnectionImmediately(t *testing.T) {
 		t.Fatal("miner connection remained open")
 	}
 	report := stats.Report()
-	if report.Totals.Accepted != 1 || report.Totals.Rejected != 1 || report.Totals.Lost != 0 {
+	if report.Totals.Accepted != 1 || report.Totals.Rejected != 0 || report.Totals.Lost != 0 {
 		t.Fatalf("burst accumulated rejects: %+v", report.Totals)
 	}
-	if snapshot := c.Snapshot(); snapshot.Accepted != 1 || !snapshot.Pools[0].BreakerOpen {
-		t.Fatalf("commission not accounted or breaker not open: %+v", snapshot)
+	if snapshot := c.Snapshot(); snapshot.Accepted != 1 || snapshot.Pools[0].BreakerOpen || snapshot.Failed != 0 {
+		t.Fatalf("commission completion was not accounted or disabled the pool: %+v", snapshot)
 	}
-	t.Logf("closed after first stale in %s; rejected=1 instead of burst of 25", time.Since(started))
+	t.Logf("reconnected at completion in %s; rejected=0 instead of restore burst of 25", time.Since(started))
 }
 
 type switchRig struct {
@@ -137,7 +136,7 @@ func (r *switchRig) miner(raw string) {
 }
 func (r *switchRig) pool(raw string) {
 	r.t.Helper()
-	if err := r.s.pool([]byte(raw)); err != nil {
+	if err := r.s.pool([]byte(raw)); err != nil && err != errCommissionComplete {
 		r.t.Fatal(err)
 	}
 }
@@ -186,50 +185,35 @@ func TestSwitchWaitsForAuthorizationAndNewJob(t *testing.T) {
 	defer r.close()
 	old := r.start()
 	before := len(r.down)
-	r.notify("unconfirmed", false)
+	r.notify("same-job", false) // queued old notify must not become fee work
 	if len(r.down) != before {
 		t.Fatal("unconfirmed job leaked to miner")
 	}
 	r.authOK()
 	if r.s.phase != feeStarting {
-		t.Fatal("authorization alone must not enable fee submits")
+		t.Fatal("old job activated on authorize ack")
 	}
-	r.notify("same-job", false) // upstream reuses the old id
+	r.notify("fee-job", false)
 	job := r.job()
 	if job == old || r.s.phase != feeWork {
 		t.Fatal("missing fresh job generation")
 	}
 	if !CleanJobsFromNotify(r.down[len(r.down)-1]) {
-		t.Fatal("transition did not force clean_jobs")
+		t.Fatal("missing clean_jobs")
 	}
 	r.submit(3, job)
 	last := r.up[len(r.up)-1]
-	if JobIDFromSubmit(last) != "same-job" || WorkerFromSubmit(last) != "fee.worker" {
-		t.Fatalf("incorrect fee submit: %s", last)
+	if JobIDFromSubmit(last) != "fee-job" || WorkerFromSubmit(last) != "fee.worker" {
+		t.Fatalf("bad fee submit: %s", last)
 	}
 	r.ack(3)
-	if r.s.phase != minerStarting {
-		t.Fatal("restoration waits for another miner share")
+	if !r.s.completed || r.s.pending() != 0 {
+		t.Fatal("completion did not request clean reconnect")
 	}
-	msg, _ := Parse(r.up[len(r.up)-1])
-	var params []string
-	json.Unmarshal(msg.Params, &params)
-	if len(params) != 2 || params[0] != "miner.w" || params[1] != "secret" {
-		t.Fatalf("restore lost original credentials: %v", params)
-	}
-	r.authOK()
-	r.notify("same-job", false)
-	if r.s.phase != minerWork {
-		t.Fatal("did not restore miner")
-	}
-	r.submit(4, r.job())
-	if WorkerFromSubmit(r.up[len(r.up)-1]) != "miner.w" {
-		t.Fatal("restored share still belongs to fee")
-	}
-	r.ack(4)
-	report := r.s.se.stats.Report()
-	if report.Totals.Accepted != 2 || report.Totals.Rejected != 0 || r.s.se.commission.Snapshot().Accepted != 1 {
-		t.Fatalf("incorrect accounting: %+v", report.Totals)
+	r.s.finish("proxy", errCommissionComplete.Error())
+	snapshot := r.s.se.commission.Snapshot()
+	if snapshot.Accepted != 1 || snapshot.Failed != 0 || snapshot.Pools[0].BreakerOpen || len(snapshot.DisabledSources) != 0 {
+		t.Fatalf("completion disabled collection: %+v", snapshot)
 	}
 }
 
@@ -239,8 +223,8 @@ func TestSwitchRejectsOldGenerationWithoutFalseAcceptance(t *testing.T) {
 	old := r.start()
 	up := len(r.up)
 	err := r.s.miner([]byte(fmt.Sprintf(`{"id":3,"method":"mining.submit","params":["miner.w",%q,"extra","time","nonce"]}`, old)))
-	if err == nil {
-		t.Fatal("unsafe transition did not request immediate reconnect")
+	if err != nil {
+		t.Fatalf("in-flight stale stopped commission: %v", err)
 	}
 	for _, line := range r.up[up:] {
 		if IsMinerSubmit(line) {
@@ -252,46 +236,42 @@ func TestSwitchRejectsOldGenerationWithoutFalseAcceptance(t *testing.T) {
 	}
 }
 
-func TestTransitionStaleDisablesPoolAcrossSessions(t *testing.T) {
-	r := newSwitchRig(t, 3)
+func TestTransitionStaleDoesNotDisableCommission(t *testing.T) {
+	r := newSwitchRig(t, 1)
 	defer r.close()
-	other := newSwitchRig(t, 0)
-	defer other.close()
-	other.s.se.commission.Close()
-	c := r.s.se.commission
-	other.s.se.commission = c
 	old := r.start()
-	c.lastAuth = time.Time{}
-	other.start()
-	if err := r.s.miner([]byte(fmt.Sprintf(`{"id":3,"method":"mining.submit","params":["miner.w",%q,"extra","time","nonce"]}`, old))); err == nil {
-		t.Fatal("unsafe session did not request reconnect")
+	r.submit(3, old)
+	response, ok := ParsePoolResponse(r.down[len(r.down)-1])
+	if !ok || response.Accepted || response.ID != "3" {
+		t.Fatal("stale was falsely accepted")
 	}
-	if !c.unsafeSwitch(r.s.se.pool) {
-		t.Fatal("transition loss did not disable pool")
+	if r.s.se.commission.switchBlocked(r.s.se.pool, r.s.se.source) {
+		t.Fatal("normal transition stale permanently disabled commission")
 	}
-	// A successful service response must not clear this incident breaker.
-	c.reportAuthOK(r.s.se.pool)
-	if c.reserve(r.s.se.pool) || c.tryStart(r.s.se.pool, time.Now().Add(24*time.Hour)) {
-		t.Fatal("unsafe pool resumed commission")
+	r.authOK()
+	r.notify("fee-job", true)
+	r.submit(4, r.job())
+	r.ack(4)
+	if !r.s.completed || r.s.se.commission.Snapshot().Accepted != 1 {
+		t.Fatal("commission did not complete after stale")
 	}
-	if err := other.s.tick(time.Now()); err != nil {
-		t.Fatal(err)
+}
+
+func TestNotifyBeforeAuthorizeAckActivatesWithItsDifficulty(t *testing.T) {
+	r := newSwitchRig(t, 1)
+	defer r.close()
+	r.start()
+	r.pool(`{"id":null,"method":"mining.set_difficulty","params":[16]}`)
+	r.notify("fresh-fee", false)
+	r.pool(`{"id":null,"method":"mining.set_difficulty","params":[32]}`)
+	r.authOK()
+	if r.s.phase != feeWork || r.s.jobs[r.job()].diff != 16 {
+		t.Fatal("buffered job lost or activated at later difficulty")
 	}
-	if other.s.phase != minerStarting {
-		t.Fatal("another session kept entering commission")
-	}
-	report := c.Snapshot()
-	if len(report.Pools) != 1 || !report.Pools[0].BreakerOpen || report.Pools[0].DisabledReason != "authorization_transition_stale" {
-		t.Fatalf("missing incident state in status: %+v", report.Pools)
-	}
-	// The unaffected session can restore ordinary work, but must not start
-	// another fee cycle even though budget remains.
-	other.authOK()
-	other.notify("restored", true)
-	other.submit(4, other.job())
-	other.ack(4)
-	if other.s.phase != minerWork {
-		t.Fatal("commission restarted after restoration")
+	r.submit(3, r.job())
+	r.ack(3)
+	if r.s.se.commission.Snapshot().WorkAccepted != 16 {
+		t.Fatal("buffered job accounting uses wrong difficulty")
 	}
 }
 
@@ -425,8 +405,8 @@ func TestSwitchDoesNotBlockTrafficOnDelayedFeeReply(t *testing.T) {
 		t.Fatal("restored with a fee share still pending")
 	}
 	r.ack(3)
-	if r.s.phase != minerStarting {
-		t.Fatal("did not restore after out-of-order acknowledgements")
+	if !r.s.completed {
+		t.Fatal("did not reconnect after out-of-order acknowledgements")
 	}
 }
 

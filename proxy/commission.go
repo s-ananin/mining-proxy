@@ -25,9 +25,9 @@
 //     только после подтверждения authorize и следующего mining.notify;
 //   - сложность пула передаётся майнеру вместе с соответствующим заданием.
 //     suggest_difficulty — асинхронная просьба, она не блокирует submit;
-//   - после ответов на последние изъятые шары прокси возвращает authorize
-//     майнера. Аннулированные переходом шары получают явный stale-ответ;
-//     отказ возврата или отсутствие нового задания требуют переподключения.
+//   - после ответов на последние изъятые шары прокси закрывает соединение:
+//     ASIC переподключается под основным воркером. Успешная порция не
+//     блокирует следующие интервалы. Старые шары при входе получают stale.
 //
 // Комиссия учитывается в своих счётчиках (/status.commission) и НЕ влияет на
 // totals/workers штатного мониторинга: забранные шары не регистрируются как
@@ -552,13 +552,8 @@ func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
 	return false
 }
 
-// A local transition reject proves that changing authorization is losing
-// actual miner work. Do not repeat the experiment on other sessions of this
-// pool, or automatically resume it after a cooldown.
-func (c *Commission) reportUnsafeSwitch(pool string) {
-	c.disableSwitch(pool, "", "authorization_transition_stale")
-}
-
+// Protocol failures and unexpected disconnects block retries; successful
+// batch completion and honest in-flight stale replies do not.
 func (c *Commission) disableSwitch(pool, source, reason string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -252,7 +252,12 @@ func runCommissionLoad(t *testing.T, n int, withCommission bool) (int, int) {
 				ready.Wait()
 				m.send(map[string]interface{}{"id": 4, "method": "mining.submit", "params": []interface{}{fmt.Sprintf("miner-%d", i), m.job, "extra", "ntime", "nonce"}})
 				m.readID(4)
-				m.readJob() // restoration must happen without another submit
+				if _, err := m.r.ReadByte(); err == nil {
+					t.Error("fee connection remained open after completion")
+				}
+				m.conn.Close()
+				m = dialLoadMiner(t, ln.Addr().String(), i)
+				defer m.conn.Close()
 				m.send(map[string]interface{}{"id": 5, "method": "mining.submit", "params": []interface{}{fmt.Sprintf("miner-%d", i), m.job, "extra", "ntime", "nonce"}})
 				m.readID(5)
 			}
@@ -309,5 +314,85 @@ func TestCommissionReauthorizationLoadModel(t *testing.T) {
 			}
 			t.Logf("full comparison elapsed=%s", time.Since(started))
 		})
+	}
+}
+
+func TestCommissionCollectsAcrossThreeIntervalsWithDelayedShares(t *testing.T) {
+	pool := startJobAwarePool(t)
+	defer pool.close()
+	stats := NewStats()
+	c := NewCommission("fee.worker", 1, 0, 5*time.Minute, 0, stats)
+	defer c.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handlers sync.WaitGroup
+	completedConnection := make(chan struct{}, 3)
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			handlers.Add(1)
+			go func() {
+				defer handlers.Done()
+				defer func() { completedConnection <- struct{}{} }()
+				HandleConnection(conn, ProxyPass{Fallback: pool.ln.Addr().String(), Commission: c}, stats)
+			}()
+		}
+	}()
+	defer func() { ln.Close(); <-acceptDone; handlers.Wait() }()
+	for cycle := 0; cycle < 3; cycle++ {
+		m := dialLoadMiner(t, ln.Addr().String(), 1)
+		defer m.conn.Close()
+		oldJob := m.job
+		// Feed the real interval planner another 300 accepted ordinary
+		// shares. Advance its clock rather than waiting fifteen minutes.
+		for i := 0; i < 300; i++ {
+			stats.Result(pool.ln.Addr().String(), "baseline", 256, true, "")
+		}
+		c.authMu.Lock()
+		c.lastAuth = time.Time{}
+		c.authMu.Unlock()
+		c.iterate(c.windowStart.Add(time.Duration(cycle+1) * 5 * time.Minute))
+		m.send(map[string]interface{}{"id": 3, "method": "mining.submit", "params": []string{"miner-1", oldJob, "e", "t", "n"}})
+		m.readID(3)
+		m.readJob()
+		feeJob := m.job
+		// A real ASIC can still emit hardware-queued shares from the old
+		// job after receiving clean_jobs. They must not disable collection.
+		for id := 4; id < 6; id++ {
+			m.send(map[string]interface{}{"id": id, "method": "mining.submit", "params": []string{"miner-1", oldJob, "e", "t", "n"}})
+			line, err := m.r.ReadBytes('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, ok := ParsePoolResponse(line)
+			if !ok || response.Accepted {
+				t.Fatalf("old-job share falsely accepted: %s", line)
+			}
+		}
+		for id := 6; id < 9; id++ {
+			m.send(map[string]interface{}{"id": id, "method": "mining.submit", "params": []string{"miner-1", feeJob, "e", "t", "n"}})
+			m.readID(id)
+		}
+		if _, err := m.r.ReadByte(); err == nil {
+			t.Fatal("batch completion waited for miner restore notify")
+		}
+		m.conn.Close()
+		// Peer EOF can be observed just before proxy cleanup finishes.
+		<-completedConnection
+		snapshot := c.Snapshot()
+		if snapshot.Accepted != 3*(cycle+1) || snapshot.Failed != 0 || len(snapshot.DisabledSources) != 0 || snapshot.Pools[0].BreakerOpen {
+			t.Fatalf("collection stopped after interval %d: %+v", cycle+1, snapshot)
+		}
+	}
+	accepted, rejected := pool.counts()
+	if accepted != 12 || rejected != 0 || stats.Report().Totals.Rejected != 6 || stats.Report().Totals.Lost != 0 {
+		t.Fatalf("bad multi-interval results: pool=%d/%d totals=%+v", accepted, rejected, stats.Report().Totals)
 	}
 }

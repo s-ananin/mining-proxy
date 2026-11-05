@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -12,6 +13,8 @@ import (
 
 const commissionTransitionTimeout = 10 * time.Second
 const commissionWorkTimeout = time.Minute
+
+var errCommissionComplete = errors.New("commission batch complete; reconnect with miner authorization")
 
 type authPhase int
 
@@ -31,30 +34,33 @@ type issuedJob struct {
 // stratumSwitch is owned by the connection event loop. In particular, no
 // goroutine can insert authorize between a submit and its accounting.
 type stratumSwitch struct {
-	se              *session
-	phase           authPhase
-	epoch           uint64
-	serial          uint64
-	controlID       string
-	serviceIDs      map[string]bool
-	serviceOrder    []string
-	authOK          bool
-	notifyBeforeAck bool
-	deadline        time.Time
-	feeWorker       string
-	reserved        bool
-	reservedAt      time.Time
-	stopFee         bool
-	poolDiff        float64
-	minerDiff       float64
-	suggestAt       time.Time
-	suggestUntil    time.Time
-	jobs            map[string]issuedJob
-	jobOrder        []string
-	aliasJobs       bool
-	lastMinerAuth   []byte
-	toPool          func([]byte) error
-	toMiner         func([]byte) error
+	se                *session
+	phase             authPhase
+	epoch             uint64
+	serial            uint64
+	controlID         string
+	serviceIDs        map[string]bool
+	serviceOrder      []string
+	authOK            bool
+	notifyBeforeAck   bool
+	pendingNotify     []byte
+	pendingNotifyDiff float64
+	completed         bool
+	deadline          time.Time
+	feeWorker         string
+	reserved          bool
+	reservedAt        time.Time
+	stopFee           bool
+	poolDiff          float64
+	minerDiff         float64
+	suggestAt         time.Time
+	suggestUntil      time.Time
+	jobs              map[string]issuedJob
+	jobOrder          []string
+	aliasJobs         bool
+	lastMinerAuth     []byte
+	toPool            func([]byte) error
+	toMiner           func([]byte) error
 }
 
 type stratumInput struct {
@@ -152,7 +158,11 @@ func runStratum(client net.Conn, reader *bufio.Reader, pool net.Conn, se *sessio
 		}
 		if err != nil {
 			endReason = err.Error()
-			log.Printf("[CONN] stratum miner=%s pool=%s: %v", se.source, se.pool, err)
+			if err == errCommissionComplete {
+				log.Printf("[COMMISSION] batch_complete miner=%s pool=%s action=reconnect", se.source, se.pool)
+			} else {
+				log.Printf("[CONN] stratum miner=%s pool=%s: %v", se.source, se.pool, err)
+			}
 			return
 		}
 	}
@@ -179,7 +189,7 @@ func (s *stratumSwitch) phaseName() string {
 }
 
 func (s *stratumSwitch) finish(side, reason string) {
-	if s.phase != minerWork && s.se.commission != nil {
+	if !s.completed && s.phase != minerWork && s.se.commission != nil {
 		s.se.commission.disableSwitch(s.se.pool, s.se.source, "commission_connection_closed")
 		s.se.commission.countFailed(s.se.pool)
 	}
@@ -216,6 +226,7 @@ func (s *stratumSwitch) switchAuth(fee bool, now time.Time) error {
 	}
 	s.authOK = false
 	s.notifyBeforeAck = false
+	s.pendingNotify = nil
 	s.deadline = now.Add(commissionTransitionTimeout)
 	s.se.lastSwitch(now)
 	worker := s.se.workerName()
@@ -263,7 +274,11 @@ func (s *stratumSwitch) tick(now time.Time) error {
 		}
 		if s.stopFee && s.pending() == 0 {
 			s.release()
-			return s.switchAuth(false, now)
+			// Returning authorize can leave the ASIC hashing fee jobs while
+			// waiting for a replacement notify. A fresh connection obtains the
+			// miner's own subscribe, extranonce and authorize together.
+			s.completed = true
+			return errCommissionComplete
 		}
 		if s.stopFee && now.After(s.deadline) {
 			return fmt.Errorf("commission submit response timeout; reconnect required")
@@ -296,18 +311,15 @@ func (s *stratumSwitch) rejectTransition(line []byte) error {
 	reason := "stale job after authorization switch"
 	job, known := s.jobs[JobIDFromSubmit(line)]
 	unsafe := s.epoch > 0 && (s.phase != minerWork || known && job.epoch != s.epoch)
-	if unsafe {
-		s.se.commission.disableSwitch(s.se.pool, s.se.source, "authorization_transition_stale")
+	if !unsafe {
+		reason = "unknown job id"
 	}
 	s.se.submitJob(id, WorkerFromSubmit(line), JobIDFromSubmit(line))
 	s.se.resolve(PoolResponse{ID: id, Error: reason})
-	if unsafe {
-		// The ASIC is still hashing an invalid authorization's work. Waiting
-		// for restore notify creates a stream of local rejects. End the
-		// session immediately; runStratum closes both sockets on this error.
-		// Do not wait for a stale response write to a slow/non-reading ASIC.
-		return fmt.Errorf("authorization transition discarded miner work; reconnect required")
-	}
+	// An in-flight old-job share during entry is an honest stale response,
+	// not evidence that the pool can never collect commission. Completion
+	// now reconnects immediately, so there is no restore interval producing
+	// repeated fee-job rejects and permanently disabling the pool.
 	response, _ := json.Marshal(struct {
 		ID     json.RawMessage `json:"id"`
 		Result bool            `json:"result"`
@@ -421,8 +433,19 @@ func (s *stratumSwitch) pool(line []byte) error {
 					// A suggestion is advisory. Never wait for it, and always
 					// publish the actual difficulty with the next job.
 					s.suggestAt = now
-					return s.toPool(miningSuggestDifficultyLine(s.minerDiff, commissionDiffTag))
+					if err := s.toPool(miningSuggestDifficultyLine(s.minerDiff, commissionDiffTag)); err != nil {
+						return err
+					}
 				}
+			}
+			if len(s.pendingNotify) != 0 {
+				pending, diff := s.pendingNotify, s.pendingNotifyDiff
+				s.pendingNotify = nil
+				latestDiff := s.poolDiff
+				s.poolDiff = diff
+				err := s.pool(pending)
+				s.poolDiff = latestDiff
+				return err
 			}
 			return nil
 		}
@@ -469,9 +492,23 @@ func (s *stratumSwitch) pool(line []byte) error {
 	if jobID, ok := JobIDFromNotify(line); ok {
 		transition := s.phase == feeStarting || s.phase == minerStarting
 		if transition && !s.authOK {
+			// Only retain a previously unseen upstream job. A notification
+			// already queued before authorize must not become fee work merely
+			// because it was read while the response was in flight.
+			seen := false
+			for _, job := range s.jobs {
+				if job.id == jobID {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				s.pendingNotify = append([]byte(nil), line...)
+				s.pendingNotifyDiff = s.poolDiff
+			}
 			if !s.notifyBeforeAck {
 				s.notifyBeforeAck = true
-				log.Printf("[DIAG] commission_notify miner=%s pool=%s phase=%s epoch=%d before_auth_ack=true job=%q action=withheld",
+				log.Printf("[DIAG] commission_notify miner=%s pool=%s phase=%s epoch=%d before_auth_ack=true job=%q action=buffer_until_ack",
 					s.se.source, s.se.pool, s.phaseName(), s.epoch, jobID)
 			}
 			return nil
