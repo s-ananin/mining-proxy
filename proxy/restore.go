@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -58,17 +57,6 @@ func (s *session) restorePoolLine(raw []byte) (bool, [][]byte, error) {
 		r.authorized = true
 	} else if r != nil && (msg.Method == "mining.set_difficulty" || msg.Method == "mining.set_extranonce" || msg.Method == "mining.notify") {
 		if msg.Method == "mining.notify" {
-			var params []json.RawMessage
-			if json.Unmarshal(msg.Params, &params) != nil || len(params) < 9 {
-				return true, nil, fmt.Errorf("invalid miner restore notify")
-			}
-			params[8] = json.RawMessage("true")
-			// Modify only the clean_jobs flag; preserve the original job ID
-			// and all other message fields, including extensions.
-			var fields map[string]json.RawMessage
-			json.Unmarshal(raw, &fields)
-			fields["params"], _ = json.Marshal(params)
-			raw, _ = json.Marshal(fields)
 			r.notified = true
 		}
 		if len(r.updates) >= 32 {
@@ -86,51 +74,14 @@ func (s *session) restorePoolLine(raw []byte) (bool, [][]byte, error) {
 	return true, r.updates, nil
 }
 
-func submitJobID(raw []byte) string {
-	msg, err := Parse(raw)
-	if err != nil {
-		return ""
-	}
-	var params []json.RawMessage
-	if json.Unmarshal(msg.Params, &params) != nil || len(params) < 2 {
-		return ""
-	}
-	var job string
-	json.Unmarshal(params[1], &job)
-	return job
-}
-
-func (s *session) oldCommissionShare(raw []byte) bool {
-	job := submitJobID(raw)
+// A new fee window must not interrupt an in-progress miner restore.
+func (s *session) restoringMiner() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.restore != nil || !s.feeActive && s.feeJobs[job]
-}
-
-// A queued share of a fee job must not be sent as ordinary miner work.
-// Send an honest stale response; never manufacture an accepted result.
-func (s *session) rejectCommissionTail(dst net.Conn, raw []byte) error {
-	id, ok := SubmitID(raw)
-	if !ok {
-		return fmt.Errorf("commission tail submit has no id")
-	}
-	reason := "stale commission job after miner reauthorization"
-	s.submit(id, WorkerFromSubmit(raw))
-	s.resolve(PoolResponse{ID: id, Error: reason})
-	response, _ := json.Marshal(struct {
-		ID     json.RawMessage `json:"id"`
-		Result bool            `json:"result"`
-		Error  []interface{}   `json:"error"`
-	}{json.RawMessage(id), false, []interface{}{21, reason, nil}})
-	s.minerWriteMu.Lock()
-	defer s.minerWriteMu.Unlock()
-	dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-	return writeLine(dst, response)
+	return s.restore != nil
 }
 
 func (s *session) publishMinerRestore(dst net.Conn, updates [][]byte) error {
-	s.minerWriteMu.Lock()
-	defer s.minerWriteMu.Unlock()
 	for _, line := range updates {
 		if diff, ok := ParseSetDifficulty(line); ok {
 			s.setDifficulty(diff)

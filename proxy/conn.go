@@ -371,14 +371,8 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		line := scanner.Bytes()
 
 		if IsMinerSubmit(line) {
-			if se.oldCommissionShare(line) {
-				if err := se.rejectCommissionTail(clientConn, line); err != nil {
-					return
-				}
-				continue
-			}
 			id, _ := SubmitID(line)
-			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() {
+			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() && !se.restoringMiner() {
 				if commission.reserve(se.pool) {
 					// Сначала открываем служебную авторизацию: она
 					// фиксирует имя воркера, под которым пойдёт эта
@@ -456,12 +450,6 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 				if !restoreMinerAuth() {
 					return
 				}
-			}
-			if se.oldCommissionShare(line) {
-				if err := se.rejectCommissionTail(clientConn, line); err != nil {
-					return
-				}
-				continue
 			}
 			se.submit(id, WorkerFromSubmit(line))
 		} else if IsMinerAuthorize(line) {
@@ -559,10 +547,8 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 			se.setJobID(jobID)
 		}
 
-		se.minerWriteMu.Lock()
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 		err := writeLine(dst, line)
-		se.minerWriteMu.Unlock()
 		if err != nil {
 			log.Printf("[CONN] pool->miner write: %v", err)
 			return

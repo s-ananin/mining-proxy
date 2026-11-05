@@ -31,9 +31,7 @@ type pendingShare struct {
 // session — привязка соединения к реестру статистики.
 type session struct {
 	mu             sync.Mutex
-	minerWriteMu   sync.Mutex
 	restore        *minerRestore
-	feeJobs        map[string]bool
 	stats          *Stats
 	pool           string // адресат соединения (реальный пул из DNAT)
 	source         string // IP майнера (без порта)
@@ -120,7 +118,6 @@ func (s *session) setFeeActive(active bool) {
 	defer s.mu.Unlock()
 	s.feeActive = active
 	if active {
-		s.feeJobs = make(map[string]bool)
 		// Сложность воркера комиссии на этом витке ещё неизвестна: пул
 		// пришлёт её после нашего authorize. До этого действует сложность
 		// сессии — та, по которой пул сейчас засчитывает шары.
@@ -303,17 +300,7 @@ func (s *session) setJobID(jobID string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.feeActive && s.restore == nil {
-		if len(s.feeJobs) >= 128 {
-			s.feeJobs = make(map[string]bool)
-		}
-		if s.feeJobs == nil {
-			s.feeJobs = make(map[string]bool)
-		}
-		s.feeJobs[jobID] = true
-	} else if !s.feeActive {
-		delete(s.feeJobs, jobID)
-	}
+
 	if s.worker != "" {
 		s.stats.SetJobID(s.pool, s.worker, jobID)
 	}

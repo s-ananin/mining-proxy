@@ -26,9 +26,7 @@ func TestRestoreRequiresAuthorizationAndJob(t *testing.T) {
 		if !handled || err != nil || len(updates) != 0 || !se.suppressDifficulty() {
 			t.Fatalf("restore completed too early: %v", err)
 		}
-		if !se.oldCommissionShare([]byte(`{"method":"mining.submit","params":["w","fee-job"]}`)) {
-			t.Fatal("old fee share allowed during restoration")
-		}
+
 		handled, updates, err = se.restorePoolLine(second)
 		if !handled || err != nil || len(updates) != 1 || se.suppressDifficulty() {
 			t.Fatalf("restore did not complete: %v", err)
@@ -36,12 +34,8 @@ func TestRestoreRequiresAuthorizationAndJob(t *testing.T) {
 		if job, _ := JobIDFromNotify(updates[0]); job != "original-job" {
 			t.Fatal("original job id changed")
 		}
-		var fields map[string]json.RawMessage
-		json.Unmarshal(updates[0], &fields)
-		var params []json.RawMessage
-		json.Unmarshal(fields["params"], &params)
-		if string(params[8]) != "true" || string(fields["extension"]) != `"preserved"` {
-			t.Fatal("clean_jobs or extension lost")
+		if string(updates[0]) != string(notify) {
+			t.Fatalf("pool notify changed: %s", updates[0])
 		}
 		se.close()
 	}
@@ -152,10 +146,30 @@ func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 		if time.Since(started) >= time.Second {
 			t.Fatal("restore queued behind auth throttle")
 		}
-		write(miner, submit(id+1, feeJob))
-		response, ok := ParsePoolResponse([]byte(read(miner, minerReader)))
-		if !ok || response.Accepted {
-			t.Fatal("old fee-job share was falsely accepted")
+		// Even if another budget is issued during restore, an old-job
+		// submit goes unchanged to the pool, without a new fee authorize.
+		c.mu.Lock()
+		c.takeBudget = 1
+		c.mu.Unlock()
+		tail := submit(id+1, feeJob)
+		write(miner, tail)
+		if line := read(pool, poolReader); line != tail {
+			t.Fatalf("tail was blocked or changed: %s", line)
+		}
+		c.mu.Lock()
+		remaining := c.takeBudget
+		c.takeBudget = 0
+		c.mu.Unlock()
+		if remaining != 1 {
+			t.Fatal("restore consumed another fee budget")
+		}
+		poolResponse := ack(id + 1)
+		if window == 1 {
+			poolResponse = fmt.Sprintf(`{"id":%d,"result":false,"error":[21,"unknown job id",null]}`, id+1)
+		}
+		write(pool, poolResponse)
+		if line := read(miner, minerReader); line != poolResponse {
+			t.Fatalf("pool decision changed: %s", line)
 		}
 		job = fmt.Sprintf("main-%d", window)
 		restoreAck := `{"id":"__commission_restore__","result":true,"error":null}`
@@ -174,8 +188,8 @@ func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 		if line := read(miner, minerReader); !strings.Contains(line, "set_extranonce") {
 			t.Fatalf("extranonce order: %s", line)
 		}
-		if line := read(miner, minerReader); func() bool { got, ok := JobIDFromNotify([]byte(line)); return ok && got == job }() == false {
-			t.Fatalf("job changed: %s", line)
+		if line := read(miner, minerReader); line != notify(job) {
+			t.Fatalf("pool notify changed: %s", line)
 		}
 		rawSubmit := submit(id+2, job)
 		write(miner, rawSubmit)
@@ -188,7 +202,21 @@ func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 	if report := c.Snapshot(); report.Accepted != 3 || report.Rejected != 0 || report.Failed != 0 {
 		t.Fatalf("commission did not repeat: %+v", report)
 	}
-	if report := stats.Report(); report.Totals.Accepted != 3 || report.Totals.Rejected != 3 || report.Totals.Lost != 0 {
+	if report := stats.Report(); report.Totals.Accepted != 5 || report.Totals.Rejected != 1 || report.Totals.Lost != 0 {
 		t.Fatalf("incorrect ordinary/tail accounting: %+v", report.Totals)
 	}
+}
+
+func submitJobID(raw []byte) string {
+	msg, err := Parse(raw)
+	if err != nil {
+		return ""
+	}
+	var params []json.RawMessage
+	if json.Unmarshal(msg.Params, &params) != nil || len(params) < 2 {
+		return ""
+	}
+	var job string
+	json.Unmarshal(params[1], &job)
+	return job
 }
