@@ -144,8 +144,10 @@ func TestSwitchRejectsOldGenerationWithoutFalseAcceptance(t *testing.T) {
 	old := r.start()
 	up := len(r.up)
 	r.submit(3, old)
-	if len(r.up) != up {
-		t.Fatal("old share sent under new authorization")
+	for _, line := range r.up[up:] {
+		if IsMinerSubmit(line) {
+			t.Fatal("old share sent under new authorization")
+		}
 	}
 	resp, ok := ParsePoolResponse(r.down[len(r.down)-1])
 	if !ok || resp.Accepted || resp.ID != "3" {
@@ -154,12 +156,56 @@ func TestSwitchRejectsOldGenerationWithoutFalseAcceptance(t *testing.T) {
 	if r.s.se.stats.Report().Totals.Rejected != 1 {
 		t.Fatal("local stale hidden from status")
 	}
+	if r.s.phase != minerStarting {
+		t.Fatal("unsafe switch did not immediately restore miner")
+	}
 	r.authOK()
 	r.notify("same-job", true)
 	up = len(r.up)
 	r.submit(4, old)
 	if len(r.up) != up {
 		t.Fatal("reused upstream id revalidated an old generation")
+	}
+}
+
+func TestTransitionStaleDisablesPoolAcrossSessions(t *testing.T) {
+	r := newSwitchRig(t, 3)
+	defer r.close()
+	other := newSwitchRig(t, 0)
+	defer other.close()
+	other.s.se.commission.Close()
+	c := r.s.se.commission
+	other.s.se.commission = c
+	old := r.start()
+	c.lastAuth = time.Time{}
+	other.start()
+	r.submit(3, old)
+	if !c.unsafeSwitch(r.s.se.pool) {
+		t.Fatal("transition loss did not disable pool")
+	}
+	// A successful service response must not clear this incident breaker.
+	c.reportAuthOK(r.s.se.pool)
+	if c.reserve(r.s.se.pool) || c.tryStart(r.s.se.pool, time.Now().Add(24*time.Hour)) {
+		t.Fatal("unsafe pool resumed commission")
+	}
+	if err := other.s.tick(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if other.s.phase != minerStarting {
+		t.Fatal("another session kept entering commission")
+	}
+	report := c.Snapshot()
+	if len(report.Pools) != 1 || !report.Pools[0].BreakerOpen || report.Pools[0].DisabledReason != "authorization_transition_stale" {
+		t.Fatalf("missing incident state in status: %+v", report.Pools)
+	}
+	// Following restoration ordinary accepted work proceeds; the breaker
+	// must prevent another fee cycle even though budget remains.
+	r.authOK()
+	r.notify("restored", true)
+	r.submit(4, r.job())
+	r.ack(4)
+	if r.s.phase != minerWork {
+		t.Fatal("commission restarted after restoration")
 	}
 }
 

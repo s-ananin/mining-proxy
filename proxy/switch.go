@@ -202,6 +202,12 @@ func (s *stratumSwitch) switchAuth(fee bool, now time.Time) error {
 }
 
 func (s *stratumSwitch) tick(now time.Time) error {
+	unsafe := s.se.commission != nil && s.se.commission.unsafeSwitch(s.se.pool)
+	if unsafe && s.phase == feeStarting {
+		s.release()
+		s.se.denyFee()
+		return s.switchAuth(false, now)
+	}
 	if s.phase == feeStarting || s.phase == minerStarting {
 		if now.Before(s.deadline) {
 			return nil
@@ -215,7 +221,7 @@ func (s *stratumSwitch) tick(now time.Time) error {
 		return s.switchAuth(false, now)
 	}
 	if s.phase == feeWork {
-		if now.After(s.deadline) || !s.se.commission.Enabled() {
+		if unsafe || now.After(s.deadline) || !s.se.commission.Enabled() {
 			s.stopFee = true
 		}
 		if s.stopFee && s.pending() == 0 {
@@ -251,6 +257,10 @@ func (s *stratumSwitch) rejectTransition(line []byte) error {
 		return fmt.Errorf("submit without id during authorization switch")
 	}
 	reason := "stale job after authorization switch"
+	job, known := s.jobs[JobIDFromSubmit(line)]
+	if s.epoch > 0 && (s.phase != minerWork || known && job.epoch != s.epoch) {
+		s.se.commission.reportUnsafeSwitch(s.se.pool)
+	}
 	s.se.submitJob(id, WorkerFromSubmit(line), JobIDFromSubmit(line))
 	s.se.resolve(PoolResponse{ID: id, Error: reason})
 	response, _ := json.Marshal(struct {
@@ -258,7 +268,10 @@ func (s *stratumSwitch) rejectTransition(line []byte) error {
 		Result bool            `json:"result"`
 		Error  []interface{}   `json:"error"`
 	}{json.RawMessage(id), false, []interface{}{21, reason, nil}})
-	return s.toMiner(response)
+	if err := s.toMiner(response); err != nil {
+		return err
+	}
+	return s.tick(time.Now())
 }
 
 func (s *stratumSwitch) miner(line []byte) error {
@@ -278,6 +291,11 @@ func (s *stratumSwitch) miner(line []byte) error {
 	}
 	if !IsMinerSubmit(line) {
 		return s.toPool(line)
+	}
+	if s.phase != minerWork {
+		if err := s.tick(time.Now()); err != nil {
+			return err
+		}
 	}
 	id, hasID := SubmitID(line)
 	originalJob := JobIDFromSubmit(line)
@@ -325,6 +343,11 @@ func (s *stratumSwitch) miner(line []byte) error {
 }
 
 func (s *stratumSwitch) pool(line []byte) error {
+	if s.phase != minerWork {
+		if err := s.tick(time.Now()); err != nil {
+			return err
+		}
+	}
 	if resp, ok := ParsePoolResponse(line); ok {
 		if s.controlID != "" && resp.ID == s.controlID {
 			s.controlID = ""

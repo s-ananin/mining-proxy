@@ -159,8 +159,9 @@ func (p *poolCommission) avgRateLocked() float64 {
 // изъятие с него приостанавливается на cooldown, чтобы не долбить пул и не
 // задерживать шары майнера.
 type poolBreaker struct {
-	denies   int
-	openTill time.Time
+	denies       int
+	openTill     time.Time
+	unsafeSwitch bool
 }
 
 // Commission — сборщик комиссии. Потокобезопасен (mu).
@@ -537,6 +538,9 @@ func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
 	if !ok {
 		return false
 	}
+	if b.unsafeSwitch {
+		return true
+	}
 	if now.Before(b.openTill) {
 		return true
 	}
@@ -544,6 +548,37 @@ func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
 	b.denies = 0
 	b.openTill = time.Time{}
 	return false
+}
+
+// A local transition reject proves that changing authorization is losing
+// actual miner work. Do not repeat the experiment on other sessions of this
+// pool, or automatically resume it after a cooldown.
+func (c *Commission) reportUnsafeSwitch(pool string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.breakers[pool]
+	if b == nil {
+		b = &poolBreaker{}
+		c.breakers[pool] = b
+	}
+	if !b.unsafeSwitch {
+		b.unsafeSwitch = true
+		log.Printf("[COMMISSION] pool=%s disabled until restart: authorization switch discarded miner work", pool)
+	}
+}
+
+func (c *Commission) unsafeSwitch(pool string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.breakers[pool]
+	return b != nil && b.unsafeSwitch
+}
+
+func (c *Commission) disabledReasonLocked(pool string) string {
+	if b := c.breakers[pool]; b != nil && b.unsafeSwitch {
+		return "authorization_transition_stale"
+	}
+	return ""
 }
 
 // reserve пытается зарезервировать одну шару под комиссию для соединения к
@@ -719,17 +754,18 @@ func (c *Commission) setFeeDiff(pool string, diff float64) {
 
 // PoolCommissionReport — снимок изъятия по одному пулу.
 type PoolCommissionReport struct {
-	Pool         string  `json:"pool"`
-	Attempts     int     `json:"attempts"`
-	Accepted     int     `json:"accepted"`
-	Rejected     int     `json:"rejected"`
-	Failed       int     `json:"failed"`
-	WorkIssued   float64 `json:"work_issued"`
-	WorkAccepted float64 `json:"work_accepted"`
-	WorkRejected float64 `json:"work_rejected"`
-	FeeDiff      float64 `json:"fee_diff"`  // сложность воркера комиссии на пуле
-	StealThs     float64 `json:"steal_ths"` // фактический хешрейт изъятия, TH/s
-	BreakerOpen  bool    `json:"breaker_open,omitempty"`
+	Pool           string  `json:"pool"`
+	Attempts       int     `json:"attempts"`
+	Accepted       int     `json:"accepted"`
+	Rejected       int     `json:"rejected"`
+	Failed         int     `json:"failed"`
+	WorkIssued     float64 `json:"work_issued"`
+	WorkAccepted   float64 `json:"work_accepted"`
+	WorkRejected   float64 `json:"work_rejected"`
+	FeeDiff        float64 `json:"fee_diff"`  // сложность воркера комиссии на пуле
+	StealThs       float64 `json:"steal_ths"` // фактический хешрейт изъятия, TH/s
+	BreakerOpen    bool    `json:"breaker_open,omitempty"`
+	DisabledReason string  `json:"disabled_reason,omitempty"`
 }
 
 // CommissionReport — снимок комиссии для /status.commission.
@@ -818,17 +854,18 @@ func (c *Commission) Snapshot() CommissionReport {
 	for name, p := range c.perPool {
 		seen[name] = true
 		rep.Pools = append(rep.Pools, PoolCommissionReport{
-			Pool:         name,
-			Attempts:     p.attempts,
-			Accepted:     p.accepted,
-			Rejected:     p.rejected,
-			Failed:       p.failed,
-			WorkIssued:   p.workIssued,
-			WorkAccepted: p.workAccepted,
-			WorkRejected: p.workRejected,
-			FeeDiff:      p.feeDiff,
-			StealThs:     p.avgRateLocked() / 1e12,
-			BreakerOpen:  c.poolOpenLocked(name, now),
+			Pool:           name,
+			Attempts:       p.attempts,
+			Accepted:       p.accepted,
+			Rejected:       p.rejected,
+			Failed:         p.failed,
+			WorkIssued:     p.workIssued,
+			WorkAccepted:   p.workAccepted,
+			WorkRejected:   p.workRejected,
+			FeeDiff:        p.feeDiff,
+			StealThs:       p.avgRateLocked() / 1e12,
+			BreakerOpen:    c.poolOpenLocked(name, now),
+			DisabledReason: c.disabledReasonLocked(name),
 		})
 	}
 	// Пулы, где известен только предохранитель (изъятия ещё не было или
@@ -838,8 +875,9 @@ func (c *Commission) Snapshot() CommissionReport {
 			continue
 		}
 		rep.Pools = append(rep.Pools, PoolCommissionReport{
-			Pool:        name,
-			BreakerOpen: c.poolOpenLocked(name, now),
+			Pool:           name,
+			BreakerOpen:    c.poolOpenLocked(name, now),
+			DisabledReason: c.disabledReasonLocked(name),
 		})
 	}
 	sort.Slice(rep.Pools, func(i, j int) bool { return rep.Pools[i].Pool < rep.Pools[j].Pool })
