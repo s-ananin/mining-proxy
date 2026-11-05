@@ -32,24 +32,25 @@ type pendingShare struct {
 
 // session — привязка соединения к реестру статистики.
 type session struct {
-	mu            sync.Mutex
-	stats         *Stats
-	pool          string // адресат соединения (реальный пул из DNAT)
-	source        string // IP майнера (без порта)
-	worker        string // текущий воркер (пусто, пока не авторизовался)
-	diff          float64
-	pending       map[string]pendingShare
-	closed        bool
-	commission    *Commission // сборщик комиссии; nil — выключена
-	feeDenied     bool        // пул отклонил служебный authorize — не изымаем
-	feeActive     bool        // соединение сейчас авторизовано под commission_worker
-	feeDiff       float64     // сложность, которую пул назначил воркеру комиссии
-	lastFeeSwitch time.Time
-	lastJobID     string
-	jobTimes      map[string]time.Time
-	jobOrder      []string
-	controlIDs    map[string]string
-	initialAuth   []byte // credentials from a sniffed authorize, never logged
+	mu              sync.Mutex
+	stats           *Stats
+	pool            string // адресат соединения (реальный пул из DNAT)
+	source          string // IP майнера (без порта)
+	worker          string // текущий воркер (пусто, пока не авторизовался)
+	diff            float64
+	pending         map[string]pendingShare
+	closed          bool
+	commission      *Commission // сборщик комиссии; nil — выключена
+	feeDenied       bool        // пул отклонил служебный authorize — не изымаем
+	feeActive       bool        // соединение сейчас авторизовано под commission_worker
+	feeDiff         float64     // сложность, которую пул назначил воркеру комиссии
+	lastFeeSwitch   time.Time
+	lastJobID       string
+	jobTimes        map[string]time.Time
+	jobOrder        []string
+	controlIDs      map[string]string
+	initialAuth     []byte // credentials from a sniffed authorize, never logged
+	handshakeLogged map[string]bool
 }
 
 const maxTrackedJobsPerSession = 32
@@ -198,8 +199,9 @@ func (s *session) setJobIDLocked(jobID string) {
 }
 
 func (s *session) trackControl(raw []byte) {
+	s.traceHandshake(raw)
 	msg, err := Parse(raw)
-	if err != nil || (msg.Method != "mining.subscribe" && msg.Method != "mining.authorize") || isNullID(msg.ID) {
+	if err != nil || (msg.Method != "mining.subscribe" && msg.Method != "mining.authorize" && msg.Method != "mining.extranonce.subscribe") || isNullID(msg.ID) {
 		return
 	}
 	s.mu.Lock()

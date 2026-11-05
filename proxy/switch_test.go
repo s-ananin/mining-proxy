@@ -459,3 +459,83 @@ func TestSwitchDoesNotRefundPreviousDayIntoNewBudget(t *testing.T) {
 		t.Fatal("old reservation increased new day's budget")
 	}
 }
+
+func TestFeeSwitchEOFBlocksSourceAcrossPoolAddresses(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 1, 40, 0, 0, stats)
+	c.takeBudget = 1
+	defer c.Close()
+	se := newSession(stats, "pool-a:3333", "10.2.38.170", c)
+	defer se.close()
+	proxyMiner, miner := net.Pipe()
+	proxyPool, pool := net.Pipe()
+	defer miner.Close()
+	defer pool.Close()
+	defer proxyMiner.Close()
+	defer proxyPool.Close()
+	miner.SetDeadline(time.Now().Add(3 * time.Second))
+	pool.SetDeadline(time.Now().Add(3 * time.Second))
+	finished := make(chan struct{})
+	go func() { runStratum(proxyMiner, bufio.NewReader(proxyMiner), proxyPool, se); close(finished) }()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		defer pool.Close()
+		r := bufio.NewReader(pool)
+		// Initial miner authorize and one ordinary submit are accepted.
+		for i := 0; i < 2; i++ {
+			line, err := r.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			msg, err := Parse(line)
+			if err != nil {
+				return
+			}
+			if writeLine(pool, []byte(fmt.Sprintf(`{"id":%s,"result":true,"error":null}`, msg.ID))) != nil {
+				return
+			}
+			if i == 0 {
+				if writeLine(pool, []byte(`{"id":null,"method":"mining.notify","params":["initial","p","c1","c2",[],"v","b","t",true]}`)) != nil {
+					return
+				}
+			}
+		}
+		// Simulate a pool closing the connection on service authorize.
+		r.ReadBytes('\n')
+	}()
+	m := &loadMiner{conn: miner, r: bufio.NewReader(miner), w: bufio.NewWriter(miner)}
+	m.send(map[string]interface{}{"id": 1, "method": "mining.authorize", "params": []string{"miner.w", "x"}})
+	m.readID(1)
+	m.readJob()
+	m.send(map[string]interface{}{"id": 2, "method": "mining.submit", "params": []string{"miner.w", m.job, "e", "t", "n"}})
+	m.readID(2)
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("EOF did not end switch")
+	}
+	<-serverDone
+	if c.tryStartMiner("pool-b:3333", se.source, time.Now().Add(time.Hour)) {
+		t.Fatal("same ASIC retried commission at another pool")
+	}
+	snapshot := c.Snapshot()
+	if snapshot.Failed != 1 || len(snapshot.DisabledSources) != 1 || snapshot.DisabledSources[0].Source != se.source || snapshot.DisabledSources[0].Reason != "commission_connection_closed" {
+		t.Fatalf("missing cross-pool incident state: %+v", snapshot)
+	}
+	if c.takeBudget != 1 {
+		t.Fatal("unsent reservation was not refunded")
+	}
+	if !c.tryStartMiner("pool-b:3333", "10.2.38.171", time.Now().Add(time.Hour)) {
+		t.Fatal("unaffected ASIC was disabled on another pool")
+	}
+}
+
+func TestNormalEOFDoesNotDisableCommission(t *testing.T) {
+	r := newSwitchRig(t, 0)
+	defer r.close()
+	r.s.finish("miner", "EOF")
+	if len(r.s.se.commission.Snapshot().DisabledSources) != 0 || r.s.se.commission.unsafeSwitch(r.s.se.pool) {
+		t.Fatal("ordinary EOF was treated as a commission failure")
+	}
+}

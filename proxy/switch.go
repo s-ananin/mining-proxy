@@ -31,29 +31,30 @@ type issuedJob struct {
 // stratumSwitch is owned by the connection event loop. In particular, no
 // goroutine can insert authorize between a submit and its accounting.
 type stratumSwitch struct {
-	se            *session
-	phase         authPhase
-	epoch         uint64
-	serial        uint64
-	controlID     string
-	serviceIDs    map[string]bool
-	serviceOrder  []string
-	authOK        bool
-	deadline      time.Time
-	feeWorker     string
-	reserved      bool
-	reservedAt    time.Time
-	stopFee       bool
-	poolDiff      float64
-	minerDiff     float64
-	suggestAt     time.Time
-	suggestUntil  time.Time
-	jobs          map[string]issuedJob
-	jobOrder      []string
-	aliasJobs     bool
-	lastMinerAuth []byte
-	toPool        func([]byte) error
-	toMiner       func([]byte) error
+	se              *session
+	phase           authPhase
+	epoch           uint64
+	serial          uint64
+	controlID       string
+	serviceIDs      map[string]bool
+	serviceOrder    []string
+	authOK          bool
+	notifyBeforeAck bool
+	deadline        time.Time
+	feeWorker       string
+	reserved        bool
+	reservedAt      time.Time
+	stopFee         bool
+	poolDiff        float64
+	minerDiff       float64
+	suggestAt       time.Time
+	suggestUntil    time.Time
+	jobs            map[string]issuedJob
+	jobOrder        []string
+	aliasJobs       bool
+	lastMinerAuth   []byte
+	toPool          func([]byte) error
+	toMiner         func([]byte) error
 }
 
 type stratumInput struct {
@@ -107,6 +108,8 @@ func runStratum(client net.Conn, reader *bufio.Reader, pool net.Conn, se *sessio
 		},
 	}
 	defer s.release()
+	observedSide, endReason := "proxy", "connection ended"
+	defer func() { s.finish(observedSide, endReason) }()
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
@@ -132,12 +135,14 @@ func runStratum(client net.Conn, reader *bufio.Reader, pool net.Conn, se *sessio
 		select {
 		case in := <-minerLines:
 			if in.line == nil {
+				observedSide, endReason = "miner", readEndReason(in.err)
 				logReadErr("miner", client, in.err)
 				return
 			}
 			err = s.miner(in.line)
 		case in := <-poolLines:
 			if in.line == nil {
+				observedSide, endReason = "pool", readEndReason(in.err)
 				logReadErr("pool", pool, in.err)
 				return
 			}
@@ -146,10 +151,40 @@ func runStratum(client net.Conn, reader *bufio.Reader, pool net.Conn, se *sessio
 			err = s.tick(now)
 		}
 		if err != nil {
+			endReason = err.Error()
 			log.Printf("[CONN] stratum miner=%s pool=%s: %v", se.source, se.pool, err)
 			return
 		}
 	}
+}
+
+func readEndReason(err error) string {
+	if err == nil {
+		return "EOF"
+	}
+	return err.Error()
+}
+
+func (s *stratumSwitch) phaseName() string {
+	switch s.phase {
+	case feeStarting:
+		return "fee_authorize"
+	case feeWork:
+		return "fee_work"
+	case minerStarting:
+		return "miner_authorize"
+	default:
+		return "miner_work"
+	}
+}
+
+func (s *stratumSwitch) finish(side, reason string) {
+	if s.phase != minerWork && s.se.commission != nil {
+		s.se.commission.disableSwitch(s.se.pool, s.se.source, "commission_connection_closed")
+		s.se.commission.countFailed(s.se.pool)
+	}
+	log.Printf("[DIAG] connection_end miner=%s pool=%s phase=%s epoch=%d observed_side=%s reason=%q auth_confirmed=%t notify_before_ack=%t",
+		s.se.source, s.se.pool, s.phaseName(), s.epoch, side, reason, s.authOK, s.notifyBeforeAck)
 }
 
 func (s *stratumSwitch) release() {
@@ -180,6 +215,7 @@ func (s *stratumSwitch) switchAuth(fee bool, now time.Time) error {
 		s.serviceOrder = s.serviceOrder[1:]
 	}
 	s.authOK = false
+	s.notifyBeforeAck = false
 	s.deadline = now.Add(commissionTransitionTimeout)
 	s.se.lastSwitch(now)
 	worker := s.se.workerName()
@@ -202,7 +238,7 @@ func (s *stratumSwitch) switchAuth(fee bool, now time.Time) error {
 }
 
 func (s *stratumSwitch) tick(now time.Time) error {
-	unsafe := s.se.commission != nil && s.se.commission.unsafeSwitch(s.se.pool)
+	unsafe := s.se.commission != nil && s.se.commission.switchBlocked(s.se.pool, s.se.source)
 	if unsafe && s.phase == feeStarting {
 		s.release()
 		s.se.denyFee()
@@ -215,6 +251,7 @@ func (s *stratumSwitch) tick(now time.Time) error {
 		if s.phase == minerStarting {
 			return fmt.Errorf("miner authorization/job timeout; reconnect required")
 		}
+		s.se.commission.disableSwitch(s.se.pool, s.se.source, "commission_authorization_job_timeout")
 		s.release()
 		s.se.denyFee()
 		s.se.commission.countFailed(s.se.pool)
@@ -243,7 +280,7 @@ func (s *stratumSwitch) maybeStart(now time.Time) error {
 	}
 	// Admission is nonblocking. A busy global authorizer leaves the miner's
 	// connection untouched, rather than sleeping in its submit path.
-	if !c.tryStart(s.se.pool, now) {
+	if !c.tryStartMiner(s.se.pool, s.se.source, now) {
 		return nil
 	}
 	s.reserved = true
@@ -260,7 +297,7 @@ func (s *stratumSwitch) rejectTransition(line []byte) error {
 	job, known := s.jobs[JobIDFromSubmit(line)]
 	unsafe := s.epoch > 0 && (s.phase != minerWork || known && job.epoch != s.epoch)
 	if unsafe {
-		s.se.commission.reportUnsafeSwitch(s.se.pool)
+		s.se.commission.disableSwitch(s.se.pool, s.se.source, "authorization_transition_stale")
 	}
 	s.se.submitJob(id, WorkerFromSubmit(line), JobIDFromSubmit(line))
 	s.se.resolve(PoolResponse{ID: id, Error: reason})
@@ -283,6 +320,7 @@ func (s *stratumSwitch) rejectTransition(line []byte) error {
 }
 
 func (s *stratumSwitch) miner(line []byte) error {
+	s.se.traceHandshake(line)
 	if IsMinerAuthorize(line) {
 		// A miner-initiated authorization during a service switch would race
 		// with that switch. Reconnect instead of silently binding wrong work.
@@ -295,6 +333,9 @@ func (s *stratumSwitch) miner(line []byte) error {
 		return s.toPool(line)
 	}
 	if IsMinerSubscribe(line) {
+		s.se.trackControl(line)
+	}
+	if msg, err := Parse(line); err == nil && msg.Method == "mining.extranonce.subscribe" {
 		s.se.trackControl(line)
 	}
 	if !IsMinerSubmit(line) {
@@ -358,6 +399,8 @@ func (s *stratumSwitch) pool(line []byte) error {
 	}
 	if resp, ok := ParsePoolResponse(line); ok {
 		if s.controlID != "" && resp.ID == s.controlID {
+			log.Printf("[DIAG] commission_authorize miner=%s pool=%s phase=%s epoch=%d accepted=%t notify_before_ack=%t error=%q",
+				s.se.source, s.se.pool, s.phaseName(), s.epoch, resp.Accepted, s.notifyBeforeAck, resp.Error)
 			s.controlID = ""
 			if !resp.Accepted {
 				if s.phase == minerStarting {
@@ -365,6 +408,7 @@ func (s *stratumSwitch) pool(line []byte) error {
 				}
 				s.release()
 				s.se.denyFee()
+				s.se.commission.disableSwitch(s.se.pool, s.se.source, "commission_authorization_rejected")
 				s.se.commission.reportDeny(s.se.pool)
 				return s.switchAuth(false, time.Now())
 			}
@@ -406,8 +450,14 @@ func (s *stratumSwitch) pool(line []byte) error {
 	}
 	if resp, ok := ParseControlResponse(line); ok {
 		if method := s.se.resolveControl(resp.ID); method != "" {
+			if method == "mining.subscribe" {
+				s.se.traceSubscription(line)
+			}
 			s.se.stats.noteControl(s.se.pool, method, resp.Accepted, resp.Error)
 		}
+	}
+	if msg, err := Parse(line); err == nil && msg.Method == "mining.set_extranonce" {
+		s.se.tracePoolExtranonce(msg.Params)
 	}
 	if diff, ok := ParseSetDifficulty(line); ok {
 		s.poolDiff = diff
@@ -419,9 +469,16 @@ func (s *stratumSwitch) pool(line []byte) error {
 	if jobID, ok := JobIDFromNotify(line); ok {
 		transition := s.phase == feeStarting || s.phase == minerStarting
 		if transition && !s.authOK {
+			if !s.notifyBeforeAck {
+				s.notifyBeforeAck = true
+				log.Printf("[DIAG] commission_notify miner=%s pool=%s phase=%s epoch=%d before_auth_ack=true job=%q action=withheld",
+					s.se.source, s.se.pool, s.phaseName(), s.epoch, jobID)
+			}
 			return nil
 		}
 		if transition {
+			log.Printf("[DIAG] commission_notify miner=%s pool=%s phase=%s epoch=%d before_auth_ack=false job=%q action=activate",
+				s.se.source, s.se.pool, s.phaseName(), s.epoch, jobID)
 			if s.phase == feeStarting {
 				s.phase = feeWork
 			} else {

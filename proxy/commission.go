@@ -159,9 +159,10 @@ func (p *poolCommission) avgRateLocked() float64 {
 // изъятие с него приостанавливается на cooldown, чтобы не долбить пул и не
 // задерживать шары майнера.
 type poolBreaker struct {
-	denies       int
-	openTill     time.Time
-	unsafeSwitch bool
+	denies         int
+	openTill       time.Time
+	unsafeSwitch   bool
+	disabledReason string
 }
 
 // Commission — сборщик комиссии. Потокобезопасен (mu).
@@ -229,9 +230,10 @@ type Commission struct {
 	workSinceTick float64 // work, изъятый с прошлого тика (сбрасывается в iterate)
 
 	// Разбивка по пулам и предохранители (мультипул).
-	perPool     map[string]*poolCommission
-	breakers    map[string]*poolBreaker
-	breakerLogs map[string]time.Time // последний лог открытия breaker (антиспам)
+	perPool         map[string]*poolCommission
+	breakers        map[string]*poolBreaker
+	breakerLogs     map[string]time.Time // последний лог открытия breaker (антиспам)
+	disabledSources map[string]string    // failed switches follow an ASIC across pool addresses
 
 	rng *rand.Rand
 }
@@ -554,6 +556,10 @@ func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
 // actual miner work. Do not repeat the experiment on other sessions of this
 // pool, or automatically resume it after a cooldown.
 func (c *Commission) reportUnsafeSwitch(pool string) {
+	c.disableSwitch(pool, "", "authorization_transition_stale")
+}
+
+func (c *Commission) disableSwitch(pool, source, reason string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b := c.breakers[pool]
@@ -563,7 +569,16 @@ func (c *Commission) reportUnsafeSwitch(pool string) {
 	}
 	if !b.unsafeSwitch {
 		b.unsafeSwitch = true
-		log.Printf("[COMMISSION] pool=%s disabled until restart: authorization switch discarded miner work", pool)
+		b.disabledReason = reason
+		log.Printf("[COMMISSION] pool=%s source=%s disabled until restart: %s", pool, source, reason)
+	}
+	if source != "" {
+		if c.disabledSources == nil {
+			c.disabledSources = make(map[string]string)
+		}
+		if _, exists := c.disabledSources[source]; !exists {
+			c.disabledSources[source] = reason
+		}
 	}
 }
 
@@ -574,9 +589,19 @@ func (c *Commission) unsafeSwitch(pool string) bool {
 	return b != nil && b.unsafeSwitch
 }
 
+func (c *Commission) switchBlocked(pool, source string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, blocked := c.disabledSources[source]; blocked {
+		return true
+	}
+	b := c.breakers[pool]
+	return b != nil && b.unsafeSwitch
+}
+
 func (c *Commission) disabledReasonLocked(pool string) string {
 	if b := c.breakers[pool]; b != nil && b.unsafeSwitch {
-		return "authorization_transition_stale"
+		return b.disabledReason
 	}
 	return ""
 }
@@ -616,6 +641,10 @@ func (c *Commission) reserveLocked(pool string, now time.Time) bool {
 // tryStart admits a switch without queuing or sleeping in a miner's path.
 // Restoring the miner is never throttled.
 func (c *Commission) tryStart(pool string, now time.Time) bool {
+	return c.tryStartMiner(pool, "", now)
+}
+
+func (c *Commission) tryStartMiner(pool, source string, now time.Time) bool {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
 	if commissionAuthMinGap > 0 && !c.lastAuth.IsZero() && now.Sub(c.lastAuth) < commissionAuthMinGap {
@@ -623,6 +652,9 @@ func (c *Commission) tryStart(pool string, now time.Time) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, disabled := c.disabledSources[source]; disabled {
+		return false
+	}
 	if !c.reserveLocked(pool, now) {
 		return false
 	}
@@ -795,6 +827,12 @@ type CommissionReport struct {
 	NextIterationAt  string                 `json:"next_iteration_at,omitempty"`
 	WindowEnd        string                 `json:"window_end,omitempty"`
 	Pools            []PoolCommissionReport `json:"pools,omitempty"`
+	DisabledSources  []DisabledSourceReport `json:"disabled_sources,omitempty"`
+}
+
+type DisabledSourceReport struct {
+	Source string `json:"source"`
+	Reason string `json:"reason"`
 }
 
 // intervalString возвращает читаемое представление интервала ("" если 0).
@@ -881,5 +919,9 @@ func (c *Commission) Snapshot() CommissionReport {
 		})
 	}
 	sort.Slice(rep.Pools, func(i, j int) bool { return rep.Pools[i].Pool < rep.Pools[j].Pool })
+	for source, reason := range c.disabledSources {
+		rep.DisabledSources = append(rep.DisabledSources, DisabledSourceReport{source, reason})
+	}
+	sort.Slice(rep.DisabledSources, func(i, j int) bool { return rep.DisabledSources[i].Source < rep.DisabledSources[j].Source })
 	return rep
 }
