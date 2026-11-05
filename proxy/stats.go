@@ -17,8 +17,11 @@
 package proxy
 
 import (
+	"fmt"
+	"log"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -95,7 +98,53 @@ type Stats struct {
 	lost        int
 	pools       map[string]*poolStat
 	workers     map[string]*workerStat
+	diagnostics diagnostics
 }
+
+// diagnostics keeps bounded-cardinality, rate-limited protocol summaries.
+// It avoids emitting one log line per rejected share or per job notification.
+type diagnostics struct {
+	mu       sync.Mutex
+	rejects  map[string]*rejectDiagnostic
+	notifies map[string]*notifyDiagnostic
+	controls map[string]*controlDiagnostic
+	steals   map[string]*stealDiagnostic
+}
+
+type rejectDiagnostic struct {
+	count       int
+	lastLog     time.Time
+	lastError   string
+	lastJob     string
+	lastAuthAge time.Duration
+	lastJobAge  time.Duration
+}
+
+type notifyDiagnostic struct {
+	count     int
+	clean     int
+	lastLog   time.Time
+	lastJobID string
+}
+
+type controlDiagnostic struct {
+	count     int
+	lastLog   time.Time
+	lastError string
+}
+
+type stealDiagnostic struct {
+	count     int
+	lastLog   time.Time
+	worker    string
+	diff      float64
+	minerDiff float64
+}
+
+const (
+	rejectDiagnosticInterval   = 30 * time.Second
+	protocolDiagnosticInterval = time.Minute
+)
 
 // NewStats создаёт пустой реестр.
 func NewStats() *Stats {
@@ -235,6 +284,164 @@ func (s *Stats) Result(pool, worker string, difficulty float64, accepted bool, e
 	}
 	p.lastSeen = now
 	w.lastSeen = now
+}
+
+// noteShareReject aggregates rejects per pool, reason class, and auth mode.
+func (s *Stats) noteShareReject(pool, reason string, commission bool, job string, authAge, jobAge time.Duration) {
+	category := shareErrorCategory(reason)
+	key := pool + "\x00" + category + fmt.Sprint("\x00", commission)
+	now := time.Now()
+	d := &s.diagnostics
+	d.mu.Lock()
+	if d.rejects == nil {
+		d.rejects = make(map[string]*rejectDiagnostic)
+	}
+	b := d.rejects[key]
+	if b == nil {
+		b = &rejectDiagnostic{}
+		d.rejects[key] = b
+	}
+	b.count++
+	b.lastError, b.lastJob, b.lastAuthAge, b.lastJobAge = reason, job, authAge, jobAge
+	if b.lastLog.IsZero() || now.Sub(b.lastLog) >= rejectDiagnosticInterval {
+		count := b.count
+		window := "first"
+		if !b.lastLog.IsZero() {
+			window = now.Sub(b.lastLog).Round(time.Second).String()
+		}
+		errSample, jobSample, authSample, jobAgeSample := b.lastError, b.lastJob, b.lastAuthAge, b.lastJobAge
+		b.count = 0
+		b.lastLog = now
+		d.mu.Unlock()
+		log.Printf("[DIAG] share_reject pool=%s class=%s mode=%s count=%d window=%s sample_error=%q sample_job=%q since_auth=%s job_age=%s",
+			pool, category, diagnosticMode(commission), count, window, errSample, jobSample,
+			durationOrUnknown(authSample), durationOrUnknown(jobAgeSample))
+		return
+	}
+	d.mu.Unlock()
+}
+
+func (s *Stats) noteNotify(pool, jobID string, clean bool) {
+	now := time.Now()
+	d := &s.diagnostics
+	d.mu.Lock()
+	if d.notifies == nil {
+		d.notifies = make(map[string]*notifyDiagnostic)
+	}
+	b := d.notifies[pool]
+	if b == nil {
+		b = &notifyDiagnostic{}
+		d.notifies[pool] = b
+	}
+	b.count++
+	if clean {
+		b.clean++
+	}
+	b.lastJobID = jobID
+	if b.lastLog.IsZero() || now.Sub(b.lastLog) >= protocolDiagnosticInterval {
+		count, cleanCount, job := b.count, b.clean, b.lastJobID
+		window := "first"
+		if !b.lastLog.IsZero() {
+			window = now.Sub(b.lastLog).Round(time.Second).String()
+		}
+		b.count, b.clean, b.lastLog = 0, 0, now
+		d.mu.Unlock()
+		log.Printf("[DIAG] pool_notify pool=%s count=%d clean_jobs=%d window=%s last_job=%q", pool, count, cleanCount, window, job)
+		return
+	}
+	d.mu.Unlock()
+}
+
+func (s *Stats) noteControl(pool, method string, accepted bool, reason string) {
+	key := pool + "\x00" + method + fmt.Sprint("\x00", accepted)
+	now := time.Now()
+	d := &s.diagnostics
+	d.mu.Lock()
+	if d.controls == nil {
+		d.controls = make(map[string]*controlDiagnostic)
+	}
+	b := d.controls[key]
+	if b == nil {
+		b = &controlDiagnostic{}
+		d.controls[key] = b
+	}
+	b.count++
+	if reason != "" {
+		b.lastError = reason
+	}
+	if b.lastLog.IsZero() || now.Sub(b.lastLog) >= protocolDiagnosticInterval {
+		count, sample := b.count, b.lastError
+		window := "first"
+		if !b.lastLog.IsZero() {
+			window = now.Sub(b.lastLog).Round(time.Second).String()
+		}
+		b.count, b.lastLog = 0, now
+		d.mu.Unlock()
+		log.Printf("[DIAG] control_response pool=%s method=%s accepted=%t count=%d window=%s sample_error=%q", pool, method, accepted, count, window, sample)
+		return
+	}
+	d.mu.Unlock()
+}
+
+func (s *Stats) noteCommissionSteal(pool, worker string, diff, minerDiff float64) {
+	now := time.Now()
+	d := &s.diagnostics
+	d.mu.Lock()
+	if d.steals == nil {
+		d.steals = make(map[string]*stealDiagnostic)
+	}
+	b := d.steals[pool]
+	if b == nil {
+		b = &stealDiagnostic{}
+		d.steals[pool] = b
+	}
+	b.count++
+	b.worker, b.diff, b.minerDiff = worker, diff, minerDiff
+	if b.lastLog.IsZero() || now.Sub(b.lastLog) >= rejectDiagnosticInterval {
+		count, lastWorker, lastDiff, lastMinerDiff := b.count, b.worker, b.diff, b.minerDiff
+		window := "first"
+		if !b.lastLog.IsZero() {
+			window = now.Sub(b.lastLog).Round(time.Second).String()
+		}
+		b.count, b.lastLog = 0, now
+		d.mu.Unlock()
+		log.Printf("[DIAG] commission_share pool=%s count=%d window=%s last_worker=%q diff=%g miner_diff=%g",
+			pool, count, window, lastWorker, lastDiff, lastMinerDiff)
+		return
+	}
+	d.mu.Unlock()
+}
+
+func diagnosticMode(commission bool) string {
+	if commission {
+		return "commission"
+	}
+	return "miner"
+}
+
+func durationOrUnknown(d time.Duration) string {
+	if d < 0 {
+		return "unknown"
+	}
+	return d.Round(time.Millisecond).String()
+}
+
+func shareErrorCategory(reason string) string {
+	s := strings.ToLower(reason)
+	switch {
+	case strings.Contains(s, "unknown job"), strings.Contains(s, "undefined job"), strings.Contains(s, "job not found"):
+		return "unknown_job"
+	case strings.Contains(s, "stale"):
+		return "stale"
+	case strings.Contains(s, "duplicate"):
+		return "duplicate"
+	case strings.Contains(s, "low difficulty"):
+		return "low_difficulty"
+	case strings.Contains(s, "unauthor"):
+		return "unauthorized"
+	default:
+		return "other"
+	}
 }
 
 // LostShare фиксирует шару без ответа пула (обрыв соединения или таймаут).

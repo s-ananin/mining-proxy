@@ -170,6 +170,26 @@ func ParsePoolResponse(raw []byte) (PoolResponse, bool) {
 	return resp, true
 }
 
+// ParseControlResponse разбирает ответ на subscribe/authorize. В отличие от
+// mining.submit ответ subscribe может содержать массив в result.
+func ParseControlResponse(raw []byte) (PoolResponse, bool) {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != "" || isNullID(msg.ID) {
+		return PoolResponse{}, false
+	}
+	resp := PoolResponse{ID: string(msg.ID)}
+	if !isNull(msg.Error) {
+		resp.Error = extractErrorMessage(msg.Error)
+		if resp.Error == "" {
+			resp.Error = string(msg.Error)
+		}
+		return resp, true
+	}
+	result := strings.TrimSpace(string(msg.Result))
+	resp.Accepted = result == "true" || strings.HasPrefix(result, "[")
+	return resp, true
+}
+
 // JobIDFromNotify достаёт id задания из mining.notify (пул → майнер):
 // params[0] — работа, на которой сейчас считает майнер.
 func JobIDFromNotify(raw []byte) (string, bool) {
@@ -186,6 +206,37 @@ func JobIDFromNotify(raw []byte) (string, bool) {
 		return "", false
 	}
 	return id, true
+}
+
+// JobIDFromSubmit достаёт params[1] из mining.submit для диагностики
+// отказов по устаревшему или неизвестному заданию.
+func JobIDFromSubmit(raw []byte) string {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != "mining.submit" {
+		return ""
+	}
+	var params []json.RawMessage
+	if json.Unmarshal(msg.Params, &params) != nil || len(params) < 2 {
+		return ""
+	}
+	var id string
+	_ = json.Unmarshal(params[1], &id)
+	return id
+}
+
+// CleanJobsFromNotify сообщает, выставил ли пул флаг clean_jobs в notify.
+func CleanJobsFromNotify(raw []byte) bool {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != "mining.notify" {
+		return false
+	}
+	var params []json.RawMessage
+	if json.Unmarshal(msg.Params, &params) != nil || len(params) < 9 {
+		return false
+	}
+	var clean bool
+	_ = json.Unmarshal(params[8], &clean)
+	return clean
 }
 
 // ParseSetDifficulty разбирает mining.set_difficulty (пул → майнер):

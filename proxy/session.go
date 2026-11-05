@@ -13,7 +13,6 @@
 package proxy
 
 import (
-	"log"
 	"sync"
 	"time"
 )
@@ -26,6 +25,9 @@ type pendingShare struct {
 	diff       float64
 	at         time.Time
 	commission bool
+	jobID      string
+	authAge    time.Duration
+	jobAge     time.Duration
 }
 
 // session — привязка соединения к реестру статистики.
@@ -44,9 +46,16 @@ type session struct {
 	feeActive      bool          // соединение сейчас авторизовано под commission_worker
 	feeDiff        float64       // сложность, которую пул назначил воркеру комиссии
 	feeDiffCh      chan struct{} // сигнал об изменении сложности воркера комиссии
-	suggestAt      time.Time     // когда последний раз просили у пула закрепить сложность
-	freqLimitUntil time.Time     // бэк-офф при "Frequency limit exceeded"
+	lastFeeSwitch  time.Time
+	lastJobID      string
+	jobTimes       map[string]time.Time
+	jobOrder       []string
+	controlIDs     map[string]string
+	suggestAt      time.Time // когда последний раз просили у пула закрепить сложность
+	freqLimitUntil time.Time // бэк-офф при "Frequency limit exceeded"
 }
+
+const maxTrackedJobsPerSession = 32
 
 // newSession регистрирует соединение в реестре.
 func newSession(stats *Stats, pool, source string, commission *Commission) *session {
@@ -115,6 +124,9 @@ func (s *session) feeDeniedNow() bool {
 func (s *session) setFeeActive(active bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.feeActive != active {
+		s.lastFeeSwitch = time.Now()
+	}
 	s.feeActive = active
 	if active {
 		// Сложность воркера комиссии на этом витке ещё неизвестна: пул
@@ -299,9 +311,74 @@ func (s *session) setJobID(jobID string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.setJobIDLocked(jobID)
+}
+
+func (s *session) setJobIDLocked(jobID string) {
+	s.lastJobID = jobID
+	if s.jobTimes == nil {
+		s.jobTimes = make(map[string]time.Time)
+	}
+	if _, exists := s.jobTimes[jobID]; !exists {
+		s.jobOrder = append(s.jobOrder, jobID)
+	}
+	s.jobTimes[jobID] = time.Now()
+	for len(s.jobOrder) > maxTrackedJobsPerSession {
+		oldest := s.jobOrder[0]
+		s.jobOrder = s.jobOrder[1:]
+		delete(s.jobTimes, oldest)
+	}
 	if s.worker != "" {
 		s.stats.SetJobID(s.pool, s.worker, jobID)
 	}
+}
+
+func (s *session) trackControl(raw []byte) {
+	msg, err := Parse(raw)
+	if err != nil || (msg.Method != "mining.subscribe" && msg.Method != "mining.authorize") || isNullID(msg.ID) {
+		return
+	}
+	s.mu.Lock()
+	if s.controlIDs == nil {
+		s.controlIDs = make(map[string]string)
+	}
+	if len(s.controlIDs) < 32 {
+		s.controlIDs[string(msg.ID)] = msg.Method
+	}
+	s.mu.Unlock()
+}
+
+func (s *session) resolveControl(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	method := s.controlIDs[id]
+	delete(s.controlIDs, id)
+	return method
+}
+
+func (s *session) shareContextLocked(jobID string, now time.Time) (string, time.Duration, time.Duration) {
+	authAge, jobAge := time.Duration(-1), time.Duration(-1)
+	if !s.lastFeeSwitch.IsZero() {
+		authAge = now.Sub(s.lastFeeSwitch)
+	}
+	if jobID == "" {
+		jobID = s.lastJobID
+	}
+	if at, ok := s.jobTimes[jobID]; ok {
+		jobAge = now.Sub(at)
+	}
+	return jobID, authAge, jobAge
+}
+
+func (s *session) noteNotify(jobID string, clean bool) {
+	s.mu.Lock()
+	if clean {
+		s.jobTimes = make(map[string]time.Time)
+		s.jobOrder = nil
+	}
+	s.setJobIDLocked(jobID)
+	s.mu.Unlock()
+	s.stats.noteNotify(s.pool, jobID, clean)
 }
 
 // submit фиксирует mining.submit: штампует шару текущей сложностью,
@@ -311,6 +388,10 @@ func (s *session) setJobID(jobID string) {
 // id пустой (нет id в запросе) — шара учитывается, но сопоставить ответ
 // будет нельзя: она останется незакрытой до закрытия сессии.
 func (s *session) submit(id, worker string) {
+	s.submitJob(id, worker, "")
+}
+
+func (s *session) submitJob(id, worker, jobID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -322,6 +403,7 @@ func (s *session) submit(id, worker string) {
 		w = unknownWorker
 	}
 	now := time.Now()
+	jobID, authAge, jobAge := s.shareContextLocked(jobID, now)
 
 	// Шары, по которым пул промолчал дольше pendingTimeout, списываем
 	// в lost прямо по ходу — таблица не должна расти бесконечно.
@@ -345,7 +427,8 @@ func (s *session) submit(id, worker string) {
 	}
 	s.stats.Submit(s.pool, w, s.source, diff)
 	if id != "" {
-		s.pending[id] = pendingShare{worker: w, diff: diff, at: now}
+		s.pending[id] = pendingShare{worker: w, diff: diff, at: now,
+			jobID: jobID, authAge: authAge, jobAge: jobAge}
 	}
 }
 
@@ -364,7 +447,10 @@ func (s *session) markCommissionSubmit(id, worker string) float64 {
 	if s.feeActive && s.feeDiff > 0 {
 		diff = s.feeDiff
 	}
-	s.pending[id] = pendingShare{worker: worker, commission: true, diff: diff, at: time.Now()}
+	now := time.Now()
+	jobID, authAge, jobAge := s.shareContextLocked("", now)
+	s.pending[id] = pendingShare{worker: worker, commission: true, diff: diff, at: now,
+		jobID: jobID, authAge: authAge, jobAge: jobAge}
 	return diff
 }
 
@@ -407,20 +493,15 @@ func (s *session) resolve(resp PoolResponse) bool {
 	if p.commission {
 		if s.commission != nil {
 			s.commission.countResult(s.pool, resp.Accepted, p.diff)
-			if resp.Accepted {
-				log.Printf("[COMMISSION] пул %s зачёл шару воркера %q (diff %g)",
-					s.pool, p.worker, p.diff)
-			} else {
-				log.Printf("[COMMISSION] пул %s отклонил шару воркера %q (diff %g): %s",
-					s.pool, p.worker, p.diff, resp.Error)
-			}
+		}
+		if !resp.Accepted {
+			s.stats.noteShareReject(s.pool, resp.Error, true, p.jobID, p.authAge, p.jobAge)
 		}
 		s.signalCommission()
 		return true
 	}
 	if !resp.Accepted {
-		log.Printf("[SHARE] отклонена пулом %s (miner=%s worker=%q id=%s): %s",
-			s.pool, s.source, p.worker, resp.ID, resp.Error)
+		s.stats.noteShareReject(s.pool, resp.Error, false, p.jobID, p.authAge, p.jobAge)
 	}
 	s.stats.Result(s.pool, p.worker, p.diff, resp.Accepted, resp.Error)
 	return true

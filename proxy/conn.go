@@ -383,6 +383,9 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			break
 		}
 		line := scanner.Bytes()
+		if IsMinerSubscribe(line) || IsMinerAuthorize(line) {
+			se.trackControl(line)
+		}
 
 		if IsMinerSubmit(line) {
 			id, _ := SubmitID(line)
@@ -422,10 +425,8 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					if err == nil && rewritten != nil {
 						diff := se.markCommissionSubmit(id, feeWorker)
 						ack := se.armCommissionAck()
-						instant, avg := commission.countSteal(se.pool, diff)
-						log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s, diff %g, сложность майнера %g, мгновенно %.2f TH/s, avg %.2f TH/s)",
-							feeWorker, se.pool, id, diff, se.difficulty(),
-							instant/1e12, avg/1e12)
+						commission.countSteal(se.pool, diff)
+						se.stats.noteCommissionSteal(se.pool, feeWorker, diff, se.difficulty())
 						line = rewritten
 						dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 						if werr := writeLine(dst, line); werr != nil {
@@ -456,7 +457,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 				// Комиссия отключена/отклонена пулом — вернуть воркер майнера.
 				restoreMinerAuth()
 			}
-			se.submit(id, WorkerFromSubmit(line))
+			se.submitJob(id, WorkerFromSubmit(line), JobIDFromSubmit(line))
 		} else if IsMinerAuthorize(line) {
 			se.authorize(WorkerFromAuthorize(line))
 		}
@@ -535,9 +536,16 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 				}
 				continue
 			}
+			if method := se.resolveControl(resp.ID); method != "" {
+				se.stats.noteControl(se.pool, method, resp.Accepted, resp.Error)
+			}
 			se.resolve(resp)
+		} else if resp, ok := ParseControlResponse(line); ok {
+			if method := se.resolveControl(resp.ID); method != "" {
+				se.stats.noteControl(se.pool, method, resp.Accepted, resp.Error)
+			}
 		} else if jobID, ok := JobIDFromNotify(line); ok {
-			se.setJobID(jobID)
+			se.noteNotify(jobID, CleanJobsFromNotify(line))
 		}
 
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))

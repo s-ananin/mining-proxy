@@ -91,6 +91,29 @@ func TestParsePoolResponse(t *testing.T) {
 	}
 }
 
+func TestDiagnosticStratumFields(t *testing.T) {
+	if got := proxy.JobIDFromSubmit([]byte(`{"id":8,"method":"mining.submit","params":["w","job-42","e","t","n"]}`)); got != "job-42" {
+		t.Fatalf("JobIDFromSubmit = %q, want job-42", got)
+	}
+	if got := proxy.JobIDFromSubmit([]byte(`{"id":8,"method":"mining.authorize","params":["w"]}`)); got != "" {
+		t.Fatalf("JobIDFromSubmit on authorize = %q, want empty", got)
+	}
+	if !proxy.CleanJobsFromNotify([]byte(`{"id":null,"method":"mining.notify","params":["j","p","c1","c2",[],"v","b","t",true]}`)) {
+		t.Fatal("CleanJobsFromNotify = false, want true")
+	}
+	if proxy.CleanJobsFromNotify([]byte(`{"id":null,"method":"mining.notify","params":["j","p","c1","c2",[],"v","b","t",false]}`)) {
+		t.Fatal("CleanJobsFromNotify = true, want false")
+	}
+	resp, ok := proxy.ParseControlResponse([]byte(`{"id":1,"result":[[],"01000000",4],"error":null}`))
+	if !ok || !resp.Accepted || resp.ID != "1" {
+		t.Fatalf("subscribe control response = %+v, ok=%t", resp, ok)
+	}
+	resp, ok = proxy.ParseControlResponse([]byte(`{"id":2,"result":false,"error":[24,"unauthorized",null]}`))
+	if !ok || resp.Accepted || resp.Error != "unauthorized" {
+		t.Fatalf("authorize control response = %+v, ok=%t", resp, ok)
+	}
+}
+
 func TestParseSetDifficulty(t *testing.T) {
 	got, ok := proxy.ParseSetDifficulty([]byte(`{"id":null,"method":"mining.set_difficulty","params":[64]}`))
 	if !ok || got != 64 {
