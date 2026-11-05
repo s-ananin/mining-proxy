@@ -58,7 +58,7 @@ func TestRestoreRejectsFailedAuthorization(t *testing.T) {
 // while the restore is pending. No aliases or automatic reconnects are used.
 func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("fee.worker", 1, 40, 0, 0, stats)
+	c := NewCommission("fee.worker", 1, 40, 0, 0, stats, WithSuggestDifficulty())
 	defer c.Close()
 	se := newSession(stats, "pool", "miner", c)
 	defer se.close()
@@ -108,6 +108,8 @@ func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 	read(pool, poolReader)
 	write(pool, ack(1))
 	read(miner, minerReader)
+	write(pool, `{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
+	read(miner, minerReader)
 	write(pool, notify("initial"))
 	read(miner, minerReader)
 	job := "initial"
@@ -124,21 +126,32 @@ func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 			t.Fatalf("missing fee auth: %s", line)
 		}
 		write(pool, `{"id":"__commission_switch__","result":true,"error":null}`)
-		if line := read(pool, poolReader); WorkerFromSubmit([]byte(line)) != "fee.worker" || submitJobID([]byte(line)) != job {
-			t.Fatalf("original commission path changed: %s", line)
+		// Reproduce the third-window failure: the fee worker drops to
+		// half difficulty. Do not send a correction or suggest response.
+		feeDiff := 16384
+		if window == 2 {
+			feeDiff = 8192
+		}
+		write(pool, fmt.Sprintf(`{"id":null,"method":"mining.set_difficulty","params":[%d]}`, feeDiff))
+		line := read(pool, poolReader)
+		if strings.Contains(line, "mining.suggest_difficulty") {
+			line = read(pool, poolReader)
+		}
+		if WorkerFromSubmit([]byte(line)) != "fee.worker" || submitJobID([]byte(line)) != job {
+			t.Fatalf("commission was stalled or changed: %s", line)
 		}
 		feeJob := fmt.Sprintf("fee-%d", window)
 		write(pool, notify(feeJob))
 		read(miner, minerReader)
-		// Entering fee still uses the original throttle; restoring must not
-		// queue behind it and wait for the next submit to initiate authorize.
+		// A busy entry rate limit must not delay restoring authorization
+		// or require another submit to initiate it.
 		c.authMu.Lock()
 		c.lastAuth = time.Now()
 		c.authMu.Unlock()
 		started := time.Now()
 		write(pool, ack(id))
 		read(miner, minerReader)
-		line := read(pool, poolReader)
+		line = read(pool, poolReader)
 		msg, _ := Parse([]byte(line))
 		if WorkerFromAuthorize([]byte(line)) != "main.worker" || string(msg.ID) != commissionRestoreID {
 			t.Fatalf("missing immediate restore: %s", line)
@@ -176,7 +189,7 @@ func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 		if window%2 != 0 {
 			write(pool, restoreAck)
 		}
-		write(pool, `{"id":null,"method":"mining.set_difficulty","params":[32]}`)
+		write(pool, `{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
 		write(pool, `{"id":null,"method":"mining.set_extranonce","params":["01020304",8]}`)
 		write(pool, notify(job))
 		if window%2 == 0 {

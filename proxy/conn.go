@@ -260,9 +260,6 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		}
 		se.setFeeActive(true)
 		feeWorker = commission.WindowWorker()
-		if commission != nil {
-			commission.throttleAuth()
-		}
 		if !writeAuthorize(feeWorker) {
 			se.setFeeActive(false)
 			return false
@@ -271,75 +268,21 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		return true
 	}
 
-	// ensurePoolDifficulty добивается, чтобы сложность сессии у пула была не
-	// ниже сложности майнера: пока в сессии держится vardiff воркера комиссии
-	// (наблюдалось падение 16384 -> 8192 -> ... -> 16), любые шары — в том
-	// числе изъятые — зачисляются в десятки раз дешевле.
-	// Также не даём пула поднять сложность воркера выше сложности майнера:
-	// шары, найденные на сложности майнера, будут отклонены как "Low difficulty share".
+	// A suggestion is advisory: neither its reply nor set_difficulty may
+	// block submitting work. Shares found at miner difficulty also meet a
+	// lower fee difficulty; account for the actual fee value in the session.
 	ensurePoolDifficulty := func() bool {
-		if commission == nil || !commission.SuggestDifficulty() {
-			return true
-		}
-		target := se.difficulty()
+		target, actual := se.difficulty(), se.feeDifficulty()
 		if target <= 0 {
 			return true
 		}
-		// Ждём, пока пул сообщит свою сложность для воркера комиссии: если он
-		// её не менял — просить закрепление незачем (и пул не сочтёт запрос
-		// слишком частым).
-		d, changed := se.waitFeeDiffUpdate(commissionDiffGrace)
-		if !changed {
-			return true
-		}
-		if d == target {
-			return true
-		}
-		if d > target {
-			// Пул поднял сложность выше сложности майнера — лучше не изымать
-			// в этом витке, чтобы не получить Low difficulty share.
-			if !se.allowSuggest() {
-				log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g выше сложности майнера %g, но закрепление уже запрашивали недавно — пропускаем изъятие",
-					se.pool, d, target)
+		if commission != nil && commission.SuggestDifficulty() && actual > 0 && actual != target && se.allowSuggest() {
+			if !writeSuggestDifficulty(target) {
 				return false
 			}
-			writeSuggestDifficulty(target)
 			se.markSuggestSent()
-			if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
-				if fd := se.feeDifficulty(); fd > 0 && fd <= target+1e-12 {
-					return true
-				}
-				if fd := se.feeDifficulty(); fd <= target {
-					return true
-				}
-				log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
-					se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
-				return false
-			}
-			return true
 		}
-		if !se.allowSuggest() {
-			log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g, но закрепление уже запрашивали недавно — пропускаем изъятие",
-				se.pool, d, target)
-			return false
-		}
-		// Просим пул закрепить сложность сессии на уровне сложности майнера.
-		writeSuggestDifficulty(target)
-		se.markSuggestSent()
-		if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
-			if fd := se.feeDifficulty(); fd > 0 && fd >= target-1e-12 {
-				// Пул уже поднял сложность до нужной или выше - можно изымать
-				return true
-			}
-			// Даже если не подтвердил точное совпадение, если feeDiff >= target - ок
-			if fd := se.feeDifficulty(); fd >= target {
-				return true
-			}
-			log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
-				se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
-			return false
-		}
-		return true
+		return actual <= 0 || actual <= target
 	}
 
 	// Restore before the ASIC finds another share. Keep suppression active
@@ -373,27 +316,27 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if IsMinerSubmit(line) {
 			id, _ := SubmitID(line)
 			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() && !se.restoringMiner() {
-				if commission.reserve(se.pool) {
+				reserved := false
+				if feeAuth {
+					reserved = commission.reserve(se.pool)
+				} else if se.feeEntryAllowed() {
+					reserved = commission.reserveEntry(se.pool)
+				}
+				if reserved {
+					reservedAt := time.Now()
 					// Сначала открываем служебную авторизацию: она
 					// фиксирует имя воркера, под которым пойдёт эта
 					// шара (authorize и submit должны совпадать).
 					rewritten, err := []byte(nil), error(nil)
 					skipped := false
 					if ensureFeeAuth() {
-						// Перед отправкой изъятой шары убеждаемся, что
-						// сложность сессии у пула не ниже сложности
-						// майнера, — иначе шара зачислится в разы
-						// дешевле.
+						// Lower fee difficulty is acceptable; never wait for
+						// it to rise. Higher difficulty is deferred.
 						if ensurePoolDifficulty() {
 							md := se.difficulty()
 							fd := se.feeDifficulty()
 							if fd > 0 && md > 0 && fd > md+1e-12 {
 								log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g выше сложности майнера %g — пропускаем изъятие (низкая сложность)",
-									se.pool, fd, md)
-								rewritten = nil
-								skipped = true
-							} else if fd > 0 && md > 0 && fd < md-1e-12 {
-								log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g — пропускаем изъятие (обесценивание)",
 									se.pool, fd, md)
 								rewritten = nil
 								skipped = true
@@ -429,6 +372,9 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 						}
 						continue
 					}
+					if skipped {
+						commission.deferDifficulty(se.pool, reservedAt)
+					}
 					// Не удалось — fail-open: шару не трогаем.
 					if feeAuth {
 						if !restoreMinerAuth() {
@@ -438,7 +384,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					if !skipped {
 						commission.countFailed(se.pool)
 					}
-					// Если skipped — просто возвращаем шару майнеру без учёта в failed
+					// A deferred preparation is counted once by deferDifficulty.
 				} else if feeAuth {
 					// Бюджет исчерпан — возвращаем соединение майнеру.
 					if !restoreMinerAuth() {

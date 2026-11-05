@@ -44,7 +44,6 @@ type session struct {
 	commAck        chan struct{} // ответ пула на текущую изъятую шару (сериализация)
 	feeActive      bool          // соединение сейчас авторизовано под commission_worker
 	feeDiff        float64       // сложность, которую пул назначил воркеру комиссии
-	feeDiffCh      chan struct{} // сигнал об изменении сложности воркера комиссии
 	suggestAt      time.Time     // когда последний раз просили у пула закрепить сложность
 	freqLimitUntil time.Time     // бэк-офф при "Frequency limit exceeded"
 }
@@ -57,7 +56,6 @@ func newSession(stats *Stats, pool, source string, commission *Commission) *sess
 		source:     source,
 		pending:    map[string]pendingShare{},
 		commission: commission,
-		feeDiffCh:  make(chan struct{}, 1),
 	}
 	s.stats.Connect(pool)
 	return s
@@ -122,12 +120,6 @@ func (s *session) setFeeActive(active bool) {
 		// пришлёт её после нашего authorize. До этого действует сложность
 		// сессии — та, по которой пул сейчас засчитывает шары.
 		s.feeDiff = 0
-		// Старые сигналы об изменении сложности относятся к предыдущему
-		// окну — сбрасываем их, чтобы не ждать их заново.
-		select {
-		case <-s.feeDiffCh:
-		default:
-		}
 	}
 }
 
@@ -145,44 +137,12 @@ func (s *session) suppressDifficulty() bool {
 func (s *session) setFeeDiff(diff float64) {
 	s.mu.Lock()
 	s.feeDiff = diff
-	ch := s.feeDiffCh
 	c := s.commission
 	pool := s.pool
 	s.mu.Unlock()
-	select {
-	case ch <- struct{}{}:
-	default:
-	}
+
 	if c != nil {
 		c.setFeeDiff(pool, diff)
-	}
-}
-
-// waitFeeDiffUpdate ждёт, пока пул пришлёт сложность воркера комиссии
-// (mining.set_difficulty — пул шлёт его, только если сложность изменилась).
-// Возвращает сложность и признак «пул её прислал». Если пул ничего не
-// прислал — сложность сессии не менялась, и просить закрепление не нужно.
-func (s *session) waitFeeDiffUpdate(timeout time.Duration) (float64, bool) {
-	deadline := time.Now().Add(timeout)
-	for {
-		s.mu.Lock()
-		cur := s.feeDiff
-		ch := s.feeDiffCh
-		s.mu.Unlock()
-		if cur > 0 {
-			return cur, true
-		}
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			return 0, false
-		}
-		timer := time.NewTimer(remain)
-		select {
-		case <-ch:
-			timer.Stop()
-		case <-timer.C:
-			return 0, false
-		}
 	}
 }
 
@@ -197,6 +157,16 @@ func (s *session) allowSuggest() bool {
 		return false
 	}
 	return time.Since(s.suggestAt) >= commissionSuggestInterval
+}
+
+// feeEntryAllowed avoids authorizing a known-too-difficult worker when a
+// difficulty request is still rate-limited. Lower fee difficulty is valid.
+func (s *session) feeEntryAllowed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	return s.diff <= 0 || s.feeDiff <= s.diff ||
+		(now.Sub(s.suggestAt) >= commissionSuggestInterval && !now.Before(s.freqLimitUntil))
 }
 
 // markSuggestFrequencyLimited ставит бэк-офф после "Frequency limit exceeded".
@@ -214,47 +184,6 @@ func (s *session) markSuggestSent() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.suggestAt = time.Now()
-}
-
-// waitFeeDiff ждёт, пока пул подтвердит сложность сессии target (например,
-// сложность майнера после mining.suggest_difficulty).
-//
-// Пока в сессии держится vardiff воркера комиссии, пул зачисляет изъятые
-// шары по его цене — в десятки раз дешевле. Поэтому отправка шар
-// откладывается до подтверждения.
-//
-// Если пул не прислал сложность вовсе, сессия осталась прежней: ждать
-// дальше бессмысленно, и через grace ожидание заканчивается успехом.
-//
-// true — сложность подтверждена (или не менялась), false — пул не
-// подтвердил за отведённое время.
-func (s *session) waitFeeDiff(target float64, timeout, grace time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	graceAt := time.Now().Add(grace)
-	for {
-		s.mu.Lock()
-		cur := s.feeDiff
-		ch := s.feeDiffCh
-		s.mu.Unlock()
-		if cur == target {
-			return true
-		}
-		if cur == 0 && time.Now().After(graceAt) {
-			// Сложность от пула так и не пришла — она не менялась.
-			return true
-		}
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			return false
-		}
-		timer := time.NewTimer(remain)
-		select {
-		case <-ch:
-			timer.Stop()
-		case <-timer.C:
-			return false
-		}
-	}
 }
 
 // feeDifficulty возвращает сложность воркера комиссии (0 — неизвестна).

@@ -767,7 +767,7 @@ func TestPipeMinerToPoolRotatedWorker(t *testing.T) {
 func TestCommissionSuggestDifficulty(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithSuggestDifficulty())
-	c.takeBudget = 1
+	c.takeBudget = 2
 
 	clientConn, minerIn := net.Pipe()
 	defer clientConn.Close()
@@ -823,118 +823,47 @@ func TestCommissionSuggestDifficulty(t *testing.T) {
 		t.Fatalf("майнер не получил set_difficulty: %q", l)
 	}
 
-	// Шара забирается: после authorize комиссии пул присылает vardiff
-	// воркера комиссии — тогда прокси просит закрепить сложность сессии.
+	// First submit must not wait for any set_difficulty notification.
 	toMiner(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
 	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
-		t.Fatalf("ожидался служебный authorize fee.worker: %s", a)
+		t.Fatalf("missing fee authorize: %s", a)
+	}
+	poolOut.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if line := fromPool(); !strings.Contains(line, "mining.submit") {
+		t.Fatalf("submit delayed: %s", line)
 	}
 	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16]}`)
-	s := fromPool()
-	if !strings.Contains(s, "mining.suggest_difficulty") {
-		t.Fatalf("ожидался mining.suggest_difficulty: %s", s)
+	toPool(`{"id":2,"result":true,"error":null}`)
+	fromMiner()
+	toMiner(`{"id":3,"method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
+	poolOut.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if line := fromPool(); !strings.Contains(line, "mining.suggest_difficulty") || !strings.Contains(line, "16384") {
+		t.Fatalf("missing advisory suggestion: %s", line)
 	}
-	if !strings.Contains(s, "16384") {
-		t.Fatalf("suggest_difficulty без сложности майнера: %s", s)
+	if line := fromPool(); !strings.Contains(line, "mining.submit") {
+		t.Fatalf("waiting for suggestion instead of sending share: %s", line)
 	}
-	if !strings.Contains(s, commissionDiffTag) {
-		t.Fatalf("suggest_difficulty без служебного id: %s", s)
+	se.mu.Lock()
+	issuedDiff := se.pending["3"].diff
+	se.mu.Unlock()
+	if issuedDiff != 16 {
+		t.Fatalf("fee share accounted at %v, want actual difficulty 16", issuedDiff)
 	}
-	// Пул подтверждает предложенную сложность — после этого прокси
-	// отправляет подменённую шару.
-	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
-	if s2 := fromPool(); !strings.Contains(s2, "mining.submit") {
-		t.Fatalf("ожидалась подменённая шара: %s", s2)
-	}
-
-	// Ответ пула на suggest_difficulty майнеру не показывается.
-	toPool(`{"id":"` + commissionDiffTag + `","result":true,"error":null}`)
-	minerOut.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	toPool(`{"id":"__commission_diff__","result":true,"error":null}`)
+	minerOut.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	if line, err := mr.ReadString('\n'); err == nil {
-		t.Fatalf("к майнеру пролегла лишняя строка: %q", strings.TrimSpace(line))
+		t.Fatalf("suggest response leaked: %s", line)
+	}
+	toPool(`{"id":3,"result":true,"error":null}`)
+	fromMiner()
+	poolOut.SetReadDeadline(time.Now().Add(time.Second))
+	if line := fromPool(); !strings.Contains(line, commissionRestoreTag) {
+		t.Fatalf("missing early restore: %s", line)
 	}
 }
 
-// TestCommissionSuggestWaitsForPoolDiff: пока пул не подтвердил сложность
-// сессии (mining.suggest_difficulty), изъятая шара не уходит — иначе пул
-// зачислит её по vardiff воркера комиссии (в десятки раз дешевле).
-func TestCommissionSuggestWaitsForPoolDiff(t *testing.T) {
-	stats := NewStats()
-	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithSuggestDifficulty())
-	c.takeBudget = 1
-
-	clientConn, minerIn := net.Pipe()
-	defer clientConn.Close()
-	defer minerIn.Close()
-	dst, poolOut := net.Pipe()
-	defer dst.Close()
-	defer poolOut.Close()
-	poolIn, poolSrc := net.Pipe()
-	defer poolIn.Close()
-	defer poolSrc.Close()
-	minerDst, minerOut := net.Pipe()
-	defer minerDst.Close()
-	defer minerOut.Close()
-
-	se := newSession(stats, "pool:3333", "10.0.0.1", c)
-	defer se.close()
-
-	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
-	go pipePoolToMiner(poolSrc, minerDst, se)
-
-	pr := bufio.NewReader(poolOut)
-	mr := bufio.NewReader(minerOut)
-	toMiner := func(s string) {
-		if _, err := minerIn.Write([]byte(s + "\n")); err != nil {
-			t.Fatalf("miner write: %v", err)
-		}
-	}
-	toPool := func(s string) {
-		if _, err := poolIn.Write([]byte(s + "\n")); err != nil {
-			t.Fatalf("pool write: %v", err)
-		}
-	}
-	fromPool := func() string {
-		line, err := pr.ReadString('\n')
-		if err != nil {
-			t.Fatalf("pool read: %v", err)
-		}
-		return strings.TrimSpace(line)
-	}
-
-	toMiner(`{"id":1,"method":"mining.authorize","params":["client.w","x"]}`)
-	fromPool()
-	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
-	minerOut.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if l, err := mr.ReadString('\n'); err != nil || !strings.Contains(l, "set_difficulty") {
-		t.Fatalf("майнер не получил set_difficulty: %q (%v)", l, err)
-	}
-
-	// Шара забирается комиссией: пул присылает vardiff воркера комиссии —
-	// прокси просит закрепить сложность сессии.
-	toMiner(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
-	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
-		t.Fatalf("ожидался служебный authorize fee.worker: %s", a)
-	}
-	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16]}`)
-	if s := fromPool(); !strings.Contains(s, "mining.suggest_difficulty") {
-		t.Fatalf("ожидался mining.suggest_difficulty: %s", s)
-	}
-
-	// Пул ещё не подтвердил сложность — шара ждёт.
-	poolOut.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-	if l, err := pr.ReadString('\n'); err == nil {
-		t.Fatalf("шара ушла до подтверждения сложности: %q", strings.TrimSpace(l))
-	}
-
-	// Пул подтвердил сложность майнера — шара уходит.
-	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
-	poolOut.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if s, err := pr.ReadString('\n'); err != nil || !strings.Contains(s, "mining.submit") {
-		t.Fatalf("ожидалась подменённая шара: %q (%v)", s, err)
-	}
-}
-
+// The advisory suggestion test also covers lower vardiff with no actual
+// difficulty update or response from the pool: submits keep flowing.
 // TestCommissionNoSuggestWhenPoolKeepsDifficulty: если пул не роняет
 // сложность воркера комиссии, прокси не просит закрепление (пул
 // ограничивает частоту таких запросов).
