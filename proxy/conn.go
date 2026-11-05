@@ -4,10 +4,9 @@
 //
 //	майнер <---> мы <---> реальный пул (адресат из iptables DNAT)
 //
-// Прокси прозрачно: каждая строка уходит байт-в-байт в обе стороны,
-// парсинг нужен ТОЛЬКО для подсчёта шар (mining.submit, ответы пула,
-// mining.set_difficulty). Всё, что не Stratum (TLS, HTTP, прочий TCP
-// из перехваченной подсети), пробросывается сырой трубой без разбора.
+// Без комиссии строки Stratum передаются без изменений. При включённой
+// комиссии switch.go согласует авторизацию, задания и сложность. Трафик
+// других протоколов (включая TLS майнера) проходит сырой трубой без разбора.
 package proxy
 
 import (
@@ -16,7 +15,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strings"
 	"time"
 )
 
@@ -34,11 +32,6 @@ const (
 
 	// sniffTimeout — сколько ждём первые байты, чтобы определить протокол.
 	sniffTimeout = 10 * time.Second
-
-	// commissionAckTimeout — сколько ждём ответ пула на изъятую шару, прежде
-	// чем отправить следующую (сериализация изъятия). Молчание пула не
-	// должно вешать соединение — по таймауту продолжаем.
-	commissionAckTimeout = 10 * time.Second
 
 	// lineBuf / maxLineSize — буфер строки Stratum (JSON редко > 1КБ).
 	lineBuf     = 4 * 1024
@@ -114,33 +107,28 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 	// Прочитанное sniffer-ом нужно переслать сразу: без этого пул не
 	// получит subscribe и соединение «повиснет» до таймаута.
 	for _, piece := range sniffed {
+		if stratum {
+			se.trackControl(piece)
+			if IsMinerAuthorize(piece) {
+				se.authorize(WorkerFromAuthorize(piece))
+			}
+		}
 		if _, err := upstream.Write(piece); err != nil {
 			log.Printf("[CONN] write sniffed to upstream: %v", err)
 			return
 		}
 	}
 
-	// --- 4. Две стороны потока ---
-	done := make(chan struct{}, 2)
+	// Stratum has one owner for writes and commission transitions. Readers
+	// remain independent, so waiting for a control response never stops reads.
 	if stratum {
-		go func() {
-			pipeMinerToPool(clientConn, reader, upstream, se, pass.Commission)
-			done <- struct{}{}
-		}()
-		go func() {
-			pipePoolToMiner(upstream, clientConn, se)
-			done <- struct{}{}
-		}()
-	} else {
-		go func() {
-			io.Copy(upstream, reader)
-			done <- struct{}{}
-		}()
-		go func() {
-			io.Copy(clientConn, upstream)
-			done <- struct{}{}
-		}()
+		runStratum(clientConn, reader, upstream, se)
+		log.Printf("[DISCONNECT] %s (pool=%s)", source, dest)
+		return
 	}
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(upstream, reader); done <- struct{}{} }()
+	go func() { io.Copy(clientConn, upstream); done <- struct{}{} }()
 
 	// Первая завершившаяся сторона = обрыв. Закрываем обе, ждём вторую —
 	// только после этого сессия считается закрытой (никаких гонок с
@@ -207,366 +195,6 @@ func sniffStratum(reader *bufio.Reader) (bool, [][]byte) {
 		}
 	}
 	return false, consumed
-}
-
-// pipeMinerToPool ведёт поток майнер → пул построчно и считает шары:
-// authorize привязывает воркера, submit штампуется сложностью и
-// регистрируется в таблице ожидающих ответа.
-//
-// Комиссия: пул привязывает воркер к mining.authorize, поэтому одной подмены
-// params[0] мало. На время изъятия прокси отправляет в пул служебный
-// mining.authorize с commission_worker (feeAuth), а params[0] шар приводит к
-// тому же воркеру; когда бюджет исчерпан — возвращает authorize на воркер
-// майнера. job_id/extranonce1 соединения сохраняются, шары остаются валидными.
-func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session, commission *Commission) {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
-
-	// feeAuth — соединение сейчас авторизовано под commission_worker.
-	feeAuth := false
-	// feeWorker — имя воркера комиссии, под которым идёт текущее изъятие.
-	// Фиксируется при открытии служебного authorize: ротация имени (новый
-	// воркер на каждое окно) не должна рассинхронизировать authorize и
-	// submit — пул зачисляет шары на того воркера, которому отдан authorize.
-	feeWorker := ""
-	writeAuthorize := func(worker string) bool {
-		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-		if err := writeLine(dst, miningAuthorizeLine(worker, commissionAuthTag)); err != nil {
-			log.Printf("[CONN] miner->pool authorize: %v", err)
-			return false
-		}
-		return true
-	}
-
-	// writeSuggestDifficulty просит у пула закрепить сложность сессии на
-	// указанном уровне (mining.suggest_difficulty). Ответ пула на этот id
-	// майнеру не показывается.
-	writeSuggestDifficulty := func(diff float64) bool {
-		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-		if err := writeLine(dst, miningSuggestDifficultyLine(diff, commissionDiffTag)); err != nil {
-			log.Printf("[CONN] miner->pool suggest_difficulty: %v", err)
-			return false
-		}
-		return true
-	}
-
-	// ensureFeeAuth переводит соединение на воркера комиссии (если ещё не
-	// переведено). Подавление сложности включается ДО отправки authorize:
-	// пул шлёт mining.set_difficulty сразу следом за сменой воркера, и он
-	// не должен ни попасть в сессию, ни уйти майнеру.
-	ensureFeeAuth := func() bool {
-		if feeAuth {
-			return true
-		}
-		se.setFeeActive(true)
-		feeWorker = commission.WindowWorker()
-		if commission != nil {
-			commission.throttleAuth()
-		}
-		if !writeAuthorize(feeWorker) {
-			se.setFeeActive(false)
-			return false
-		}
-		feeAuth = true
-		log.Printf("[COMMISSION] запрос переавторизации miner=%s pool=%s worker=%q",
-			se.source, se.pool, feeWorker)
-		return true
-	}
-
-	// ensurePoolDifficulty добивается, чтобы сложность сессии у пула была не
-	// ниже сложности майнера: пока в сессии держится vardiff воркера комиссии
-	// (наблюдалось падение 16384 -> 8192 -> ... -> 16), любые шары — в том
-	// числе изъятые — зачисляются в десятки раз дешевле.
-	// Также не даём пула поднять сложность воркера выше сложности майнера:
-	// шары, найденные на сложности майнера, будут отклонены как "Low difficulty share".
-	ensurePoolDifficulty := func() bool {
-		if commission == nil || !commission.SuggestDifficulty() {
-			return true
-		}
-		target := se.difficulty()
-		if target <= 0 {
-			return true
-		}
-		// Ждём, пока пул сообщит свою сложность для воркера комиссии: если он
-		// её не менял — просить закрепление незачем (и пул не сочтёт запрос
-		// слишком частым).
-		d, changed := se.waitFeeDiffUpdate(commissionDiffGrace)
-		if !changed {
-			return true
-		}
-		if d == target {
-			return true
-		}
-		if d > target {
-			// Пул поднял сложность выше сложности майнера — лучше не изымать
-			// в этом витке, чтобы не получить Low difficulty share.
-			if !se.allowSuggest() {
-				log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g выше сложности майнера %g, но закрепление уже запрашивали недавно — пропускаем изъятие",
-					se.pool, d, target)
-				return false
-			}
-			writeSuggestDifficulty(target)
-			se.markSuggestSent()
-			if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
-				if fd := se.feeDifficulty(); fd > 0 && fd <= target+1e-12 {
-					return true
-				}
-				if fd := se.feeDifficulty(); fd <= target {
-					return true
-				}
-				log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
-					se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
-				return false
-			}
-			return true
-		}
-		if !se.allowSuggest() {
-			log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g, но закрепление уже запрашивали недавно — пропускаем изъятие",
-				se.pool, d, target)
-			return false
-		}
-		// Просим пул закрепить сложность сессии на уровне сложности майнера.
-		writeSuggestDifficulty(target)
-		se.markSuggestSent()
-		if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
-			if fd := se.feeDifficulty(); fd > 0 && fd >= target-1e-12 {
-				// Пул уже поднял сложность до нужной или выше - можно изымать
-				return true
-			}
-			// Даже если не подтвердил точное совпадение, если feeDiff >= target - ок
-			if fd := se.feeDifficulty(); fd >= target {
-				return true
-			}
-			log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
-				se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
-			return false
-		}
-		return true
-	}
-
-	// restoreMinerAuth возвращает соединение воркеру майнера: с этого
-	// момента сложность пула снова можно отдавать майнеру.
-	restoreMinerAuth := func() {
-		if !feeAuth {
-			return
-		}
-		w := se.workerName()
-		if w == "" {
-			return
-		}
-		if commission != nil {
-			commission.throttleAuth()
-		}
-		if writeAuthorize(w) {
-			feeAuth = false
-			se.setFeeActive(false)
-			log.Printf("[COMMISSION] запрос возврата авторизации miner=%s pool=%s worker=%q",
-				se.source, se.pool, w)
-			// Возвращаем сложность сессии на уровень сложности майнера: если
-			// пул оставил в сессии заниженную сложность воркера комиссии, шары
-			// майнера зачислялись бы дешевле.
-			if commission != nil && commission.SuggestDifficulty() {
-				target := se.difficulty()
-				if target > 0 {
-					if d := se.feeDifficulty(); d > 0 && d < target {
-						writeSuggestDifficulty(target)
-						se.markSuggestSent()
-					}
-				}
-			}
-		}
-	}
-
-	for {
-		clientConn.SetReadDeadline(time.Now().Add(idleTimeout))
-		if !scanner.Scan() {
-			break
-		}
-		line := scanner.Bytes()
-		if IsMinerSubscribe(line) || IsMinerAuthorize(line) {
-			se.trackControl(line)
-		}
-
-		if IsMinerSubmit(line) {
-			id, _ := SubmitID(line)
-			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() {
-				if commission.reserve(se.pool) {
-					// Сначала открываем служебную авторизацию: она
-					// фиксирует имя воркера, под которым пойдёт эта
-					// шара (authorize и submit должны совпадать).
-					rewritten, err := []byte(nil), error(nil)
-					skipped := false
-					if ensureFeeAuth() {
-						// Перед отправкой изъятой шары убеждаемся, что
-						// сложность сессии у пула не ниже сложности
-						// майнера, — иначе шара зачислится в разы
-						// дешевле.
-						if ensurePoolDifficulty() {
-							md := se.difficulty()
-							fd := se.feeDifficulty()
-							if fd > 0 && md > 0 && fd > md+1e-12 {
-								log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g выше сложности майнера %g — пропускаем изъятие (низкая сложность)",
-									se.pool, fd, md)
-								rewritten = nil
-								skipped = true
-							} else if fd > 0 && md > 0 && fd < md-1e-12 {
-								log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g — пропускаем изъятие (обесценивание)",
-									se.pool, fd, md)
-								rewritten = nil
-								skipped = true
-							} else {
-								rewritten, err = rewriteSubmitWorker(line, feeWorker)
-							}
-						} else {
-							rewritten = nil
-							skipped = true
-						}
-					}
-					if err == nil && rewritten != nil {
-						diff := se.markCommissionSubmit(id, feeWorker)
-						ack := se.armCommissionAck()
-						commission.countSteal(se.pool, diff)
-						se.stats.noteCommissionSteal(se.pool, feeWorker, diff, se.difficulty())
-						line = rewritten
-						dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-						if werr := writeLine(dst, line); werr != nil {
-							log.Printf("[CONN] miner->pool write: %v", werr)
-							return
-						}
-						// Следующую шару берём только после ответа пула на
-						// эту: иначе порция уходит залпом и пул путает шары.
-						if !waitCommissionAck(ack, commissionAckTimeout) {
-							log.Printf("[COMMISSION] пул %s не ответил на шару id %s за %s — продолжаем",
-								se.pool, id, commissionAckTimeout)
-						}
-						continue
-					}
-					// Не удалось — fail-open: шару не трогаем.
-					if feeAuth {
-						restoreMinerAuth()
-					}
-					if !skipped {
-						commission.countFailed(se.pool)
-					}
-					// Если skipped — просто возвращаем шару майнеру без учёта в failed
-				} else if feeAuth {
-					// Бюджет исчерпан — возвращаем соединение майнеру.
-					restoreMinerAuth()
-				}
-			} else if feeAuth {
-				// Комиссия отключена/отклонена пулом — вернуть воркер майнера.
-				restoreMinerAuth()
-			}
-			se.submitJob(id, WorkerFromSubmit(line), JobIDFromSubmit(line))
-		} else if IsMinerAuthorize(line) {
-			se.authorize(WorkerFromAuthorize(line))
-		}
-
-		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-		if err := writeLine(dst, line); err != nil {
-			log.Printf("[CONN] miner->pool write: %v", err)
-			return
-		}
-	}
-	logReadErr("miner", clientConn, scanner.Err())
-}
-
-// pipePoolToMiner ведёт поток пул → майнер: забирает set_difficulty
-// (сложность для хешрейта) и ответы на шары (accepted/rejected).
-func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
-	scanner := bufio.NewScanner(src)
-	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
-
-	for {
-		src.SetReadDeadline(time.Now().Add(idleTimeout))
-		if !scanner.Scan() {
-			break
-		}
-		line := scanner.Bytes()
-
-		if diff, ok := ParseSetDifficulty(line); ok {
-			if se.suppressDifficulty() {
-				// Соединение сейчас под воркером комиссии: сложность от
-				// пула относится к нему (vardiff), а не к майнеру. Если её
-				// отдать ASIC — майнер начнёт сдавать копеечные шары, а его
-				// сложность в сессии затрётся чужой.
-				se.setFeeDiff(diff)
-				log.Printf("[COMMISSION] сложность %g от пула скрыта от майнера (соединение под воркером комиссии, сложность сессии %g)",
-					diff, se.difficulty())
-				continue
-			}
-			if prev := se.difficulty(); prev != diff {
-				log.Printf("[SESSION] пул %s сменил сложность сессии: %g -> %g", se.pool, prev, diff)
-			}
-			se.setDifficulty(diff)
-		} else if resp, ok := ParsePoolResponse(line); ok {
-			if resp.ID == commissionAuthID {
-				// Ответ на служебный authorize: майнеру не показываем,
-				// но пишем в лог — по нему видно, принял ли пул смену воркера.
-				if resp.Accepted {
-					log.Printf("[COMMISSION] пул %s подтвердил переавторизацию miner=%s", se.pool, se.source)
-					if se.commission != nil {
-						se.commission.reportAuthOK(se.pool)
-					}
-				} else {
-					log.Printf("[COMMISSION] пул %s ОТКЛОНИЛ переавторизацию miner=%s: %s — изъятие на этом соединении остановлено",
-						se.pool, se.source, resp.Error)
-					se.denyFee()
-					if se.commission != nil {
-						se.commission.reportDeny(se.pool)
-					}
-				}
-				continue
-			}
-			if resp.ID == commissionDiffID {
-				// Ответ на наш mining.suggest_difficulty: майнеру не
-				// показываем. Пул подтвердил, что закрепит сложность
-				// сессии на уровне сложности майнера.
-				if resp.Accepted {
-					log.Printf("[COMMISSION] пул %s подтвердил закрепление сложности %g", se.pool, se.difficulty())
-				} else if strings.Contains(resp.Error, "Frequency limit") {
-					// Пул ограничивает частоту таких запросов — это не
-					// поломка: следующую просьбу сделаем не раньше чем
-					// через commissionSuggestInterval.
-					se.markSuggestFrequencyLimited()
-					log.Printf("[COMMISSION] пул %s ограничил частоту запросов закрепления сложности (%s) — бэк-офф 3м",
-						se.pool, resp.Error)
-				} else {
-					log.Printf("[COMMISSION] пул %s отклонил mining.suggest_difficulty: %s", se.pool, resp.Error)
-				}
-				continue
-			}
-			if method := se.resolveControl(resp.ID); method != "" {
-				se.stats.noteControl(se.pool, method, resp.Accepted, resp.Error)
-			}
-			se.resolve(resp)
-		} else if resp, ok := ParseControlResponse(line); ok {
-			if method := se.resolveControl(resp.ID); method != "" {
-				se.stats.noteControl(se.pool, method, resp.Accepted, resp.Error)
-			}
-		} else if jobID, ok := JobIDFromNotify(line); ok {
-			se.noteNotify(jobID, CleanJobsFromNotify(line))
-		}
-
-		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-		if err := writeLine(dst, line); err != nil {
-			log.Printf("[CONN] pool->miner write: %v", err)
-			return
-		}
-	}
-	logReadErr("pool", src, scanner.Err())
-}
-
-// waitCommissionAck ждёт ответа пула на текущую изъятую шару. Возвращает
-// false, если за отведённое время ответа не было (соединение продолжает
-// работать, просто без сериализации по этой шаре).
-func waitCommissionAck(ch chan struct{}, d time.Duration) bool {
-	select {
-	case <-ch:
-		return true
-	case <-time.After(d):
-		return false
-	}
 }
 
 // writeLine пишет строку и терминальный '\n' (scanner его съел).

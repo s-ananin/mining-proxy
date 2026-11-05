@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"testing"
@@ -89,6 +90,7 @@ func (p *jobAwarePool) handle(c net.Conn) {
 			write(map[string]interface{}{"id": m.ID, "result": []interface{}{[]interface{}{}, "01000000", 4}, "error": nil})
 		case "mining.authorize":
 			write(map[string]interface{}{"id": m.ID, "result": true, "error": nil})
+			write(map[string]interface{}{"id": nil, "method": "mining.set_difficulty", "params": []int{256}})
 			newNotify()
 		case "mining.submit":
 			got := ""
@@ -127,6 +129,7 @@ func dialLoadMiner(t *testing.T, addr string, i int) *loadMiner {
 		t.Fatal(err)
 	}
 	m := &loadMiner{conn: c, r: bufio.NewReader(c), w: bufio.NewWriter(c)}
+	_ = c.SetDeadline(time.Now().Add(time.Minute))
 	m.send(map[string]interface{}{"id": 1, "method": "mining.subscribe", "params": []string{"load-test"}})
 	m.readID(1)
 	m.send(map[string]interface{}{"id": 2, "method": "mining.authorize", "params": []string{fmt.Sprintf("miner-%d", i), "x"}})
@@ -197,27 +200,41 @@ func runCommissionLoad(t *testing.T, n int, withCommission bool) (int, int) {
 		t.Fatal(err)
 	}
 	pass := ProxyPass{ListenAddr: ln.Addr().String(), Fallback: pool.ln.Addr().String(), Commission: commission}
+	var handlers sync.WaitGroup
+	acceptDone := make(chan struct{})
 	go func() {
+		defer close(acceptDone)
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go HandleConnection(c, pass, stats)
+			handlers.Add(1)
+			go func() { defer handlers.Done(); HandleConnection(c, pass, stats) }()
 		}
 	}()
-	defer ln.Close()
+	defer func() { ln.Close(); <-acceptDone; handlers.Wait() }()
 	if commission != nil {
 		defer commission.Close()
 	}
 
 	miners := make([]*loadMiner, n)
+	defer func() {
+		for _, m := range miners {
+			if m != nil {
+				m.conn.Close()
+			}
+		}
+	}()
 	for i := range miners {
 		miners[i] = dialLoadMiner(t, ln.Addr().String(), i)
 	}
 	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(n)
 	var wg sync.WaitGroup
 	for i, m := range miners {
+		_ = m.conn.SetDeadline(time.Now().Add(2 * time.Minute))
 		wg.Add(1)
 		go func(i int, m *loadMiner) {
 			defer wg.Done()
@@ -226,11 +243,19 @@ func runCommissionLoad(t *testing.T, n int, withCommission bool) (int, int) {
 			job := m.job
 			m.mu.Unlock()
 			m.send(map[string]interface{}{"id": 3, "method": "mining.submit", "params": []interface{}{fmt.Sprintf("miner-%d", i), job, "extra", "ntime", "nonce"}})
-			// Pool response, possibly preceded by a fresh notify caused by the
-			// service authorize. Ignore notifications and consume the submit ack.
-			deadline := time.Now().Add(3 * time.Second)
-			_ = m.conn.SetReadDeadline(deadline)
 			m.readID(3)
+			if withCommission {
+				// The triggering share must reach the pool under its original
+				// authorization. Only the subsequent job belongs to the fee.
+				m.readJob()
+				ready.Done()
+				ready.Wait()
+				m.send(map[string]interface{}{"id": 4, "method": "mining.submit", "params": []interface{}{fmt.Sprintf("miner-%d", i), m.job, "extra", "ntime", "nonce"}})
+				m.readID(4)
+				m.readJob() // restoration must happen without another submit
+				m.send(map[string]interface{}{"id": 5, "method": "mining.submit", "params": []interface{}{fmt.Sprintf("miner-%d", i), m.job, "extra", "ntime", "nonce"}})
+				m.readID(5)
+			}
 		}(i, m)
 	}
 	close(start)
@@ -238,24 +263,51 @@ func runCommissionLoad(t *testing.T, n int, withCommission bool) (int, int) {
 	for _, m := range miners {
 		_ = m.conn.Close()
 	}
+	// Wait for session cleanup so losses and pending reservations are also
+	// checked, and the next test cannot race the auth limiter override.
+	ln.Close()
+	<-acceptDone
+	handlers.Wait()
+	wantMiner, wantFee := n, 0
+	if withCommission {
+		wantMiner, wantFee = 2*n, n
+	}
+	report := stats.Report()
+	if report.Totals.Accepted != wantMiner || report.Totals.Rejected != 0 || report.Totals.Lost != 0 {
+		t.Errorf("miners=%d fee=%t: totals=%+v, want accepted=%d rejected=0 lost=0", n, withCommission, report.Totals, wantMiner)
+	}
+	if commission != nil {
+		snapshot := commission.Snapshot()
+		if snapshot.Accepted != wantFee || snapshot.Rejected != 0 || snapshot.Attempts != wantFee {
+			t.Errorf("miners=%d: commission attempts=%d accepted=%d rejected=%d, want %d/%d/0", n, snapshot.Attempts, snapshot.Accepted, snapshot.Rejected, wantFee, wantFee)
+		}
+	}
 	return pool.counts()
 }
 
 func TestCommissionReauthorizationLoadModel(t *testing.T) {
 	oldGap := commissionAuthMinGap
-	commissionAuthMinGap = time.Millisecond
+	commissionAuthMinGap = 0
 	defer func() { commissionAuthMinGap = oldGap }()
-	for _, n := range []int{1, 10, 50} {
-		accepted, rejected := runCommissionLoad(t, n, false)
-		t.Logf("miners=%d commission=off accepted=%d rejected=%d", n, accepted, rejected)
-		if accepted != n || rejected != 0 {
-			t.Fatalf("without commission: got accepted=%d rejected=%d, want %d/0", accepted, rejected, n)
-		}
+	sizes := []int{1, 10, 50, 100}
+	if os.Getenv("MINING_PROXY_LARGE_LOAD") == "1" {
+		sizes = append(sizes, 1000, 10000)
+	}
+	for _, n := range sizes {
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			started := time.Now()
+			accepted, rejected := runCommissionLoad(t, n, false)
+			t.Logf("miners=%d commission=off accepted=%d rejected=%d", n, accepted, rejected)
+			if accepted != n || rejected != 0 {
+				t.Fatalf("without commission: got accepted=%d rejected=%d, want %d/0", accepted, rejected, n)
+			}
 
-		accepted, rejected = runCommissionLoad(t, n, true)
-		t.Logf("miners=%d commission=on accepted=%d rejected=%d", n, accepted, rejected)
-		if rejected != n {
-			t.Fatalf("with modeled reauthorization: got accepted=%d rejected=%d, want 0/%d", accepted, rejected, n)
-		}
+			accepted, rejected = runCommissionLoad(t, n, true)
+			t.Logf("miners=%d commission=on accepted=%d rejected=%d", n, accepted, rejected)
+			if accepted != 3*n || rejected != 0 {
+				t.Fatalf("with modeled reauthorization: got accepted=%d rejected=%d, want %d/0", accepted, rejected, 3*n)
+			}
+			t.Logf("full comparison elapsed=%s", time.Since(started))
+		})
 	}
 }

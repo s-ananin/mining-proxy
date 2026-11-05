@@ -20,15 +20,14 @@
 //     2) случайные итерации (commission_iteration, дефолт 40/сутки):
 //     batch = ceil((target - уже взято) / оставшиеся итерации). Так процент
 //     сходится к target, а число изъятий не превышает commission_iteration;
-//   - в момент итерации следующие batch mining.submit из ЛЮБОГО ASIC уходят в
-//     ТОТ ЖЕ upstream-соединение майнера (job_id/extranonce1 сохраняются),
-//     но воркер подменяется на commission_worker. Пул привязывает воркер к
-//     mining.authorize, поэтому одной подмены params[0] мало: на время
-//     изъятия прокси отправляет в пул служебный mining.authorize с
-//     commission_worker, а в конце возвращает воркер майнера. Так authorize и
-//     submit согласованы, и шары засчитываются комиссии;
-//   - fail-open: если переписать шару не удалось, она уходит как обычно,
-//     комиссия НЕ изымается. Майнинг клиента не прерывается никогда.
+//   - после ответа на обычную шару прокси может начать переавторизацию;
+//     старые шары не переписываются под нового воркера. Изъятие начинается
+//     только после подтверждения authorize и следующего mining.notify;
+//   - сложность пула передаётся майнеру вместе с соответствующим заданием.
+//     suggest_difficulty — асинхронная просьба, она не блокирует submit;
+//   - после ответов на последние изъятые шары прокси возвращает authorize
+//     майнера. Аннулированные переходом шары получают явный stale-ответ;
+//     отказ возврата или отсутствие нового задания требуют переподключения.
 //
 // Комиссия учитывается в своих счётчиках (/status.commission) и НЕ влияет на
 // totals/workers штатного мониторинга: забранные шары не регистрируются как
@@ -56,9 +55,8 @@ const (
 
 	// commissionAuthTag — id служебного mining.authorize, которым прокси на
 	// время изъятия переводит соединение майнера на commission_worker.
-	// commissionAuthID — тот же id в виде, в котором его вернёт пул в ответе.
+	// Каждый переход добавляет к префиксу свой номер запроса.
 	commissionAuthTag = "__commission_switch__"
-	commissionAuthID  = `"` + commissionAuthTag + `"`
 
 	// commissionBreakerDenies — сколько отказов служебной переавторизации
 	// подряд по пулу открывают «предохранитель».
@@ -69,21 +67,6 @@ const (
 	// commissionDiffID — тот же id в виде, в котором его вернёт пул.
 	commissionDiffTag = "__commission_diff__"
 	commissionDiffID  = `"` + commissionDiffTag + `"`
-
-	// commissionDiffWaitTimeout — сколько ждём подтверждения сложности
-	// сессии после mining.suggest_difficulty, прежде чем отправлять изъятые
-	// шары: пока в сессии держится vardiff воркера комиссии, пул зачисляет
-	// их в десятки раз дешевле.
-	commissionDiffWaitTimeout = 15 * time.Second
-
-	// commissionDiffGrace — сколько ждём сложности от пула, если он её не
-	// присылает: не прислал — сложность сессии не менялась.
-	commissionDiffGrace = 2 * time.Second
-
-	// commissionSuggestInterval — не чаще как часто просим у пула закрепить
-	// сложность сессии: пул ограничивает частоту таких запросов
-	// ("Frequency limit exceeded").
-	commissionSuggestInterval = 90 * time.Second
 )
 
 // commissionBreakerCooldown — на сколько пул исключается из изъятия после
@@ -91,7 +74,8 @@ const (
 // задавать короткую паузу.
 var commissionBreakerCooldown = 10 * time.Minute
 
-// commissionAuthMinGap — минимальный интервал между служебными authorize.
+// commissionAuthMinGap — минимальный интервал между входами в комиссию.
+// Возврат авторизации майнера не ограничивается и не стоит в очереди.
 // Переменная также позволяет нагрузочным тестам не ждать реальную паузу.
 var commissionAuthMinGap = 1200 * time.Millisecond
 
@@ -264,29 +248,11 @@ func WithWorkerRotation() CommissionOption {
 }
 
 // WithSuggestDifficulty включает запрос сложности сессии у пула
-// (mining.suggest_difficulty) сразу после служебного authorize: пул
-// закрепляет сложность на уровне сложности майнера, даже если у воркера
-// комиссии свой vardiff.
+// (mining.suggest_difficulty) после служебного authorize. Запрос не
+// блокирует передачу шар; пул может его проигнорировать, поэтому ASIC
+// всегда получает фактическую сложность с соответствующим заданием.
 func WithSuggestDifficulty() CommissionOption {
 	return func(c *Commission) { c.suggestDiff = true }
-}
-
-func (c *Commission) throttleAuth() {
-	if c == nil {
-		return
-	}
-	c.authMu.Lock()
-	defer c.authMu.Unlock()
-	min := commissionAuthMinGap
-	if c.lastAuth.IsZero() {
-		c.lastAuth = time.Now()
-		return
-	}
-	since := time.Since(c.lastAuth)
-	if since < min {
-		time.Sleep(min - since)
-	}
-	c.lastAuth = time.Now()
 }
 
 // NewCommission создаёт сборщик комиссии. worker == "" — комиссия
@@ -593,20 +559,49 @@ func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
 func (c *Commission) reserve(pool string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.reserveLocked(pool, time.Now())
+}
+
+func (c *Commission) reserveLocked(pool string, now time.Time) bool {
 	if c.worker == "" || c.takeBudget <= 0 {
 		return false
 	}
-	if c.poolOpenLocked(pool, time.Now()) {
+	if c.poolOpenLocked(pool, now) {
 		return false
 	}
 	if c.session > 0 {
-		now := time.Now()
 		if now.Before(c.sessionStart) || !now.Before(c.sessionEnd) {
 			return false
 		}
 	}
 	c.takeBudget--
 	return true
+}
+
+// tryStart admits a switch without queuing or sleeping in a miner's path.
+// Restoring the miner is never throttled.
+func (c *Commission) tryStart(pool string, now time.Time) bool {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if commissionAuthMinGap > 0 && !c.lastAuth.IsZero() && now.Sub(c.lastAuth) < commissionAuthMinGap {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.reserveLocked(pool, now) {
+		return false
+	}
+	c.lastAuth = now
+	return true
+}
+
+// release refunds a reserved share that was never sent to the pool.
+func (c *Commission) release(reservedAt time.Time) {
+	c.mu.Lock()
+	if !reservedAt.Before(c.windowStart) {
+		c.takeBudget++
+	}
+	c.mu.Unlock()
 }
 
 // reportDeny сообщает об отказе пула переавторизовать соединение под
@@ -645,9 +640,9 @@ func (c *Commission) reportAuthOK(pool string) {
 }
 
 // rewriteSubmitWorker переписывает в mining.submit имя воркера (params[0])
-// на newWorker, СОХРАНЯЯ id шары (чтобы ответ пула вернулся майнеру по его
-// id). Остаток шары (job_id, extranonce2, ntime, nonce) не трогаем — на
-// соединении майнера шара остаётся валидной.
+// на newWorker, сохраняя id и остальные параметры. Вызывающий обязан
+// проверить принадлежность задания текущей авторизации: сама подмена
+// имени не делает старую шару валидной после смены воркера.
 func rewriteSubmitWorker(raw []byte, newWorker string) ([]byte, error) {
 	var msg struct {
 		ID     json.RawMessage   `json:"id"`
