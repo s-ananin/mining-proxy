@@ -1,11 +1,106 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 )
+
+// Reproduce the incident: fee shares are accepted, restoring authorize is
+// acknowledged but no new job arrives, and the ASIC sends 25 old-job submits.
+// Both sockets must close after the first loss, before the restore timeout.
+func TestTransitionStaleBurstClosesConnectionImmediately(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 1, 40, 0, 0, stats)
+	c.takeBudget = 1
+	defer c.Close()
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+	proxyMiner, miner := net.Pipe()
+	proxyPool, pool := net.Pipe()
+	defer miner.Close()
+	defer pool.Close()
+	defer proxyMiner.Close()
+	defer proxyPool.Close()
+	miner.SetDeadline(time.Now().Add(3 * time.Second))
+	pool.SetDeadline(time.Now().Add(3 * time.Second))
+	finished, poolFinished := make(chan struct{}), make(chan struct{})
+	go func() {
+		runStratum(proxyMiner, bufio.NewReader(proxyMiner), proxyPool, se)
+		close(finished)
+	}()
+	go func() {
+		defer close(poolFinished)
+		scanner := bufio.NewScanner(pool)
+		auths := 0
+		for scanner.Scan() {
+			msg, err := Parse(scanner.Bytes())
+			if err != nil {
+				return
+			}
+			switch msg.Method {
+			case "mining.authorize":
+				auths++
+				if writeLine(pool, []byte(fmt.Sprintf(`{"id":%s,"result":true,"error":null}`, msg.ID))) != nil {
+					return
+				}
+				if auths <= 2 {
+					if writeLine(pool, []byte(`{"id":null,"method":"mining.set_difficulty","params":[1024]}`)) != nil {
+						return
+					}
+					if writeLine(pool, []byte(fmt.Sprintf(`{"id":null,"method":"mining.notify","params":["job-%d","prev","c1","c2",[],"v","bits","time",true]}`, auths))) != nil {
+						return
+					}
+				}
+			case "mining.submit":
+				if writeLine(pool, []byte(fmt.Sprintf(`{"id":%s,"result":true,"error":null}`, msg.ID))) != nil {
+					return
+				}
+			}
+		}
+	}()
+	m := &loadMiner{conn: miner, r: bufio.NewReader(miner), w: bufio.NewWriter(miner)}
+	m.send(map[string]interface{}{"id": 1, "method": "mining.authorize", "params": []string{"miner.w", "x"}})
+	m.readID(1)
+	m.readJob()
+	m.send(map[string]interface{}{"id": 2, "method": "mining.submit", "params": []string{"miner.w", m.job, "extra", "time", "nonce"}})
+	m.readID(2)
+	m.readJob()
+	feeJob := m.job
+	m.send(map[string]interface{}{"id": 3, "method": "mining.submit", "params": []string{"miner.w", feeJob, "extra", "time", "nonce"}})
+	m.readID(3)
+	started := time.Now()
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for id := 4; id < 29; id++ {
+			if writeLine(miner, []byte(fmt.Sprintf(`{"id":%d,"method":"mining.submit","params":["miner.w",%q,"extra","time","nonce"]}`, id, feeJob))) != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("still waiting for restore instead of reconnecting after first stale")
+	}
+	<-writerDone
+	<-poolFinished
+	if _, err := m.r.ReadByte(); err == nil {
+		t.Fatal("miner connection remained open")
+	}
+	report := stats.Report()
+	if report.Totals.Accepted != 1 || report.Totals.Rejected != 1 || report.Totals.Lost != 0 {
+		t.Fatalf("burst accumulated rejects: %+v", report.Totals)
+	}
+	if snapshot := c.Snapshot(); snapshot.Accepted != 1 || !snapshot.Pools[0].BreakerOpen {
+		t.Fatalf("commission not accounted or breaker not open: %+v", snapshot)
+	}
+	t.Logf("closed after first stale in %s; rejected=1 instead of burst of 25", time.Since(started))
+}
 
 type switchRig struct {
 	t        *testing.T
@@ -143,28 +238,17 @@ func TestSwitchRejectsOldGenerationWithoutFalseAcceptance(t *testing.T) {
 	defer r.close()
 	old := r.start()
 	up := len(r.up)
-	r.submit(3, old)
+	err := r.s.miner([]byte(fmt.Sprintf(`{"id":3,"method":"mining.submit","params":["miner.w",%q,"extra","time","nonce"]}`, old)))
+	if err == nil {
+		t.Fatal("unsafe transition did not request immediate reconnect")
+	}
 	for _, line := range r.up[up:] {
 		if IsMinerSubmit(line) {
 			t.Fatal("old share sent under new authorization")
 		}
 	}
-	resp, ok := ParsePoolResponse(r.down[len(r.down)-1])
-	if !ok || resp.Accepted || resp.ID != "3" {
-		t.Fatalf("missing explicit stale response: %+v", resp)
-	}
 	if r.s.se.stats.Report().Totals.Rejected != 1 {
 		t.Fatal("local stale hidden from status")
-	}
-	if r.s.phase != minerStarting {
-		t.Fatal("unsafe switch did not immediately restore miner")
-	}
-	r.authOK()
-	r.notify("same-job", true)
-	up = len(r.up)
-	r.submit(4, old)
-	if len(r.up) != up {
-		t.Fatal("reused upstream id revalidated an old generation")
 	}
 }
 
@@ -179,7 +263,9 @@ func TestTransitionStaleDisablesPoolAcrossSessions(t *testing.T) {
 	old := r.start()
 	c.lastAuth = time.Time{}
 	other.start()
-	r.submit(3, old)
+	if err := r.s.miner([]byte(fmt.Sprintf(`{"id":3,"method":"mining.submit","params":["miner.w",%q,"extra","time","nonce"]}`, old))); err == nil {
+		t.Fatal("unsafe session did not request reconnect")
+	}
 	if !c.unsafeSwitch(r.s.se.pool) {
 		t.Fatal("transition loss did not disable pool")
 	}
@@ -198,13 +284,13 @@ func TestTransitionStaleDisablesPoolAcrossSessions(t *testing.T) {
 	if len(report.Pools) != 1 || !report.Pools[0].BreakerOpen || report.Pools[0].DisabledReason != "authorization_transition_stale" {
 		t.Fatalf("missing incident state in status: %+v", report.Pools)
 	}
-	// Following restoration ordinary accepted work proceeds; the breaker
-	// must prevent another fee cycle even though budget remains.
-	r.authOK()
-	r.notify("restored", true)
-	r.submit(4, r.job())
-	r.ack(4)
-	if r.s.phase != minerWork {
+	// The unaffected session can restore ordinary work, but must not start
+	// another fee cycle even though budget remains.
+	other.authOK()
+	other.notify("restored", true)
+	other.submit(4, other.job())
+	other.ack(4)
+	if other.s.phase != minerWork {
 		t.Fatal("commission restarted after restoration")
 	}
 }

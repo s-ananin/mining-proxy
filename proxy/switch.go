@@ -258,11 +258,19 @@ func (s *stratumSwitch) rejectTransition(line []byte) error {
 	}
 	reason := "stale job after authorization switch"
 	job, known := s.jobs[JobIDFromSubmit(line)]
-	if s.epoch > 0 && (s.phase != minerWork || known && job.epoch != s.epoch) {
+	unsafe := s.epoch > 0 && (s.phase != minerWork || known && job.epoch != s.epoch)
+	if unsafe {
 		s.se.commission.reportUnsafeSwitch(s.se.pool)
 	}
 	s.se.submitJob(id, WorkerFromSubmit(line), JobIDFromSubmit(line))
 	s.se.resolve(PoolResponse{ID: id, Error: reason})
+	if unsafe {
+		// The ASIC is still hashing an invalid authorization's work. Waiting
+		// for restore notify creates a stream of local rejects. End the
+		// session immediately; runStratum closes both sockets on this error.
+		// Do not wait for a stale response write to a slow/non-reading ASIC.
+		return fmt.Errorf("authorization transition discarded miner work; reconnect required")
+	}
 	response, _ := json.Marshal(struct {
 		ID     json.RawMessage `json:"id"`
 		Result bool            `json:"result"`
