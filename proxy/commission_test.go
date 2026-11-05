@@ -318,16 +318,19 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 		t.Fatalf("resolve изъятой шары не найден")
 	}
 
-	// Вторая шара: бюджет исчерпан → authorize(client.w) + submit(client.w).
-	send(`{"id":3,"method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
+	// Restore starts after the last acknowledgement, without another submit.
 	a = recv()
-	if a.Method != "mining.authorize" || worker(a) != "client.w" {
-		t.Fatalf("ожидался возврат authorize на client.w: %+v", a)
+	if a.Method != "mining.authorize" || worker(a) != "client.w" || tagID(a) != commissionRestoreID {
+		t.Fatalf("ожидался немедленный возврат authorize на client.w: %+v", a)
 	}
+	se.restorePoolLine([]byte(`{"id":"__commission_restore__","result":true,"error":null}`))
+	se.restorePoolLine([]byte(`{"id":null,"method":"mining.notify","params":["job2","p","c1","c2",[],"v","b","t",true]}`))
+	send(`{"id":3,"method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
 	s = recv()
 	if s.Method != "mining.submit" || worker(s) != "client.w" || string(s.ID) != "3" {
 		t.Fatalf("возвращённая шара неверна: %+v", s)
 	}
+
 }
 
 // TestFeeDifficultyNotLeakedToMiner проверяет, что сложность, которую пул
@@ -425,23 +428,27 @@ func TestFeeDifficultyNotLeakedToMiner(t *testing.T) {
 		t.Fatalf("ответ пула по шаре не дошёл до майнера: %s", r)
 	}
 
-	// Бюджет исчерпан → прокси возвращает authorize(client.w).
-	toMiner(`{"id":"3","method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
-	if a := fromPool(); !strings.Contains(a, `"client.w"`) {
+	// Return authorize is emitted before another miner submit.
+	if a := fromPool(); !strings.Contains(a, commissionRestoreTag) || !strings.Contains(a, `"client.w"`) {
 		t.Fatalf("ожидался возврат authorize на client.w: %s", a)
 	}
-	if s := fromPool(); !strings.Contains(s, `"client.w"`) {
-		t.Fatalf("ожидалась шара майнера: %s", s)
-	}
-
-	// Теперь сложность пула снова доходит до майнера.
+	toPool(`{"id":"__commission_restore__","result":true,"error":null}`)
 	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
+	toPool(`{"id":null,"method":"mining.notify","params":["job2","p","c1","c2",[],"v","b","t",false]}`)
 	if line := fromMiner(); !strings.Contains(line, "set_difficulty") {
-		t.Fatalf("майнер получил не set_difficulty: %q", line)
+		t.Fatalf("missing restored difficulty: %s", line)
+	}
+	if line := fromMiner(); !strings.Contains(line, "mining.notify") {
+		t.Fatalf("missing restored job: %s", line)
+	}
+	toMiner(`{"id":"3","method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
+	if line := fromPool(); !strings.Contains(line, "mining.submit") || !strings.Contains(line, `"client.w"`) {
+		t.Fatalf("bad restored submit: %s", line)
 	}
 	if d := se.difficulty(); d != 16384 {
 		t.Fatalf("сложность сессии не обновилась: %v", d)
 	}
+
 }
 
 // TestCommissionWorkCountedAtFeeDifficulty проверяет, что work изъятой

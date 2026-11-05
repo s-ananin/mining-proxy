@@ -57,8 +57,10 @@ const (
 	// commissionAuthTag — id служебного mining.authorize, которым прокси на
 	// время изъятия переводит соединение майнера на commission_worker.
 	// commissionAuthID — тот же id в виде, в котором его вернёт пул в ответе.
-	commissionAuthTag = "__commission_switch__"
-	commissionAuthID  = `"` + commissionAuthTag + `"`
+	commissionAuthTag    = "__commission_switch__"
+	commissionAuthID     = `"` + commissionAuthTag + `"`
+	commissionRestoreTag = "__commission_restore__"
+	commissionRestoreID  = `"` + commissionRestoreTag + `"`
 
 	// commissionBreakerDenies — сколько отказов служебной переавторизации
 	// подряд по пулу открывают «предохранитель».
@@ -189,7 +191,7 @@ type Commission struct {
 
 	// Глобальная сериализация авторизаций под комиссионного воркера
 	// для снижения лавины переавторизаций у пула с vardiff по аккаунту.
-	authMu sync.Mutex
+	authMu   sync.Mutex
 	lastAuth time.Time
 
 	// Параметры (worker == "" → комиссия выключена).
@@ -259,10 +261,10 @@ func WithWorkerRotation() CommissionOption {
 	return func(c *Commission) { c.rotateWorkers = true }
 }
 
-	// WithSuggestDifficulty включает запрос сложности сессии у пула
-	// (mining.suggest_difficulty) сразу после служебного authorize: пул
-	// закрепляет сложность на уровне сложности майнера, даже если у воркера
-	// комиссии свой vardiff.
+// WithSuggestDifficulty включает запрос сложности сессии у пула
+// (mining.suggest_difficulty) сразу после служебного authorize: пул
+// закрепляет сложность на уровне сложности майнера, даже если у воркера
+// комиссии свой vardiff.
 func WithSuggestDifficulty() CommissionOption {
 	return func(c *Commission) { c.suggestDiff = true }
 }
@@ -603,6 +605,17 @@ func (c *Commission) reserve(pool string) bool {
 	}
 	c.takeBudget--
 	return true
+}
+
+// hasBudget checks whether another commission share can be taken without
+// reserving it. It allows an exhausted session to restore immediately after
+// the last share response, before the ASIC finds its next share.
+func (c *Commission) hasBudget(pool string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	return c.worker != "" && c.takeBudget > 0 && !c.poolOpenLocked(pool, now) &&
+		(c.session <= 0 || !now.Before(c.sessionStart) && now.Before(c.sessionEnd))
 }
 
 // reportDeny сообщает об отказе пула переавторизовать соединение под

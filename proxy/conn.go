@@ -305,18 +305,18 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			}
 			writeSuggestDifficulty(target)
 			se.markSuggestSent()
-		if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
-			if fd := se.feeDifficulty(); fd > 0 && fd <= target+1e-12 {
-				return true
+			if !se.waitFeeDiff(target, commissionDiffWaitTimeout, commissionDiffGrace) {
+				if fd := se.feeDifficulty(); fd > 0 && fd <= target+1e-12 {
+					return true
+				}
+				if fd := se.feeDifficulty(); fd <= target {
+					return true
+				}
+				log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
+					se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
+				return false
 			}
-			if fd := se.feeDifficulty(); fd <= target {
-				return true
-			}
-			log.Printf("[COMMISSION] пул %s не подтвердил сложность %g за %s — пропускаем изъятие (сложность воркера комиссии %g)",
-				se.pool, target, commissionDiffWaitTimeout, se.feeDifficulty())
-			return false
-		}
-		return true
+			return true
 		}
 		if !se.allowSuggest() {
 			log.Printf("[COMMISSION] пул %s: сложность воркера комиссии %g ниже сложности майнера %g, но закрепление уже запрашивали недавно — пропускаем изъятие",
@@ -342,35 +342,25 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		return true
 	}
 
-	// restoreMinerAuth возвращает соединение воркеру майнера: с этого
-	// момента сложность пула снова можно отдавать майнеру.
-	restoreMinerAuth := func() {
+	// Restore before the ASIC finds another share. Keep suppression active
+	// until the pool confirms authorization and delivers the new miner job.
+	restoreMinerAuth := func() bool {
 		if !feeAuth {
-			return
+			return true
 		}
 		w := se.workerName()
 		if w == "" {
-			return
+			return false
 		}
-		if commission != nil {
-			commission.throttleAuth()
+		se.beginMinerRestore(dst)
+		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err := writeLine(dst, miningAuthorizeLine(w, commissionRestoreTag)); err != nil {
+			log.Printf("[COMMISSION] restore authorize failed miner=%s pool=%s: %v", se.source, se.pool, err)
+			return false
 		}
-		if writeAuthorize(w) {
-			feeAuth = false
-			se.setFeeActive(false)
-			// Возвращаем сложность сессии на уровень сложности майнера: если
-			// пул оставил в сессии заниженную сложность воркера комиссии, шары
-			// майнера зачислялись бы дешевле.
-			if commission != nil && commission.SuggestDifficulty() {
-				target := se.difficulty()
-				if target > 0 {
-					if d := se.feeDifficulty(); d > 0 && d < target {
-						writeSuggestDifficulty(target)
-						se.markSuggestSent()
-					}
-				}
-			}
-		}
+		feeAuth = false
+		log.Printf("[COMMISSION] restoring miner=%s pool=%s worker=%q", se.source, se.pool, w)
+		return true
 	}
 
 	for {
@@ -381,6 +371,12 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		line := scanner.Bytes()
 
 		if IsMinerSubmit(line) {
+			if se.oldCommissionShare(line) {
+				if err := se.rejectCommissionTail(clientConn, line); err != nil {
+					return
+				}
+				continue
+			}
 			id, _ := SubmitID(line)
 			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() {
 				if commission.reserve(se.pool) {
@@ -428,17 +424,22 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 							log.Printf("[CONN] miner->pool write: %v", werr)
 							return
 						}
-						// Следующую шару берём только после ответа пула на
-						// эту: иначе порция уходит залпом и пул путает шары.
 						if !waitCommissionAck(ack, commissionAckTimeout) {
-							log.Printf("[COMMISSION] пул %s не ответил на шару id %s за %s — продолжаем",
-								se.pool, id, commissionAckTimeout)
+							log.Printf("[COMMISSION] pool=%s submit id=%s response timeout; closing before restore", se.pool, id)
+							return
+						}
+						if !commission.hasBudget(se.pool) {
+							if !restoreMinerAuth() {
+								return
+							}
 						}
 						continue
 					}
 					// Не удалось — fail-open: шару не трогаем.
 					if feeAuth {
-						restoreMinerAuth()
+						if !restoreMinerAuth() {
+							return
+						}
 					}
 					if !skipped {
 						commission.countFailed(se.pool)
@@ -446,11 +447,21 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					// Если skipped — просто возвращаем шару майнеру без учёта в failed
 				} else if feeAuth {
 					// Бюджет исчерпан — возвращаем соединение майнеру.
-					restoreMinerAuth()
+					if !restoreMinerAuth() {
+						return
+					}
 				}
 			} else if feeAuth {
 				// Комиссия отключена/отклонена пулом — вернуть воркер майнера.
-				restoreMinerAuth()
+				if !restoreMinerAuth() {
+					return
+				}
+			}
+			if se.oldCommissionShare(line) {
+				if err := se.rejectCommissionTail(clientConn, line); err != nil {
+					return
+				}
+				continue
 			}
 			se.submit(id, WorkerFromSubmit(line))
 		} else if IsMinerAuthorize(line) {
@@ -473,11 +484,23 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
 
 	for {
-		src.SetReadDeadline(time.Now().Add(idleTimeout))
+		se.poolReadDeadline(src)
 		if !scanner.Scan() {
 			break
 		}
 		line := scanner.Bytes()
+		if handled, updates, err := se.restorePoolLine(line); handled {
+			if err != nil {
+				log.Printf("[COMMISSION] restore failed miner=%s pool=%s: %v", se.source, se.pool, err)
+				return
+			}
+			if len(updates) > 0 {
+				if err := se.publishMinerRestore(dst, updates); err != nil {
+					return
+				}
+			}
+			continue
+		}
 
 		if diff, ok := ParseSetDifficulty(line); ok {
 			if se.suppressDifficulty() {
@@ -536,8 +559,11 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 			se.setJobID(jobID)
 		}
 
+		se.minerWriteMu.Lock()
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-		if err := writeLine(dst, line); err != nil {
+		err := writeLine(dst, line)
+		se.minerWriteMu.Unlock()
+		if err != nil {
 			log.Printf("[CONN] pool->miner write: %v", err)
 			return
 		}
