@@ -260,6 +260,9 @@ func (s *session) submit(id, worker string) {
 		if now.Sub(p.at) > pendingTimeout {
 			delete(s.pending, k)
 			if p.commission {
+				if s.commission != nil {
+					s.commission.lostWork(p.diff, p.at)
+				}
 				continue // комиссионные в lost воркера не пишем
 			}
 			s.stats.LostShare(s.pool, p.worker)
@@ -337,7 +340,7 @@ func (s *session) resolve(resp PoolResponse) bool {
 	}
 	if p.commission {
 		if s.commission != nil {
-			s.commission.countResult(s.pool, resp.Accepted, p.diff)
+			s.commission.countResult(s.pool, resp.Accepted, p.diff, p.at)
 			if resp.Accepted {
 				log.Printf("[COMMISSION] пул %s зачёл шару воркера %q (diff %g)",
 					s.pool, p.worker, p.diff)
@@ -364,6 +367,9 @@ func (s *session) close() {
 	s.closed = true
 	for _, p := range s.pending {
 		if p.commission {
+			if s.commission != nil {
+				s.commission.lostWork(p.diff, p.at)
+			}
 			continue // комиссионные шары в lost воркера не пишем
 		}
 		s.stats.LostShare(s.pool, p.worker)

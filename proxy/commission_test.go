@@ -9,31 +9,6 @@ import (
 	"time"
 )
 
-func TestPlanBatch(t *testing.T) {
-	cases := []struct {
-		name       string
-		accepted   int
-		taken      int
-		iterations int
-		percent    float64
-		want       int
-	}{
-		{"2% от 25000 за 40 итераций", 25000, 0, 40, 2, 13},
-		{"ничего не нужно", 100, 2, 40, 2, 0},
-		{"остаток добираем в последней итерации", 1000, 18, 2, 2, 1},
-		{"нет итераций", 1000, 0, 0, 2, 0},
-		{"процент 0", 1000, 0, 40, 0, 0},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := planBatch(c.accepted, c.taken, c.iterations, c.percent); got != c.want {
-				t.Errorf("planBatch(%d,%d,%d,%v) = %d, want %d",
-					c.accepted, c.taken, c.iterations, c.percent, got, c.want)
-			}
-		})
-	}
-}
-
 func TestRewriteSubmitWorker(t *testing.T) {
 	raw := []byte(`{"id":7,"method":"mining.submit","params":["ger.w1","job1","n2","nt","nc"]}`)
 	got, err := rewriteSubmitWorker(raw, "test.com")
@@ -50,7 +25,7 @@ func TestRewriteSubmitWorker(t *testing.T) {
 		t.Fatalf("unmarshal rewritten: %v (%s)", err, got)
 	}
 	if msg.ID != 7 {
-		t.Errorf("id = %d, want 7 (id шары должен сохраняться)", msg.ID)
+		t.Errorf("id = %v, want 7 (id шары должен сохраняться)", msg.ID)
 	}
 	if msg.Method != "mining.submit" {
 		t.Errorf("method = %q", msg.Method)
@@ -61,7 +36,7 @@ func TestRewriteSubmitWorker(t *testing.T) {
 	want := []string{"job1", "n2", "nt", "nc"}
 	for i, v := range want {
 		if msg.Params[i+1] != v {
-			t.Errorf("params[%d] = %q, want %q (остаток шары не тронут)", i+1, msg.Params[i+1], v)
+			t.Errorf("params[%v] = %q, want %q (остаток шары не тронут)", i+1, msg.Params[i+1], v)
 		}
 	}
 }
@@ -86,6 +61,7 @@ func TestCommissionStealAndCount(t *testing.T) {
 	c := NewCommission("test.com", 2, 40, 0, 0, stats)
 	c.takeBudget = 2
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	se.setDifficulty(1)
 	defer se.close()
 
 	line := []byte(`{"id":7,"method":"mining.submit","params":["w","j","n2","nt","nc"]}`)
@@ -106,7 +82,7 @@ func TestCommissionStealAndCount(t *testing.T) {
 		t.Fatalf("unmarshal rewritten: %v", err)
 	}
 	if rew.ID != 7 || rew.Params[0] != "test.com" {
-		t.Errorf("переписанная шара: id=%d worker=%q, want 7/test.com", rew.ID, rew.Params[0])
+		t.Errorf("переписанная шара: id=%v worker=%q, want 7/test.com", rew.ID, rew.Params[0])
 	}
 	se.setDifficulty(2)
 	c.countSteal(se.pool, se.markCommissionSubmit("7", "fee.worker"))
@@ -131,11 +107,11 @@ func TestCommissionStealAndCount(t *testing.T) {
 
 	snap := c.Snapshot()
 	if snap.Attempts != 2 || snap.Accepted != 1 || snap.Rejected != 1 {
-		t.Errorf("счётчики комиссии = attempts=%d accepted=%d rejected=%d, want 2/1/1",
+		t.Errorf("счётчики комиссии = attempts=%v accepted=%v rejected=%v, want 2/1/1",
 			snap.Attempts, snap.Accepted, snap.Rejected)
 	}
 	if snap.TakenToday != 1 {
-		t.Errorf("taken_today = %d, want 1", snap.TakenToday)
+		t.Errorf("taken_today = %v, want 1", snap.TakenToday)
 	}
 	// work: изъято diff 2+4=6, зачтено 2, отклонено 4.
 	if snap.WorkIssued != 6 || snap.WorkAccepted != 2 || snap.WorkRejected != 4 {
@@ -144,7 +120,7 @@ func TestCommissionStealAndCount(t *testing.T) {
 	}
 	// Майнеру засчитана только третья шара — комиссионные в stats не попали.
 	if stats.Submits() != 1 || stats.Accepted() != 1 {
-		t.Errorf("майнерские submits=%d accepted=%d, want 1/1", stats.Submits(), stats.Accepted())
+		t.Errorf("майнерские submits=%v accepted=%v, want 1/1", stats.Submits(), stats.Accepted())
 	}
 }
 
@@ -156,7 +132,7 @@ func TestIterationSchedulesBudget(t *testing.T) {
 	next := c.iterate(now)
 	// Первая итерация начислила бюджет и запланировала следующую в текущем окне.
 	if c.iterationsUsed != 1 {
-		t.Errorf("iterations_used = %d, want 1", c.iterationsUsed)
+		t.Errorf("iterations_used = %v, want 1", c.iterationsUsed)
 	}
 	if next.IsZero() || next.Before(now) || next.After(c.windowStart.Add(commissionWindow)) {
 		t.Errorf("next iteration = %v, должно быть между now и концом окна (%v)",
@@ -168,7 +144,7 @@ func TestIntervalProportionalBudget(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("test.com", 2, 0, 10*time.Minute, 0, stats)
 	if c.iterationsPerDay != 144 {
-		t.Fatalf("iterationsPerDay = %d, want 144 (24h/10m)", c.iterationsPerDay)
+		t.Fatalf("iterationsPerDay = %v, want 144 (24h/10m)", c.iterationsPerDay)
 	}
 
 	now := c.windowStart
@@ -182,7 +158,7 @@ func TestIntervalProportionalBudget(t *testing.T) {
 	accept(200)
 	next := c.iterate(now.Add(10 * time.Minute))
 	if c.takeBudget != 4 || c.budgetIssued != 4 {
-		t.Errorf("после 1-го тика budget=%d issued=%d, want 4/4", c.takeBudget, c.budgetIssued)
+		t.Errorf("после 1-го тика budget=%v issued=%v, want 4/4", c.takeBudget, c.budgetIssued)
 	}
 	if !next.After(now.Add(10 * time.Minute)) {
 		t.Errorf("next = %v, want after 10m", next)
@@ -192,17 +168,17 @@ func TestIntervalProportionalBudget(t *testing.T) {
 	accept(100)
 	c.iterate(now.Add(20 * time.Minute))
 	if c.takeBudget != 6 || c.budgetIssued != 6 {
-		t.Errorf("после 2-го тика budget=%d issued=%d, want 6/6", c.takeBudget, c.budgetIssued)
+		t.Errorf("после 2-го тика budget=%v issued=%v, want 6/6", c.takeBudget, c.budgetIssued)
 	}
 
 	// Третий тик без новых шар: цель не растёт, изъятия нет (кап).
 	c.iterate(now.Add(30 * time.Minute))
 	if c.takeBudget != 6 || c.budgetIssued != 6 {
-		t.Errorf("без новых шар budget=%d issued=%d, want 6/6", c.takeBudget, c.budgetIssued)
+		t.Errorf("без новых шар budget=%v issued=%v, want 6/6", c.takeBudget, c.budgetIssued)
 	}
 	// Суммарно за окно — не более percent% от принятых.
-	if c.budgetIssued > int(float64(300)*0.02) {
-		t.Errorf("issued %d превышает 2%% от 300", c.budgetIssued)
+	if c.budgetIssued > float64(300)*0.02 {
+		t.Errorf("issued %v превышает 2%% от 300", c.budgetIssued)
 	}
 }
 
@@ -214,7 +190,7 @@ func TestIntervalWindowReset(t *testing.T) {
 	}
 	c.iterate(c.windowStart.Add(10 * time.Minute))
 	if c.budgetIssued != 4 {
-		t.Fatalf("issued = %d, want 4", c.budgetIssued)
+		t.Fatalf("issued = %v, want 4", c.budgetIssued)
 	}
 
 	old := c.windowStart
@@ -223,7 +199,7 @@ func TestIntervalWindowReset(t *testing.T) {
 		t.Fatal("окно не сброшено")
 	}
 	if c.budgetIssued != 0 || c.takeBudget != 0 || c.iterationsUsed != 1 {
-		t.Errorf("после сброса issued=%d budget=%d iters=%d, want 0/0/1",
+		t.Errorf("после сброса issued=%v budget=%v iters=%v, want 0/0/1",
 			c.budgetIssued, c.takeBudget, c.iterationsUsed)
 	}
 }
@@ -240,10 +216,10 @@ func TestCommissionWindowReset(t *testing.T) {
 		t.Errorf("окно не сброшено: start %v -> %v", oldStart, c.windowStart)
 	}
 	if c.iterationsUsed != 1 {
-		t.Errorf("iterations_used после сброса = %d, want 1 (первая итерация нового окна)", c.iterationsUsed)
+		t.Errorf("iterations_used после сброса = %v, want 1 (первая итерация нового окна)", c.iterationsUsed)
 	}
 	if c.taken != 0 || c.takeBudget != 0 {
-		t.Errorf("счётчики окна должны обнуляться: taken=%d budget=%d", c.taken, c.takeBudget)
+		t.Errorf("счётчики окна должны обнуляться: taken=%v budget=%v", c.taken, c.takeBudget)
 	}
 }
 
@@ -264,6 +240,7 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	defer poolSide.Close()
 
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	se.setDifficulty(1)
 	defer se.close()
 
 	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
@@ -357,6 +334,7 @@ func TestFeeDifficultyNotLeakedToMiner(t *testing.T) {
 	defer minerOut.Close()
 
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	se.setDifficulty(1)
 	defer se.close()
 
 	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
@@ -458,6 +436,7 @@ func TestCommissionWorkCountedAtFeeDifficulty(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("fee.worker", 2, 40, 0, 0, stats)
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	se.setDifficulty(1)
 	defer se.close()
 
 	se.setDifficulty(16384)
@@ -497,7 +476,7 @@ func TestCommissionSessionGatesReserve(t *testing.T) {
 		t.Fatal("внутри окна reserve должен вернуть true")
 	}
 	if c.takeBudget != 4 {
-		t.Errorf("takeBudget = %d, want 4", c.takeBudget)
+		t.Errorf("takeBudget = %v, want 4", c.takeBudget)
 	}
 
 	// Окно ещё не началось.
@@ -507,7 +486,7 @@ func TestCommissionSessionGatesReserve(t *testing.T) {
 		t.Fatal("до начала окна reserve должен вернуть false")
 	}
 	if c.takeBudget != 4 {
-		t.Errorf("вне окна бюджет не должен тратиться: takeBudget = %d", c.takeBudget)
+		t.Errorf("вне окна бюджет не должен тратиться: takeBudget = %v", c.takeBudget)
 	}
 
 	// Окно уже закончилось.
@@ -594,7 +573,7 @@ func TestCommissionPerPoolBreakdown(t *testing.T) {
 
 	rep := c.Snapshot()
 	if len(rep.Pools) != 2 {
-		t.Fatalf("pools = %d, want 2: %+v", len(rep.Pools), rep.Pools)
+		t.Fatalf("pools = %v, want 2: %+v", len(rep.Pools), rep.Pools)
 	}
 	// Сортировка по имени пула.
 	gate, other := rep.Pools[0], rep.Pools[1]
@@ -723,6 +702,7 @@ func TestPipeMinerToPoolRotatedWorker(t *testing.T) {
 	defer poolSide.Close()
 
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	se.setDifficulty(1)
 	defer se.close()
 
 	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
@@ -767,7 +747,7 @@ func TestPipeMinerToPoolRotatedWorker(t *testing.T) {
 func TestCommissionSuggestDifficulty(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithSuggestDifficulty())
-	c.takeBudget = 2
+	c.takeBudget = 16384 + 16
 
 	clientConn, minerIn := net.Pipe()
 	defer clientConn.Close()
@@ -783,6 +763,7 @@ func TestCommissionSuggestDifficulty(t *testing.T) {
 	defer minerOut.Close()
 
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	se.setDifficulty(1)
 	defer se.close()
 
 	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
@@ -886,6 +867,7 @@ func TestCommissionNoSuggestWhenPoolKeepsDifficulty(t *testing.T) {
 	defer minerOut.Close()
 
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	se.setDifficulty(1)
 	defer se.close()
 
 	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)

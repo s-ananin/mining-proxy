@@ -316,14 +316,18 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if IsMinerSubmit(line) {
 			id, _ := SubmitID(line)
 			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() && !se.restoringMiner() {
+				reservedWork := se.difficulty()
+				if feeAuth && se.feeDifficulty() > 0 {
+					reservedWork = se.feeDifficulty()
+				}
+				reservedAt := time.Now()
 				reserved := false
 				if feeAuth {
-					reserved = commission.reserve(se.pool)
+					reserved = commission.reserve(se.pool, reservedWork)
 				} else if se.feeEntryAllowed() {
-					reserved = commission.reserveEntry(se.pool)
+					reserved = commission.reserveEntry(se.pool, reservedWork)
 				}
 				if reserved {
-					reservedAt := time.Now()
 					// Сначала открываем служебную авторизацию: она
 					// фиксирует имя воркера, под которым пойдёт эта
 					// шара (authorize и submit должны совпадать).
@@ -350,6 +354,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					}
 					if err == nil && rewritten != nil {
 						diff := se.markCommissionSubmit(id, feeWorker)
+						commission.settleReservation(reservedAt, reservedWork, diff)
 						ack := se.armCommissionAck()
 						instant, avg := commission.countSteal(se.pool, diff)
 						log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s, diff %g, сложность майнера %g, мгновенно %.2f TH/s, avg %.2f TH/s)",
@@ -373,16 +378,17 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 						continue
 					}
 					if skipped {
-						commission.deferDifficulty(se.pool, reservedAt)
+						commission.deferDifficulty(se.pool, reservedAt, reservedWork)
+					}
+					if !skipped {
+						commission.settleReservation(reservedAt, reservedWork, 0)
+						commission.countFailed(se.pool)
 					}
 					// Не удалось — fail-open: шару не трогаем.
 					if feeAuth {
 						if !restoreMinerAuth() {
 							return
 						}
-					}
-					if !skipped {
-						commission.countFailed(se.pool)
 					}
 					// A deferred preparation is counted once by deferDifficulty.
 				} else if feeAuth {

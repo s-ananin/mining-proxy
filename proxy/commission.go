@@ -1,34 +1,15 @@
 // Файл commission.go — «комиссия» за использование инфраструктуры.
 //
-// ТЗ заказчика: за сутки на commission_worker должно уйти ~commission_percent
-// процентов принятых шар, изъятие происходит порциями (итерациями) в
-// случайные моменты, но не чаще commission_iteration раз в сутки.
-//
-// Как работает:
-//
-//   - суточное окно (скользящие 24h): target = процент от принятых за окно
-//     шар (accepted реестра Stats — подтверждённые реальным пулом);
-//   - есть два режима изъятия:
-//     1) фиксированный интервал (commission_interval, напр. "10m"):
-//     каждые N планировщик добирает бюджет до target. target растёт по мере
-//     принятия шар, поэтому порция пропорциональна принятым за интервал
-//     шарам, а сумма выданного бюджета никогда не превышает target
-//     (кап — commission_percent% за сутки). Если задан commission_session
-//     (напр. "20m"), изъятие дополнительно ограничено одним окном такой
-//     длины внутри каждого интервала; начало окна выбирается случайно,
-//     вне окна шары не изымаются;
-//     2) случайные итерации (commission_iteration, дефолт 40/сутки):
-//     batch = ceil((target - уже взято) / оставшиеся итерации). Так процент
-//     сходится к target, а число изъятий не превышает commission_iteration;
-//   - в момент итерации следующие batch mining.submit из ЛЮБОГО ASIC уходят в
-//     ТОТ ЖЕ upstream-соединение майнера (job_id/extranonce1 сохраняются),
-//     но воркер подменяется на commission_worker. Пул привязывает воркер к
-//     mining.authorize, поэтому одной подмены params[0] мало: на время
-//     изъятия прокси отправляет в пул служебный mining.authorize с
-//     commission_worker, а в конце возвращает воркер майнера. Так authorize и
-//     submit согласованы, и шары засчитываются комиссии;
-//   - fail-open: если переписать шару не удалось, она уходит как обычно,
-//     комиссия НЕ изымается. Майнинг клиента не прерывается никогда.
+// Бюджет — commission_percent% суммы сложностей принятых обычных шар.
+// Каждая комиссионная шара расходует сложность, с которой её зачтёт пул,
+// поэтому разная сложность ASIC и vardiff комиссии не обесценивают бюджет.
+// Планировщик выдаёт работу порциями: с фиксированным интервалом либо
+// случайными итерациями в суточном окне. session ограничивает время изъятия.
+// Изъятие использует исходное upstream-соединение и служебную авторизацию;
+// job_id и extranonce сохраняются. После порции восстанавливается майнер.
+// Неотправленная работа возвращается в бюджет; отклонённая работа повторно
+// планируется на следующем тике. Превышение на последнюю зарезервированную
+// шару переносится как отрицательный баланс на следующие тики.
 //
 // Комиссия учитывается в своих счётчиках (/status.commission) и НЕ влияет на
 // totals/workers штатного мониторинга: забранные шары не регистрируются как
@@ -39,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -174,7 +156,7 @@ type poolBreaker struct {
 // реальный пул майнера, а отправляется в тот же upstream с подменённым
 // воркером (params[0]). Так сохраняются job_id и extranonce1 соединения, и
 // шара остаётся валидной для пула. Решения по изъятию принимаются глобально
-// по всем ASIC, как и процент в ТЗ (25000 -> 500).
+// по всем ASIC; бюджет выражен в сумме сложностей шар.
 type Commission struct {
 	mu   sync.Mutex
 	stop chan struct{}
@@ -210,15 +192,17 @@ type Commission struct {
 
 	// Состояние суточного окна.
 	windowStart     time.Time
-	baseAccepted    int // stats.Accepted() в момент начала окна
-	taken           int // принято комиссионных шар за окно
-	attempts        int // всего перенаправлено за всё время
-	acceptedCnt     int // из них принято пулом
-	rejectedCnt     int // отклонено пулом
-	failedCnt       int // ошибок перенаправления / недоступности пула
-	iterationsUsed  int // итераций в текущем окне
-	takeBudget      int // сколько следующих шар забрать (порция итерации)
-	budgetIssued    int // выдано бюджета за окно (interval-режим, кап на target)
+	baseWork        float64
+	baseFeeWork     float64
+	baseAccepted    int     // stats.Accepted() в момент начала окна
+	taken           int     // принято комиссионных шар за окно
+	attempts        int     // всего перенаправлено за всё время
+	acceptedCnt     int     // из них принято пулом
+	rejectedCnt     int     // отклонено пулом
+	failedCnt       int     // ошибок перенаправления / недоступности пула
+	iterationsUsed  int     // итераций в текущем окне
+	takeBudget      float64 // оставшаяся сумма сложностей; отрицательное значение — долг
+	budgetIssued    float64 // выдано бюджета за окно (interval-режим, кап на target)
 	nextIterationAt time.Time
 
 	// Активное окно изъятия текущего интервала (session > 0).
@@ -290,6 +274,7 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 		stats:            stats,
 		windowStart:      now,
 		baseAccepted:     stats.Accepted(),
+		baseWork:         stats.AcceptedWork(),
 		perPool:          map[string]*poolCommission{},
 		breakers:         map[string]*poolBreaker{},
 		breakerLogs:      map[string]time.Time{},
@@ -385,7 +370,7 @@ func (c *Commission) scheduler() {
 	}
 }
 
-// iterate выполняет одну итерацию изъятия: начисляет порцию следующих шар
+// iterate выполняет одну итерацию изъятия: начисляет порцию работы
 // на бюджет и планирует следующую итерацию. Возвращает момент следующей.
 func (c *Commission) iterate(now time.Time) time.Time {
 	c.mu.Lock()
@@ -397,6 +382,8 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	if !now.Before(c.windowStart.Add(commissionWindow)) {
 		c.windowStart = now
 		c.baseAccepted = c.stats.Accepted()
+		c.baseWork = c.stats.AcceptedWork()
+		c.baseFeeWork = c.workAccepted
 		c.taken = 0
 		c.iterationsUsed = 0
 		c.takeBudget = 0
@@ -405,12 +392,12 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	end := c.windowStart.Add(commissionWindow)
 
 	// Фиксированный интервал: каждый тик добираем бюджет до текущего target
-	// = percent% принятых за окно. target растёт вместе с accepted, поэтому
-	// порция пропорциональна принятым за интервал шарам, а сумма выданного
+	// = percent% принятой за окно работы. target растёт вместе с работой, поэтому
+	// порция пропорциональна принятой работе, а сумма выданного
 	// за окно бюджета не превышает target (суточный кап на процент).
 	if c.interval > 0 {
-		acceptedToday := c.stats.Accepted() - c.baseAccepted
-		target := int(float64(acceptedToday) * c.percent / 100)
+		acceptedToday := c.stats.AcceptedWork() - c.baseWork
+		target := acceptedToday * c.percent / 100
 		batch := target - c.budgetIssued
 		if batch < 0 {
 			batch = 0
@@ -438,11 +425,11 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		}
 		if batch > 0 {
 			if c.session > 0 {
-				log.Printf("[COMMISSION] every %s: batch %d (accepted today=%d, target≈%d, issued=%d, session %s..%s)",
+				log.Printf("[COMMISSION] every %s: work budget %.3f (accepted work=%.3f, target=%.3f, issued=%.3f, session %s..%s)",
 					c.interval, batch, acceptedToday, target, c.budgetIssued,
 					c.sessionStart.Format("15:04:05"), c.sessionEnd.Format("15:04:05"))
 			} else {
-				log.Printf("[COMMISSION] every %s: batch %d (accepted today=%d, target≈%d, issued=%d)",
+				log.Printf("[COMMISSION] every %s: work budget %.3f (accepted work=%.3f, target=%.3f, issued=%.3f)",
 					c.interval, batch, acceptedToday, target, c.budgetIssued)
 			}
 		}
@@ -473,18 +460,20 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		return end.Add(time.Minute)
 	}
 
-	acceptedToday := c.stats.Accepted() - c.baseAccepted
-	batch := planBatch(acceptedToday, c.taken, iterationsLeft, c.percent)
+	acceptedToday := c.stats.AcceptedWork() - c.baseWork
+	target := acceptedToday * c.percent / 100
+	batch := math.Max(0, target-c.budgetIssued) / float64(iterationsLeft)
 	c.takeBudget += batch
+	c.budgetIssued += batch
 	c.iterationsUsed++
 	if batch > 0 {
 		// Новое окно изъятия — новое имя воркера (если включена ротация).
 		c.advanceWindowWorkerLocked()
 	}
 	if batch > 0 {
-		log.Printf("[COMMISSION] iteration %d/%d: batch %d (accepted today=%d, target≈%d, taken=%d)",
+		log.Printf("[COMMISSION] iteration %d/%d: work budget %.3f (accepted work=%.3f, target=%.3f, taken=%.3f)",
 			c.iterationsUsed, c.iterationsPerDay, batch, acceptedToday,
-			int(float64(acceptedToday)*c.percent/100), c.taken)
+			target, c.workAccepted-c.baseFeeWork)
 	}
 
 	// Следующая итерация — случайный момент, равномерно размазанный по
@@ -508,21 +497,6 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	}
 	c.nextIterationAt = next
 	return next
-}
-
-// planBatch считает порцию шар для текущей итерации: сколько ещё нужно
-// изъять за оставшиеся итерации (округляем вверх). Чистая функция —
-// вынесена для тестирования. Возвращает 0, если изымать нечего.
-func planBatch(acceptedToday, taken, iterationsLeft int, percent float64) int {
-	if iterationsLeft <= 0 {
-		return 0
-	}
-	target := int(float64(acceptedToday) * percent / 100)
-	need := target - taken
-	if need <= 0 {
-		return 0
-	}
-	return (need + iterationsLeft - 1) / iterationsLeft
 }
 
 // poolLocked возвращает (создавая при необходимости) счётчики по пулу.
@@ -564,13 +538,24 @@ func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
 //
 // Если задано окно изъятия (session > 0), шара забирается только внутри
 // текущего окна; вне окна бюджет не тратится и переносится на следующее окно.
-func (c *Commission) reserve(pool string) bool {
+func (c *Commission) reserve(pool string, difficulty ...float64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.reserveLocked(pool)
+	return c.reserveLocked(pool, difficulty...)
 }
 
-func (c *Commission) reserveLocked(pool string) bool {
+func reservationWork(difficulty []float64) float64 {
+	if len(difficulty) > 0 {
+		return difficulty[0]
+	}
+	return 1
+}
+
+func (c *Commission) reserveLocked(pool string, difficulty ...float64) bool {
+	work := reservationWork(difficulty)
+	if work <= 0 || math.IsNaN(work) || math.IsInf(work, 0) {
+		return false
+	}
 	if c.worker == "" || c.takeBudget <= 0 {
 		return false
 	}
@@ -583,12 +568,12 @@ func (c *Commission) reserveLocked(pool string) bool {
 			return false
 		}
 	}
-	c.takeBudget--
+	c.takeBudget -= work
 	return true
 }
 
 // A busy authorization gate skips entry; it never sleeps in a submit pipe.
-func (c *Commission) reserveEntry(pool string) bool {
+func (c *Commission) reserveEntry(pool string, difficulty ...float64) bool {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
 	now := time.Now()
@@ -597,7 +582,7 @@ func (c *Commission) reserveEntry(pool string) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.reserveLocked(pool) {
+	if !c.reserveLocked(pool, difficulty...) {
 		return false
 	}
 	c.lastAuth = now
@@ -605,7 +590,7 @@ func (c *Commission) reserveEntry(pool string) bool {
 }
 
 // Refund unsent work and retry later, rather than reauthorizing on each share.
-func (c *Commission) deferDifficulty(pool string, reservedAt time.Time) {
+func (c *Commission) deferDifficulty(pool string, reservedAt time.Time, difficulty ...float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
@@ -620,7 +605,7 @@ func (c *Commission) deferDifficulty(pool string, reservedAt time.Time) {
 	}
 	b.difficultyRetryAt = retryAt
 	if !reservedAt.Before(c.windowStart) {
-		c.takeBudget++
+		c.takeBudget += reservationWork(difficulty)
 	}
 	c.failedCnt++
 	c.poolLocked(pool).failed++
@@ -717,19 +702,28 @@ func (c *Commission) countSteal(pool string, diff float64) (instant, avg float64
 	return p.stealRateLocked(time.Now(), diff)
 }
 
-func (c *Commission) countResult(pool string, accepted bool, diff float64) {
+func (c *Commission) countResult(pool string, accepted bool, diff float64, submittedAt ...time.Time) {
+	c.stats.commissionResult(diff, accepted)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	p := c.poolLocked(pool)
 	if accepted {
 		c.acceptedCnt++
-		c.taken++
+		if len(submittedAt) == 0 || !submittedAt[0].Before(c.windowStart) {
+			c.taken++
+		} else {
+			c.baseFeeWork += diff
+		}
 		c.workAccepted += diff
 		p.accepted++
 		p.workAccepted += diff
 	} else {
 		c.rejectedCnt++
 		c.workRejected += diff
+		// Retry rejected work at the next scheduled tick, never in a tight loop.
+		if len(submittedAt) == 0 || !submittedAt[0].Before(c.windowStart) {
+			c.budgetIssued -= diff
+		}
 		p.rejected++
 		p.workRejected += diff
 	}
@@ -771,7 +765,7 @@ type PoolCommissionReport struct {
 type CommissionReport struct {
 	Enabled          bool                   `json:"enabled"`
 	Worker           string                 `json:"worker,omitempty"`
-	WindowWorker     string                 `json:"window_worker,omitempty"`
+	WindowWorker     string                 `json:"-"`
 	WorkerRotate     bool                   `json:"worker_rotate,omitempty"`
 	Percent          float64                `json:"percent,omitempty"`
 	Interval         string                 `json:"interval,omitempty"`
@@ -783,17 +777,18 @@ type CommissionReport struct {
 	Accepted         int                    `json:"accepted"`
 	Rejected         int                    `json:"rejected"`
 	Failed           int                    `json:"failed"`
-	WorkIssued       float64                `json:"work_issued"`
-	WorkAccepted     float64                `json:"work_accepted"`
-	WorkRejected     float64                `json:"work_rejected"`
+	WorkIssued       float64                `json:"-"`
+	WorkAccepted     float64                `json:"-"`
+	WorkRejected     float64                `json:"-"`
+	EffectivePercent float64                `json:"effective_percent"`
 	AcceptedToday    int                    `json:"accepted_today"`
-	TargetToday      int                    `json:"target_today"`
+	TargetToday      float64                `json:"-"`
 	TakenToday       int                    `json:"taken_today"`
 	IterationsUsed   int                    `json:"iterations_used"`
 	IterationsLeft   int                    `json:"iterations_left"`
 	NextIterationAt  string                 `json:"next_iteration_at,omitempty"`
 	WindowEnd        string                 `json:"window_end,omitempty"`
-	Pools            []PoolCommissionReport `json:"pools,omitempty"`
+	Pools            []PoolCommissionReport `json:"-"`
 }
 
 // intervalString возвращает читаемое представление интервала ("" если 0).
@@ -812,7 +807,7 @@ func (c *Commission) Snapshot() CommissionReport {
 		return CommissionReport{Enabled: false}
 	}
 	acceptedToday := c.stats.Accepted() - c.baseAccepted
-	target := int(float64(acceptedToday) * c.percent / 100)
+	target := (c.stats.AcceptedWork() - c.baseWork) * c.percent / 100
 	left := c.iterationsPerDay - c.iterationsUsed
 	if left < 0 {
 		left = 0
@@ -835,6 +830,7 @@ func (c *Commission) Snapshot() CommissionReport {
 		WorkRejected:     c.workRejected,
 		AcceptedToday:    acceptedToday,
 		TargetToday:      target,
+		EffectivePercent: workPercent(c.workAccepted-c.baseFeeWork, c.stats.AcceptedWork()-c.baseWork),
 		TakenToday:       c.taken,
 		IterationsUsed:   c.iterationsUsed,
 		IterationsLeft:   left,
@@ -888,4 +884,32 @@ func (c *Commission) difficultyRetryStringLocked(pool string, now time.Time) str
 		return b.difficultyRetryAt.Format(time.RFC3339)
 	}
 	return ""
+}
+
+// settleReservation reconciles the estimated work with the pool's fee difficulty.
+// A negative balance is carried to the next tick, bounding overshoot to shares
+// already reserved by concurrent connections. Unsent shares refund the estimate.
+func (c *Commission) settleReservation(at time.Time, reserved, actual float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !at.Before(c.windowStart) {
+		c.takeBudget += reserved - actual
+	}
+}
+
+func workPercent(fee, ordinary float64) float64 {
+	if ordinary <= 0 {
+		return 0
+	}
+	return fee / ordinary * 100
+}
+
+// Unanswered shares are not rejects. Retry their work on the next tick.
+func (c *Commission) lostWork(diff float64, at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !at.Before(c.windowStart) {
+		c.budgetIssued -= diff
+	}
+	c.failedCnt++
 }

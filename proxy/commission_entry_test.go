@@ -71,12 +71,12 @@ func TestCommissionEntryDoesNotQueueOrdinaryShares(t *testing.T) {
 			c.mu.Lock()
 			budget := c.takeBudget
 			c.mu.Unlock()
-			want := 6
+			want := float64(6)
 			if scenario == "lower_diff_backoff" {
-				want = 5
+				want = 6 - 16384
 			}
 			if budget != want {
-				t.Fatalf("budget=%d, want %d", budget, want)
+				t.Fatalf("budget=%v, want %v", budget, want)
 			}
 		})
 	}

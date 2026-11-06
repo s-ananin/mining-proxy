@@ -85,16 +85,18 @@ type workerStat struct {
 // Stats потокобезопасный реестр. Все методы можно вызывать из разных
 // goroutine (по одной на соединение).
 type Stats struct {
-	mu          sync.Mutex
-	start       time.Time
-	connsTotal  int
-	connsActive int
-	submits     int
-	accepted    int
-	rejected    int
-	lost        int
-	pools       map[string]*poolStat
-	workers     map[string]*workerStat
+	mu           sync.Mutex
+	start        time.Time
+	connsTotal   int
+	connsActive  int
+	submits      int
+	accepted     int
+	acceptedWork float64
+	averages     workHistory
+	rejected     int
+	lost         int
+	pools        map[string]*poolStat
+	workers      map[string]*workerStat
 }
 
 // NewStats создаёт пустой реестр.
@@ -205,7 +207,7 @@ func (s *Stats) Submits() int {
 }
 
 // Accepted возвращает число принятых реальным пулом шар. Используется
-// комиссией для расчёта суточного target (percent от accepted).
+// счётчиками мониторинга; бюджет комиссии использует AcceptedWork().
 func (s *Stats) Accepted() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -222,11 +224,14 @@ func (s *Stats) Result(pool, worker string, difficulty float64, accepted bool, e
 	w := s.getWorker(pool, worker, now)
 	if accepted {
 		s.accepted++
+		s.acceptedWork += difficulty
+		s.averages.add(now, normalAccepted, difficulty)
 		p.accepted++
 		w.accepted++
 		w.samples = trimSamples(append(w.samples, shareSample{at: now, diff: difficulty}))
 	} else {
 		s.rejected++
+		s.averages.add(now, normalRejected, difficulty)
 		p.rejected++
 		w.rejected++
 		if errText != "" {
@@ -340,10 +345,11 @@ type PoolReport struct {
 
 // Report — полный снимок реестра для /status.
 type Report struct {
-	Uptime  string         `json:"uptime"`
-	Totals  Totals         `json:"totals"`
-	Pools   []PoolReport   `json:"pools"`
-	Workers []WorkerReport `json:"workers"`
+	Avg     map[string]AverageReport `json:"avg"`
+	Uptime  string                   `json:"uptime"`
+	Totals  Totals                   `json:"totals"`
+	Pools   []PoolReport             `json:"pools"`
+	Workers []WorkerReport           `json:"workers"`
 }
 
 // Report строит снимок статистики. Счётчики копируются под мьютексом,
@@ -356,6 +362,7 @@ func (s *Stats) Report() Report {
 
 	rep := Report{
 		Uptime: now.Sub(s.start).Round(time.Second).String(),
+		Avg:    s.averages.report(s.start, now),
 		Totals: Totals{
 			ConnectionsActive: s.connsActive,
 			ConnectionsTotal:  s.connsTotal,
@@ -473,4 +480,21 @@ func percent(accepted, total int) float64 {
 		return 0
 	}
 	return math.Round(float64(accepted)/float64(total)*10000) / 100
+}
+
+// AcceptedWork returns the cumulative difficulty of accepted ordinary shares.
+func (s *Stats) AcceptedWork() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acceptedWork
+}
+
+func (s *Stats) commissionResult(diff float64, accepted bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kind := feeRejected
+	if accepted {
+		kind = feeAccepted
+	}
+	s.averages.add(time.Now(), kind, diff)
 }
