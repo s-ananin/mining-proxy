@@ -45,15 +45,14 @@ func TestWorkBudgetMixedDifficultyAndFeeVardiff(t *testing.T) {
 	if c.hasBudget("a") {
 		t.Fatal("rejected share retried immediately")
 	}
+	// The miner's rejected share is spent: it is not re-issued on the next tick.
 	c.iterate(now.Add(5 * time.Minute))
-	nearWork(t, c.takeBudget, target-16384)
-	// Unanswered work is retried too, but does not count as a rejection.
-	if !c.reserve("a", 16384) {
-		t.Fatal("missing retry budget")
-	}
+	nearWork(t, c.takeBudget, target-2*16384)
+	// Unanswered work is charged too and does not count as a rejection.
 	c.lostWork(16384, at)
 	c.iterate(now.Add(10 * time.Minute))
-	nearWork(t, c.takeBudget, target-16384)
+	nearWork(t, c.takeBudget, target-2*16384)
+	nearWork(t, c.budgetIssued, target)
 	nearWork(t, c.Snapshot().EffectivePercent, 16384/(100*16384.0+524288)*100)
 }
 

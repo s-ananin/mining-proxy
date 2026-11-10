@@ -83,6 +83,10 @@ func main() {
 		if cfg.CommissionSuggestDifficulty {
 			opts = append(opts, proxy.WithSuggestDifficulty())
 		}
+		// Комиссия на адресе пула — только после того, как пул принял
+		// commission_worker в отдельном проверочном соединении (пул комиссии
+		// на динамическом IP, белый список адресов не годится).
+		opts = append(opts, proxy.WithPoolProbe(nil))
 		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, cfg.CommissionSessionEvery, stats, opts...)
 		commission.Start()
 		defer commission.Close()

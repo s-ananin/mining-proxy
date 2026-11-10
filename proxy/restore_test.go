@@ -166,23 +166,12 @@ func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 		c.mu.Unlock()
 		tail := submit(id+1, feeJob)
 		write(miner, tail)
-		if line := read(pool, poolReader); line != tail {
-			t.Fatalf("tail was blocked or changed: %s", line)
-		}
 		c.mu.Lock()
 		remaining := c.takeBudget
 		c.takeBudget = 0
 		c.mu.Unlock()
 		if remaining != 1 {
 			t.Fatal("restore consumed another fee budget")
-		}
-		poolResponse := ack(id + 1)
-		if window == 1 {
-			poolResponse = fmt.Sprintf(`{"id":%d,"result":false,"error":[21,"unknown job id",null]}`, id+1)
-		}
-		write(pool, poolResponse)
-		if line := read(miner, minerReader); line != poolResponse {
-			t.Fatalf("pool decision changed: %s", line)
 		}
 		job = fmt.Sprintf("main-%d", window)
 		restoreAck := `{"id":"__commission_restore__","result":true,"error":null}`
@@ -203,6 +192,17 @@ func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 		}
 		if line := read(miner, minerReader); line != notify(job) {
 			t.Fatalf("pool notify changed: %s", line)
+		}
+		if line := read(pool, poolReader); line != tail {
+			t.Fatalf("tail changed: %s", line)
+		}
+		poolResponse := ack(id + 1)
+		if window == 1 {
+			poolResponse = fmt.Sprintf(`{"id":%d,"result":false,"error":[21,"unknown job id",null]}`, id+1)
+		}
+		write(pool, poolResponse)
+		if line := read(miner, minerReader); line != poolResponse {
+			t.Fatalf("pool decision changed: %s", line)
 		}
 		rawSubmit := submit(id+2, job)
 		write(miner, rawSubmit)

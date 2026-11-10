@@ -58,6 +58,8 @@ func TestCommissionEntryDoesNotQueueOrdinaryShares(t *testing.T) {
 				if WorkerFromAuthorize([]byte(line)) != "fee.worker" {
 					t.Fatalf("lower fee diff wrongly blocked: %s", line)
 				}
+				se.confirmFeeAuthorization(true)
+				se.setFeeDiff(8192)
 				line, err = r.ReadString('\n')
 				if err != nil || WorkerFromSubmit([]byte(line)) != "fee.worker" {
 					t.Fatalf("lower fee diff submit stalled: %s (%v)", line, err)
@@ -73,7 +75,7 @@ func TestCommissionEntryDoesNotQueueOrdinaryShares(t *testing.T) {
 			c.mu.Unlock()
 			want := float64(6)
 			if scenario == "lower_diff_backoff" {
-				want = 6 - 16384
+				want = 6 - 8192
 			}
 			if budget != want {
 				t.Fatalf("budget=%v, want %v", budget, want)

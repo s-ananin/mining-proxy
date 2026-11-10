@@ -217,7 +217,8 @@ func sniffStratum(reader *bufio.Reader) (bool, [][]byte) {
 // params[0] мало. На время изъятия прокси отправляет в пул служебный
 // mining.authorize с commission_worker (feeAuth), а params[0] шар приводит к
 // тому же воркеру; когда бюджет исчерпан — возвращает authorize на воркер
-// майнера. job_id/extranonce1 соединения сохраняются, шары остаются валидными.
+// майнера. Перед отправкой проверяются авторизация, сложность и известные
+// сбросы задания/extranonce; job_id и параметры самой шары не меняются.
 func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se *session, commission *Commission) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, lineBuf), maxLineSize)
@@ -241,8 +242,8 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 	// writeSuggestDifficulty просит у пула закрепить сложность сессии на
 	// указанном уровне (mining.suggest_difficulty). Ответ пула на этот id
 	// майнеру не показывается.
-	writeSuggestDifficulty := func(diff float64) bool {
-		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+	writeSuggestDifficulty := func(diff float64, deadline time.Time) bool {
+		dst.SetWriteDeadline(deadline)
 		if err := writeLine(dst, miningSuggestDifficultyLine(diff, commissionDiffTag)); err != nil {
 			log.Printf("[CONN] miner->pool suggest_difficulty: %v", err)
 			return false
@@ -268,21 +269,34 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		return true
 	}
 
-	// A suggestion is advisory: neither its reply nor set_difficulty may
-	// block submitting work. Shares found at miner difficulty also meet a
-	// lower fee difficulty; account for the actual fee value in the session.
+	// Confirm authorization and the actual fee difficulty before sending work.
+	// A suggest reply is advisory; only set_difficulty can make a higher target
+	// safe. Keep lower fee difficulty flowing without waiting for a correction.
 	ensurePoolDifficulty := func() bool {
-		target, actual := se.difficulty(), se.feeDifficulty()
-		if target <= 0 {
-			return true
-		}
-		if commission != nil && commission.SuggestDifficulty() && actual > 0 && actual != target && se.allowSuggest() {
-			if !writeSuggestDifficulty(target) {
+		deadline := time.Now().Add(time.Second)
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		for {
+			ready, denied, changed := se.feePreparation()
+			if denied {
 				return false
 			}
-			se.markSuggestSent()
+			target, actual := se.difficulty(), se.feeDifficulty()
+			if ready && target > 0 && actual <= target {
+				return true
+			}
+			if ready && target > 0 && actual > target && commission.SuggestDifficulty() && se.allowSuggest() {
+				if !writeSuggestDifficulty(target, deadline) {
+					return false
+				}
+				se.markSuggestSent()
+			}
+			select {
+			case <-changed:
+			case <-timer.C:
+				return false
+			}
 		}
-		return actual <= 0 || actual <= target
 	}
 
 	// Restore before the ASIC finds another share. Keep suppression active
@@ -336,7 +350,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					if ensureFeeAuth() {
 						// Lower fee difficulty is acceptable; never wait for
 						// it to rise. Higher difficulty is deferred.
-						if ensurePoolDifficulty() {
+						if ensurePoolDifficulty() && se.commissionJobAllowed(line) {
 							md := se.difficulty()
 							fd := se.feeDifficulty()
 							if fd > 0 && md > 0 && fd > md+1e-12 {
@@ -354,7 +368,13 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					}
 					if err == nil && rewritten != nil {
 						diff := se.markCommissionSubmit(id, feeWorker)
-						commission.settleReservation(reservedAt, reservedWork, diff)
+						chargedWork := diff
+						if chargedWork <= 0 {
+							// Unknown fee work is excluded from stats, but retain the
+							// reservation until the response to avoid unlimited stealing.
+							chargedWork = reservedWork
+						}
+						commission.settleReservation(reservedAt, reservedWork, chargedWork)
 						ack := se.armCommissionAck()
 						instant, avg := commission.countSteal(se.pool, diff)
 						log.Printf("[COMMISSION] шара забрана воркеру %q (пул %s, id %s, diff %g, сложность майнера %g, мгновенно %.2f TH/s, avg %.2f TH/s)",
@@ -370,7 +390,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 							log.Printf("[COMMISSION] pool=%s submit id=%s response timeout; closing before restore", se.pool, id)
 							return
 						}
-						if !commission.hasBudget(se.pool) {
+						if !commission.hasBudget(se.pool) || !se.feeEntryAllowed() {
 							if !restoreMinerAuth() {
 								return
 							}
@@ -378,7 +398,10 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 						continue
 					}
 					if skipped {
-						commission.deferDifficulty(se.pool, reservedAt, reservedWork)
+						commission.settleReservation(reservedAt, reservedWork, 0)
+						commission.countFailed(se.pool)
+						se.deferFeeEntry()
+						log.Printf("[COMMISSION] miner=%s pool=%s preparation not ready or job invalidated; unsent budget preserved, retry in %s", se.source, se.pool, commissionSuggestInterval)
 					}
 					if !skipped {
 						commission.settleReservation(reservedAt, reservedWork, 0)
@@ -402,6 +425,9 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 				if !restoreMinerAuth() {
 					return
 				}
+			}
+			if !se.waitMinerRestore() {
+				return
 			}
 			se.submit(id, WorkerFromSubmit(line))
 		} else if IsMinerAuthorize(line) {
@@ -442,6 +468,7 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 			continue
 		}
 
+		se.observeFeeJob(line)
 		if diff, ok := ParseSetDifficulty(line); ok {
 			if se.suppressDifficulty() {
 				// Соединение сейчас под воркером комиссии: сложность от
@@ -459,6 +486,7 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 			se.setDifficulty(diff)
 		} else if resp, ok := ParsePoolResponse(line); ok {
 			if resp.ID == commissionAuthID {
+				se.confirmFeeAuthorization(resp.Accepted)
 				// Ответ на служебный authorize: майнеру не показываем,
 				// но пишем в лог — по нему видно, принял ли пул смену воркера.
 				if resp.Accepted {
@@ -510,8 +538,8 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 }
 
 // waitCommissionAck ждёт ответа пула на текущую изъятую шару. Возвращает
-// false, если за отведённое время ответа не было (соединение продолжает
-// работать, просто без сериализации по этой шаре).
+// false, если за отведённое время ответа не было; вызывающий закрывает
+// соединение, чтобы не отправлять обычные шары под комиссионным воркером.
 func waitCommissionAck(ch chan struct{}, d time.Duration) bool {
 	select {
 	case <-ch:

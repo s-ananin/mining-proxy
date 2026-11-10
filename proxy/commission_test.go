@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -165,16 +166,18 @@ func TestIntervalProportionalBudget(t *testing.T) {
 	}
 
 	// Второй тик: принято ещё 100 (итого 300) → target 6, добираем 2.
+	// Неизрасходованные 4 переносятся только в пределах половины порции (1),
+	// остальное сгорает: провал изъятия не догоняется всплеском.
 	accept(100)
 	c.iterate(now.Add(20 * time.Minute))
-	if c.takeBudget != 6 || c.budgetIssued != 6 {
-		t.Errorf("после 2-го тика budget=%v issued=%v, want 6/6", c.takeBudget, c.budgetIssued)
+	if c.takeBudget != 3 || c.budgetIssued != 6 || c.forfeited != 3 {
+		t.Errorf("после 2-го тика budget=%v issued=%v forfeited=%v, want 3/6/3", c.takeBudget, c.budgetIssued, c.forfeited)
 	}
 
-	// Третий тик без новых шар: цель не растёт, изъятия нет (кап).
+	// Третий тик без новых шар: цель не растёт, порция 0 — остаток сгорает.
 	c.iterate(now.Add(30 * time.Minute))
-	if c.takeBudget != 6 || c.budgetIssued != 6 {
-		t.Errorf("без новых шар budget=%v issued=%v, want 6/6", c.takeBudget, c.budgetIssued)
+	if c.takeBudget != 0 || c.budgetIssued != 6 || c.forfeited != 6 {
+		t.Errorf("без новых шар budget=%v issued=%v forfeited=%v, want 0/6/6", c.takeBudget, c.budgetIssued, c.forfeited)
 	}
 	// Суммарно за окно — не более percent% от принятых.
 	if c.budgetIssued > float64(300)*0.02 {
@@ -286,6 +289,8 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 	if a.Method != "mining.authorize" || worker(a) != "fee.worker" || tagID(a) != commissionAuthID {
 		t.Fatalf("ожидался служебный authorize fee.worker: %+v", a)
 	}
+	se.confirmFeeAuthorization(true)
+	se.setFeeDiff(1)
 	s := recv()
 	if s.Method != "mining.submit" || worker(s) != "fee.worker" || string(s.ID) != "2" {
 		t.Fatalf("подменённая шара неверна: %+v", s)
@@ -301,7 +306,14 @@ func TestPipeMinerToPoolCommissionSwitch(t *testing.T) {
 		t.Fatalf("ожидался немедленный возврат authorize на client.w: %+v", a)
 	}
 	se.restorePoolLine([]byte(`{"id":"__commission_restore__","result":true,"error":null}`))
-	se.restorePoolLine([]byte(`{"id":null,"method":"mining.notify","params":["job2","p","c1","c2",[],"v","b","t",true]}`))
+	_, updates, err := se.restorePoolLine([]byte(`{"id":null,"method":"mining.notify","params":["job2","p","c1","c2",[],"v","b","t",true]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { bufio.NewReader(minerSide).ReadString('\n') }()
+	if err := se.publishMinerRestore(clientConn, updates); err != nil {
+		t.Fatal(err)
+	}
 	send(`{"id":3,"method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
 	s = recv()
 	if s.Method != "mining.submit" || worker(s) != "client.w" || string(s.ID) != "3" {
@@ -334,7 +346,7 @@ func TestFeeDifficultyNotLeakedToMiner(t *testing.T) {
 	defer minerOut.Close()
 
 	se := newSession(stats, "pool:3333", "10.0.0.1", c)
-	se.setDifficulty(1)
+	se.setDifficulty(512)
 	defer se.close()
 
 	go pipeMinerToPool(clientConn, bufio.NewReader(clientConn), dst, se, c)
@@ -387,6 +399,8 @@ func TestFeeDifficultyNotLeakedToMiner(t *testing.T) {
 	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
 		t.Fatalf("ожидался служебный authorize fee.worker: %s", a)
 	}
+	toPool(`{"id":"__commission_switch__","result":true,"error":null}`)
+	toPool(`{"id":null,"method":"mining.set_difficulty","params":[256]}`)
 	if s := fromPool(); !strings.Contains(s, `"fee.worker"`) {
 		t.Fatalf("ожидалась подменённая шара fee.worker: %s", s)
 	}
@@ -442,10 +456,9 @@ func TestCommissionWorkCountedAtFeeDifficulty(t *testing.T) {
 	se.setDifficulty(16384)
 	se.setFeeActive(true)
 
-	// Пул ещё не прислал сложность воркера комиссии — действует сложность
-	// сессии (та, по которой пул сейчас засчитывает шары).
-	if d := se.markCommissionSubmit("1", "fee.worker"); d != 16384 {
-		t.Fatalf("work первой шары посчитан по %v, ожидалось 16384", d)
+	// Unknown fee difficulty must not inherit the miner difficulty.
+	if d := se.markCommissionSubmit("1", "fee.worker"); d != 0 {
+		t.Fatalf("work первой шары посчитан по %v, ожидалось 0", d)
 	}
 
 	// Пул прислал сложность воркера комиссии — дальше считаем по ней.
@@ -554,6 +567,7 @@ func TestCommissionStealRate(t *testing.T) {
 	}
 	// Пул-разбивка отдаёт TH/s.
 	c.countSteal("gate:3333", 100)
+	c.countResult("gate:3333", true, 100)
 	rep := c.Snapshot()
 	if len(rep.Pools) != 1 || rep.Pools[0].StealThs <= 0 {
 		t.Errorf("StealThs должен быть > 0: %+v", rep.Pools)
@@ -732,6 +746,8 @@ func TestPipeMinerToPoolRotatedWorker(t *testing.T) {
 	if !strings.Contains(a, `"feeworker.r1"`) || !strings.Contains(a, "mining.authorize") {
 		t.Fatalf("ожидался служебный authorize feeworker.r1: %s", a)
 	}
+	se.confirmFeeAuthorization(true)
+	se.setFeeDiff(1)
 	s := recv()
 	if !strings.Contains(s, `"feeworker.r1"`) || !strings.Contains(s, "mining.submit") {
 		t.Fatalf("подменённая шара неверна: %s", s)
@@ -747,7 +763,7 @@ func TestPipeMinerToPoolRotatedWorker(t *testing.T) {
 func TestCommissionSuggestDifficulty(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithSuggestDifficulty())
-	c.takeBudget = 16384 + 16
+	c.takeBudget = 16 + 16
 
 	clientConn, minerIn := net.Pipe()
 	defer clientConn.Close()
@@ -804,11 +820,13 @@ func TestCommissionSuggestDifficulty(t *testing.T) {
 		t.Fatalf("майнер не получил set_difficulty: %q", l)
 	}
 
-	// First submit must not wait for any set_difficulty notification.
+	// First submit waits for confirmed authorization and actual difficulty.
 	toMiner(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
 	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
 		t.Fatalf("missing fee authorize: %s", a)
 	}
+	toPool(`{"id":"__commission_switch__","result":true,"error":null}`)
+	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16]}`)
 	poolOut.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	if line := fromPool(); !strings.Contains(line, "mining.submit") {
 		t.Fatalf("submit delayed: %s", line)
@@ -818,9 +836,6 @@ func TestCommissionSuggestDifficulty(t *testing.T) {
 	fromMiner()
 	toMiner(`{"id":3,"method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
 	poolOut.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	if line := fromPool(); !strings.Contains(line, "mining.suggest_difficulty") || !strings.Contains(line, "16384") {
-		t.Fatalf("missing advisory suggestion: %s", line)
-	}
 	if line := fromPool(); !strings.Contains(line, "mining.submit") {
 		t.Fatalf("waiting for suggestion instead of sending share: %s", line)
 	}
@@ -900,11 +915,13 @@ func TestCommissionNoSuggestWhenPoolKeepsDifficulty(t *testing.T) {
 		t.Fatalf("майнер не получил set_difficulty: %q (%v)", l, err)
 	}
 
-	// Пул не присылает сложность воркера комиссии — значит, не менял её.
+	// Pool explicitly confirms that the fee difficulty is unchanged.
 	toMiner(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
 	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
 		t.Fatalf("ожидался служебный authorize fee.worker: %s", a)
 	}
+	toPool(`{"id":"__commission_switch__","result":true,"error":null}`)
+	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16384]}`)
 	if s := fromPool(); !strings.Contains(s, "mining.submit") {
 		t.Fatalf("ожидалась подменённая шара: %s", s)
 	}
@@ -912,5 +929,58 @@ func TestCommissionNoSuggestWhenPoolKeepsDifficulty(t *testing.T) {
 	poolOut.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if l, err := pr.ReadString('\n'); err == nil {
 		t.Fatalf("прокси зря запросил закрепление сложности: %q", strings.TrimSpace(l))
+	}
+}
+
+// Reproduce authorize -> submit -> lower set_difficulty -> accepted, without
+// holding up the submit pipe while the pool announces its fee difficulty.
+func TestCommissionFirstShareDifficultyAccounting(t *testing.T) {
+	for _, announced := range []float64{8192, 0} {
+		t.Run(fmt.Sprint(announced), func(t *testing.T) {
+			stats := NewStats()
+			c := NewCommission("fee.worker", 1, 40, 0, 0, stats)
+			defer c.Close()
+			se := newSession(stats, "pool", "miner", c)
+			defer se.close()
+			se.setDifficulty(524288)
+			se.setFeeActive(true)
+			c.mu.Lock()
+			c.takeBudget = 524288
+			c.mu.Unlock()
+			at := time.Now()
+			if !c.reserve(se.pool, 524288) {
+				t.Fatal("missing reservation")
+			}
+			diff := se.markCommissionSubmit("1", "fee.worker")
+			if diff != 0 {
+				t.Fatalf("unknown difficulty inherited miner value: %g", diff)
+			}
+			c.settleReservation(at, 524288, 524288)
+			c.countSteal(se.pool, diff)
+			if announced > 0 {
+				se.setFeeDiff(announced)
+				// A later vardiff update must not change this pending share.
+				se.setFeeDiff(16384)
+			}
+			se.resolve(PoolResponse{ID: "1", Accepted: true})
+			wantBudget := 524288 - announced
+			if announced == 0 {
+				wantBudget = 0
+			}
+			c.mu.Lock()
+			if c.workAccepted != announced || c.workIssued != announced || c.takeBudget != wantBudget || c.acceptedCnt != 1 || c.attempts != 1 {
+				t.Errorf("accepted=%g issued=%g budget=%g acceptedCount=%d attempts=%d", c.workAccepted, c.workIssued, c.takeBudget, c.acceptedCnt, c.attempts)
+			}
+			c.mu.Unlock()
+			stats.mu.Lock()
+			var work float64
+			for _, b := range stats.averages.buckets {
+				work += b.work[feeAccepted]
+			}
+			stats.mu.Unlock()
+			if work != announced {
+				t.Fatalf("stats work=%g, want %g", work, announced)
+			}
+		})
 	}
 }

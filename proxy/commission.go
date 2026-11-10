@@ -65,6 +65,13 @@ const (
 // задавать короткую паузу.
 var commissionBreakerCooldown = 10 * time.Minute
 
+// commissionCarryFraction — какая доля бюджета нового тика может прийти из
+// неизрасходованного остатка прошлых тиков. Остаток сверх неё сгорает и
+// повторно не выдаётся: провал изъятия (пул недоступен, шторм реконнектов)
+// не догоняется всплеском, который забрал бы у майнеров больше 1.5x
+// причитающегося за интервал.
+const commissionCarryFraction = 0.5
+
 // poolCommission — счётчики изъятия по конкретному пулу. Нужны, чтобы при
 // работе с несколькими пулами видеть, где комиссия фактически идёт, а где
 // пул не знает commission_worker.
@@ -79,8 +86,9 @@ type poolCommission struct {
 
 	// Диагностика скорости изъятия: время и сложность последних изъятых
 	// шар. По ним считается мгновенный и средний хешрейт комиссии.
-	lastStealAt time.Time
-	samples     []stealSample
+	lastStealAt     time.Time
+	samples         []stealSample
+	acceptedSamples []stealSample
 
 	// Сложность, которую пул назначил воркеру комиссии (vardiff). По ней
 	// пул зачитывает изъятые шары: если она падает, комиссия обесценивается
@@ -148,6 +156,8 @@ type poolBreaker struct {
 	denies            int
 	openTill          time.Time
 	difficultyRetryAt time.Time
+	failureUntil      time.Time
+	failures          int // неудач боевых соединений подряд (растущая пауза)
 }
 
 // Commission — сборщик комиссии. Потокобезопасен (mu).
@@ -211,10 +221,19 @@ type Commission struct {
 
 	// Диагностика: суммарная сложность (work) изъятых шар. Сравнивается с
 	// тем, что пул показал по commission_worker: наш work должен расти ровно.
-	workIssued    float64 // work всех изъятых шар (по сложности на момент изъятия)
-	workAccepted  float64 // work зачтённых пулом
-	workRejected  float64 // work отклонённых пулом
-	workSinceTick float64 // work, изъятый с прошлого тика (сбрасывается в iterate)
+	workIssued        float64 // work всех изъятых шар (по сложности на момент изъятия)
+	workAccepted      float64 // work зачтённых пулом
+	workRejected      float64 // work отклонённых пулом
+	acceptedSinceTick float64
+	workSinceTick     float64 // work, изъятый с прошлого тика (сбрасывается в iterate)
+
+	// forfeited — неизрасходованный бюджет окна, сгоревший по
+	// commissionCarryFraction (не выдаётся повторно).
+	forfeited float64
+
+	// Проверка пулов отдельным соединением (probe.go); probe == nil — выкл.
+	probe  ProbeFunc
+	probes map[string]*poolProbe
 
 	// Разбивка по пулам и предохранители (мультипул).
 	perPool     map[string]*poolCommission
@@ -278,6 +297,7 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 		perPool:          map[string]*poolCommission{},
 		breakers:         map[string]*poolBreaker{},
 		breakerLogs:      map[string]time.Time{},
+		probes:           map[string]*poolProbe{},
 		rng:              rand.New(rand.NewSource(now.UnixNano())),
 	}
 	c.windowWorker = worker
@@ -388,6 +408,7 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		c.iterationsUsed = 0
 		c.takeBudget = 0
 		c.budgetIssued = 0
+		c.forfeited = 0
 	}
 	end := c.windowStart.Add(commissionWindow)
 
@@ -402,6 +423,7 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		if batch < 0 {
 			batch = 0
 		}
+		c.capCarryLocked(batch)
 		c.takeBudget += batch
 		c.budgetIssued += batch
 		c.iterationsUsed++
@@ -433,19 +455,16 @@ func (c *Commission) iterate(now time.Time) time.Time {
 					c.interval, batch, acceptedToday, target, c.budgetIssued)
 			}
 		}
-		// Диагностика: сколько work реально изъято за прошедший интервал и
-		// сколько пул зачёл. Наш work должен держаться ровно — если на
-		// диаграмме пула воркер «затухает», а здесь ровно, причина на пуле.
-		// Сверяем фактический хешрейт изъятия с ожидаемым (percent% от
-		// хешрейта майнеров) в TH/s — так сразу видно недостачу.
-		if c.workSinceTick > 0 {
-			actualTh := c.workSinceTick * diffToHashF / c.interval.Seconds() / 1e12
+		// Report accepted work separately from attempts and unanswered shares.
+		if c.workSinceTick > 0 || c.acceptedSinceTick > 0 {
+			actualTh := c.acceptedSinceTick * diffToHashF / c.interval.Seconds() / 1e12
 			expectedTh := float64(c.stats.Report().Totals.Hashrate) / 1e12 * c.percent / 100
-			log.Printf("[COMMISSION] за интервал work изъято=%.0f (issued=%.0f, зачтено=%.0f, отклонено=%.0f), изъятие %.2f TH/s, ожидалось %.2f TH/s (%.1f%% от %.2f TH/s)",
-				c.workSinceTick, c.workIssued, c.workAccepted, c.workRejected,
-				actualTh, expectedTh, c.percent, float64(c.stats.Report().Totals.Hashrate)/1e12)
+			log.Printf("[COMMISSION] interval sent_work=%.0f accepted_work=%.0f accepted=%.2f TH/s expected=%.2f TH/s (total issued=%.0f accepted=%.0f rejected=%.0f)",
+				c.workSinceTick, c.acceptedSinceTick, actualTh, expectedTh, c.workIssued, c.workAccepted, c.workRejected)
 			c.workSinceTick = 0
+			c.acceptedSinceTick = 0
 		}
+
 		next := c.windowStart.Add(time.Duration(c.iterationsUsed) * c.interval)
 		if !next.After(now) {
 			next = now.Add(c.interval)
@@ -463,6 +482,7 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	acceptedToday := c.stats.AcceptedWork() - c.baseWork
 	target := acceptedToday * c.percent / 100
 	batch := math.Max(0, target-c.budgetIssued) / float64(iterationsLeft)
+	c.capCarryLocked(batch)
 	c.takeBudget += batch
 	c.budgetIssued += batch
 	c.iterationsUsed++
@@ -499,6 +519,22 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	return next
 }
 
+// capCarryLocked ограничивает перенос неизрасходованного бюджета на новый
+// тик долей commissionCarryFraction от его порции. Сгоревший остаток уже
+// учтён в budgetIssued и повторно не выдаётся. Долг (отрицательный бюджет)
+// переносится полностью. Вызывается под c.mu.
+func (c *Commission) capCarryLocked(batch float64) {
+	limit := batch * commissionCarryFraction
+	if c.takeBudget <= limit {
+		return
+	}
+	burnt := c.takeBudget - limit
+	c.forfeited += burnt
+	c.takeBudget = limit
+	log.Printf("[COMMISSION] unspent budget %.0f forfeited (carry limited to %.0f%% of next batch %.0f)",
+		burnt, commissionCarryFraction*100, batch)
+}
+
 // poolLocked возвращает (создавая при необходимости) счётчики по пулу.
 func (c *Commission) poolLocked(pool string) *poolCommission {
 	p, ok := c.perPool[pool]
@@ -516,6 +552,9 @@ func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
 	if !ok {
 		return false
 	}
+	if now.Before(b.failureUntil) {
+		return true
+	}
 	if now.Before(b.difficultyRetryAt) {
 		return true
 	}
@@ -523,8 +562,10 @@ func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
 		return true
 	}
 	// Cooldown истёк — предохранитель закрывается, счётчик отказов сброшен.
-	b.denies = 0
-	b.openTill = time.Time{}
+	if !b.openTill.IsZero() {
+		b.denies = 0
+		b.openTill = time.Time{}
+	}
 	return false
 }
 
@@ -582,6 +623,9 @@ func (c *Commission) reserveEntry(pool string, difficulty ...float64) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.poolVerifiedLocked(pool, now) {
+		return false
+	}
 	if !c.reserveLocked(pool, difficulty...) {
 		return false
 	}
@@ -647,6 +691,41 @@ func (c *Commission) reportDeny(pool string) {
 	}
 }
 
+// Pause on unanswered commission work, including resets before the submit
+// timeout. Authorization success must not clear this independent cooldown.
+// Consecutive failures double the pause (up to failurePauseMax); an accepted
+// commission share on the pool resets the streak.
+func (c *Commission) pauseFailure(pool string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.breakers[pool]
+	if b == nil {
+		b = &poolBreaker{}
+		c.breakers[pool] = b
+	}
+	if time.Now().Before(b.failureUntil) {
+		return
+	}
+	b.failures++
+	pause := backoff(commissionBreakerCooldown, failurePauseMax, b.failures)
+	b.failureUntil = time.Now().Add(pause)
+	log.Printf("[COMMISSION] pool=%s unanswered commission work (%d in a row); paused for %s until %s",
+		pool, b.failures, pause, b.failureUntil.Format(time.RFC3339))
+}
+
+func acceptedRate(samples []stealSample, now time.Time) float64 {
+	var work float64
+	start := now.Add(-commissionRateWindow)
+	for _, sample := range samples {
+		if !sample.at.Before(start) {
+			work += sample.diff
+		}
+	}
+	// Fixed window includes silence after the last response, so a stopped
+	// commission worker cannot keep reporting its previous hashrate forever.
+	return work * diffToHashF / commissionRateWindow.Seconds()
+}
+
 // reportAuthOK сбрасывает счётчик отказов пула после успешной
 // переавторизации (пул знает commission_worker).
 func (c *Commission) reportAuthOK(pool string) {
@@ -699,7 +778,25 @@ func (c *Commission) countSteal(pool string, diff float64) (instant, avg float64
 	p := c.poolLocked(pool)
 	p.attempts++
 	p.workIssued += diff
+	if diff <= 0 {
+		return 0, p.avgRateLocked()
+	}
 	return p.stealRateLocked(time.Now(), diff)
+}
+
+// priceUnknownShare adds work which was unknown when countSteal ran.
+// Attempts are already counted; only the work and rate sample need updating.
+func (c *Commission) priceUnknownShare(pool string, diff float64) {
+	if diff <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.workIssued += diff
+	c.workSinceTick += diff
+	p := c.poolLocked(pool)
+	p.workIssued += diff
+	p.stealRateLocked(time.Now(), diff)
 }
 
 func (c *Commission) countResult(pool string, accepted bool, diff float64, submittedAt ...time.Time) {
@@ -715,15 +812,23 @@ func (c *Commission) countResult(pool string, accepted bool, diff float64, submi
 			c.baseFeeWork += diff
 		}
 		c.workAccepted += diff
+		c.acceptedSinceTick += diff
+		now := time.Now()
+		cut := 0
+		for cut < len(p.acceptedSamples) && now.Sub(p.acceptedSamples[cut].at) > commissionRateWindow {
+			cut++
+		}
+		p.acceptedSamples = append(p.acceptedSamples[cut:], stealSample{at: now, diff: diff})
 		p.accepted++
 		p.workAccepted += diff
+		if b := c.breakers[pool]; b != nil {
+			b.failures = 0
+		}
 	} else {
 		c.rejectedCnt++
 		c.workRejected += diff
-		// Retry rejected work at the next scheduled tick, never in a tight loop.
-		if len(submittedAt) == 0 || !submittedAt[0].Before(c.windowStart) {
-			c.budgetIssued -= diff
-		}
+		// The miner's share is spent either way: rejected commission work is
+		// charged and never re-taken from miners on a later tick.
 		p.rejected++
 		p.workRejected += diff
 	}
@@ -781,6 +886,9 @@ type CommissionReport struct {
 	WorkAccepted     float64                `json:"-"`
 	WorkRejected     float64                `json:"-"`
 	EffectivePercent float64                `json:"effective_percent"`
+	ChargedPercent   float64                `json:"charged_percent"`
+	ForfeitedWork    float64                `json:"forfeited_work"`
+	PoolChecks       map[string]string      `json:"pool_checks,omitempty"`
 	AcceptedToday    int                    `json:"accepted_today"`
 	TargetToday      float64                `json:"-"`
 	TakenToday       int                    `json:"taken_today"`
@@ -831,6 +939,8 @@ func (c *Commission) Snapshot() CommissionReport {
 		AcceptedToday:    acceptedToday,
 		TargetToday:      target,
 		EffectivePercent: workPercent(c.workAccepted-c.baseFeeWork, c.stats.AcceptedWork()-c.baseWork),
+		ChargedPercent:   workPercent(c.budgetIssued-c.forfeited-c.takeBudget, c.stats.AcceptedWork()-c.baseWork),
+		ForfeitedWork:    c.forfeited,
 		TakenToday:       c.taken,
 		IterationsUsed:   c.iterationsUsed,
 		IterationsLeft:   left,
@@ -858,7 +968,7 @@ func (c *Commission) Snapshot() CommissionReport {
 			WorkAccepted:      p.workAccepted,
 			WorkRejected:      p.workRejected,
 			FeeDiff:           p.feeDiff,
-			StealThs:          p.avgRateLocked() / 1e12,
+			StealThs:          acceptedRate(p.acceptedSamples, now) / 1e12,
 			BreakerOpen:       c.poolOpenLocked(name, now),
 			DifficultyRetryAt: c.difficultyRetryStringLocked(name, now),
 		})
@@ -874,6 +984,14 @@ func (c *Commission) Snapshot() CommissionReport {
 			BreakerOpen:       c.poolOpenLocked(name, now),
 			DifficultyRetryAt: c.difficultyRetryStringLocked(name, now),
 		})
+	}
+	for name := range c.probes {
+		if v := c.probeVerdictLocked(name); v != "" {
+			if rep.PoolChecks == nil {
+				rep.PoolChecks = map[string]string{}
+			}
+			rep.PoolChecks[name] = v
+		}
 	}
 	sort.Slice(rep.Pools, func(i, j int) bool { return rep.Pools[i].Pool < rep.Pools[j].Pool })
 	return rep
@@ -904,12 +1022,10 @@ func workPercent(fee, ordinary float64) float64 {
 	return fee / ordinary * 100
 }
 
-// Unanswered shares are not rejects. Retry their work on the next tick.
+// Unanswered shares are not rejects, but the miner's share is spent: the
+// work stays charged and is never re-taken from miners on a later tick.
 func (c *Commission) lostWork(diff float64, at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !at.Before(c.windowStart) {
-		c.budgetIssued -= diff
-	}
 	c.failedCnt++
 }

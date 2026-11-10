@@ -18,6 +18,7 @@ type minerRestore struct {
 
 func (s *session) beginMinerRestore(pool net.Conn) {
 	s.mu.Lock()
+	s.restoreDone = make(chan struct{})
 	s.restore = &minerRestore{deadline: time.Now().Add(minerRestoreTimeout)}
 	if pool != nil {
 		pool.SetReadDeadline(s.restore.deadline)
@@ -69,7 +70,6 @@ func (s *session) restorePoolLine(raw []byte) (bool, [][]byte, error) {
 	if !r.authorized || !r.notified {
 		return true, nil, nil
 	}
-	s.restore = nil
 	s.feeActive = false
 	return true, r.updates, nil
 }
@@ -94,6 +94,13 @@ func (s *session) publishMinerRestore(dst net.Conn, updates [][]byte) error {
 			return err
 		}
 	}
+	s.mu.Lock()
+	s.restore = nil
+	if s.restoreDone != nil {
+		close(s.restoreDone)
+		s.restoreDone = nil
+	}
+	s.mu.Unlock()
 	log.Printf("[COMMISSION] miner authorization and new job restored miner=%s pool=%s", s.source, s.pool)
 	return nil
 }
