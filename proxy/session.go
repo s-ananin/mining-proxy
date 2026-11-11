@@ -13,7 +13,6 @@
 package proxy
 
 import (
-	"encoding/json"
 	"log"
 	"sync"
 	"time"
@@ -34,8 +33,6 @@ type pendingShare struct {
 // session — привязка соединения к реестру статистики.
 type session struct {
 	mu             sync.Mutex
-	feeAuthorized  bool
-	feeChanged     chan struct{}
 	feeRetryAt     time.Time
 	restoreDone    chan struct{}
 	restore        *minerRestore
@@ -49,11 +46,10 @@ type session struct {
 	commission     *Commission   // сборщик комиссии; nil — выключена
 	feeDenied      bool          // пул отклонил служебный authorize — не изымаем
 	commAck        chan struct{} // ответ пула на текущую изъятую шару (сериализация)
-	feeJobs        map[string]bool
-	feeActive      bool      // соединение сейчас авторизовано под commission_worker
-	feeDiff        float64   // сложность, которую пул назначил воркеру комиссии
-	suggestAt      time.Time // когда последний раз просили у пула закрепить сложность
-	freqLimitUntil time.Time // бэк-офф при "Frequency limit exceeded"
+	feeActive      bool          // соединение сейчас авторизовано под commission_worker
+	feeDiff        float64       // сложность, которую пул назначил воркеру комиссии
+	suggestAt      time.Time     // когда последний раз просили у пула закрепить сложность
+	freqLimitUntil time.Time     // бэк-офф при "Frequency limit exceeded"
 }
 
 // newSession регистрирует соединение в реестре.
@@ -128,9 +124,6 @@ func (s *session) setFeeActive(active bool) {
 		// пришлёт её после нашего authorize. До уведомления work неизвестен:
 		// сложность майнера не подтверждает сложность комиссионной шары.
 		s.feeDiff = 0
-		s.feeJobs = nil
-		s.feeAuthorized = false
-		s.feeChanged = make(chan struct{}, 1)
 	}
 }
 
@@ -148,7 +141,6 @@ func (s *session) suppressDifficulty() bool {
 func (s *session) setFeeDiff(diff float64) {
 	s.mu.Lock()
 	s.feeDiff = diff
-	s.signalFeeChangedLocked()
 	// Only the first difficulty after fee authorization can price a submit
 	// sent before that notification. Never reprice an already known share.
 	if diff > 0 {
@@ -194,31 +186,12 @@ func (s *session) feeEntryAllowed() bool {
 		(now.Sub(s.suggestAt) >= commissionSuggestInterval && !now.Before(s.freqLimitUntil))
 }
 
-// Fee preparation is bounded and wakes on actual pool state, never on a
-// successful suggest_difficulty response alone.
-func (s *session) signalFeeChangedLocked() {
-	if s.feeChanged != nil {
-		select {
-		case s.feeChanged <- struct{}{}:
-		default:
-		}
-	}
-}
-
 func (s *session) confirmFeeAuthorization(accepted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.feeAuthorized = accepted
 	if !accepted {
 		s.feeDenied = true
 	}
-	s.signalFeeChangedLocked()
-}
-
-func (s *session) feePreparation() (bool, bool, <-chan struct{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.feeAuthorized && s.feeDiff > 0, s.feeDenied, s.feeChanged
 }
 
 func (s *session) deferFeeEntry() {
@@ -241,61 +214,6 @@ func (s *session) waitMinerRestore() bool {
 	case <-time.After(minerRestoreTimeout):
 		return false
 	}
-}
-
-// A clean job sent during reauthorization invalidates a share found on
-// the previous job. Extranonce changes also require a fresh notification.
-func (s *session) observeFeeJob(raw []byte) {
-	msg, err := Parse(raw)
-	if err != nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.feeActive {
-		return
-	}
-	if msg.Method == "mining.set_extranonce" {
-		s.feeJobs = map[string]bool{}
-		return
-	}
-	if msg.Method != "mining.notify" {
-		return
-	}
-	var params []json.RawMessage
-	if json.Unmarshal(msg.Params, &params) != nil || len(params) < 9 {
-		return
-	}
-	var job string
-	var clean bool
-	if json.Unmarshal(params[0], &job) != nil {
-		return
-	}
-	json.Unmarshal(params[8], &clean)
-	if clean {
-		s.feeJobs = map[string]bool{}
-	}
-	if s.feeJobs != nil {
-		s.feeJobs[job] = true
-	}
-}
-
-func (s *session) commissionJobAllowed(raw []byte) bool {
-	msg, err := Parse(raw)
-	if err != nil {
-		return false
-	}
-	var params []json.RawMessage
-	if json.Unmarshal(msg.Params, &params) != nil || len(params) < 2 {
-		return false
-	}
-	var job string
-	if json.Unmarshal(params[1], &job) != nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.feeJobs == nil || s.feeJobs[job]
 }
 
 // markSuggestFrequencyLimited ставит бэк-офф после "Frequency limit exceeded".

@@ -269,34 +269,22 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		return true
 	}
 
-	// Confirm authorization and the actual fee difficulty before sending work.
-	// A suggest reply is advisory; only set_difficulty can make a higher target
-	// safe. Keep lower fee difficulty flowing without waiting for a correction.
+	// Suggestion is advisory: neither its reply nor set_difficulty may block
+	// the submit path. The fee share goes out right after the authorize, while
+	// the miner's job is still valid on the pool; a higher, already known fee
+	// difficulty is skipped below. Unknown fee difficulty is priced on reply.
 	ensurePoolDifficulty := func() bool {
-		deadline := time.Now().Add(time.Second)
-		timer := time.NewTimer(time.Until(deadline))
-		defer timer.Stop()
-		for {
-			ready, denied, changed := se.feePreparation()
-			if denied {
-				return false
-			}
-			target, actual := se.difficulty(), se.feeDifficulty()
-			if ready && target > 0 && actual <= target {
-				return true
-			}
-			if ready && target > 0 && actual > target && commission.SuggestDifficulty() && se.allowSuggest() {
-				if !writeSuggestDifficulty(target, deadline) {
-					return false
-				}
-				se.markSuggestSent()
-			}
-			select {
-			case <-changed:
-			case <-timer.C:
-				return false
-			}
+		target, actual := se.difficulty(), se.feeDifficulty()
+		if target <= 0 {
+			return true
 		}
+		if commission.SuggestDifficulty() && actual > 0 && actual != target && se.allowSuggest() {
+			if !writeSuggestDifficulty(target, time.Now().Add(writeTimeout)) {
+				return false
+			}
+			se.markSuggestSent()
+		}
+		return actual <= 0 || actual <= target
 	}
 
 	// Restore before the ASIC finds another share. Keep suppression active
@@ -350,7 +338,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 					if ensureFeeAuth() {
 						// Lower fee difficulty is acceptable; never wait for
 						// it to rise. Higher difficulty is deferred.
-						if ensurePoolDifficulty() && se.commissionJobAllowed(line) {
+						if ensurePoolDifficulty() {
 							md := se.difficulty()
 							fd := se.feeDifficulty()
 							if fd > 0 && md > 0 && fd > md+1e-12 {
@@ -401,7 +389,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 						commission.settleReservation(reservedAt, reservedWork, 0)
 						commission.countFailed(se.pool)
 						se.deferFeeEntry()
-						log.Printf("[COMMISSION] miner=%s pool=%s preparation not ready or job invalidated; unsent budget preserved, retry in %s", se.source, se.pool, commissionSuggestInterval)
+						log.Printf("[COMMISSION] miner=%s pool=%s fee difficulty above miner difficulty; unsent budget preserved, retry in %s", se.source, se.pool, commissionSuggestInterval)
 					}
 					if !skipped {
 						commission.settleReservation(reservedAt, reservedWork, 0)
@@ -468,7 +456,6 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 			continue
 		}
 
-		se.observeFeeJob(line)
 		if diff, ok := ParseSetDifficulty(line); ok {
 			if se.suppressDifficulty() {
 				// Соединение сейчас под воркером комиссии: сложность от

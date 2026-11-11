@@ -820,22 +820,25 @@ func TestCommissionSuggestDifficulty(t *testing.T) {
 		t.Fatalf("майнер не получил set_difficulty: %q", l)
 	}
 
-	// First submit waits for confirmed authorization and actual difficulty.
+	// First submit must not wait for the authorize reply or set_difficulty:
+	// the pool resets jobs after authorize, so waiting invalidates the share.
 	toMiner(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
 	if a := fromPool(); !strings.Contains(a, `"fee.worker"`) {
 		t.Fatalf("missing fee authorize: %s", a)
 	}
-	toPool(`{"id":"__commission_switch__","result":true,"error":null}`)
-	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16]}`)
 	poolOut.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	if line := fromPool(); !strings.Contains(line, "mining.submit") {
 		t.Fatalf("submit delayed: %s", line)
 	}
+	toPool(`{"id":"__commission_switch__","result":true,"error":null}`)
 	toPool(`{"id":null,"method":"mining.set_difficulty","params":[16]}`)
 	toPool(`{"id":2,"result":true,"error":null}`)
 	fromMiner()
 	toMiner(`{"id":3,"method":"mining.submit","params":["client.w","job2","n2","nt","nc"]}`)
 	poolOut.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if line := fromPool(); !strings.Contains(line, "mining.suggest_difficulty") || !strings.Contains(line, "16384") {
+		t.Fatalf("missing advisory suggestion: %s", line)
+	}
 	if line := fromPool(); !strings.Contains(line, "mining.submit") {
 		t.Fatalf("waiting for suggestion instead of sending share: %s", line)
 	}
