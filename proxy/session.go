@@ -28,6 +28,9 @@ type pendingShare struct {
 	commission     bool
 	feeDiffUnknown bool
 	feeEstimate    float64
+	// billable — работа шары входит в базу бюджета комиссии. false для
+	// шар не-BTC соединений в режиме btcOnly (их работа не облагается).
+	billable bool
 }
 
 // session — привязка соединения к реестру статистики.
@@ -50,6 +53,7 @@ type session struct {
 	feeDiff        float64       // сложность, которую пул назначил воркеру комиссии
 	suggestAt      time.Time     // когда последний раз просили у пула закрепить сложность
 	freqLimitUntil time.Time     // бэк-офф при "Frequency limit exceeded"
+	coin           coinKind      // монета по последнему mining.notify (coin.go)
 }
 
 // newSession регистрирует соединение в реестре.
@@ -247,6 +251,45 @@ func (s *session) difficulty() float64 {
 	return s.diff
 }
 
+// observeNotify обновляет монету соединения по сетевой сложности из
+// mining.notify. Пул может переключить монету на лету (smart mining),
+// поэтому решение пересчитывается на каждом задании.
+func (s *session) observeNotify(netDiff float64) {
+	kind := classifyCoin(netDiff)
+	s.mu.Lock()
+	prev := s.coin
+	s.coin = kind
+	s.mu.Unlock()
+	if prev == kind {
+		return
+	}
+	s.stats.SetPoolCoin(s.pool, kind.String())
+	if s.commission.BTCOnly() {
+		if kind == coinBTC {
+			log.Printf("[COIN] miner=%s pool=%s: задание BTC (сеть diff %.3g) — комиссия разрешена", s.source, s.pool, netDiff)
+		} else {
+			log.Printf("[COIN] miner=%s pool=%s: задание не BTC (сеть diff %.3g) — прозрачно, без комиссии", s.source, s.pool, netDiff)
+		}
+	}
+}
+
+// coinAllowsCommission сообщает, можно ли изымать комиссию на этом
+// соединении с учётом монеты: в режиме btcOnly — только для заданий BTC.
+func (s *session) coinAllowsCommission() bool {
+	if !s.commission.BTCOnly() {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.coin == coinBTC
+}
+
+// billableLocked — входит ли работа шары в базу бюджета комиссии.
+// Вызывается под s.mu.
+func (s *session) billableLocked() bool {
+	return !s.commission.BTCOnly() || s.coin == coinBTC
+}
+
 // authorize обрабатывает mining.authorize.
 func (s *session) authorize(worker string) {
 	if worker == "" {
@@ -327,7 +370,7 @@ func (s *session) submit(id, worker string) {
 	}
 	s.stats.Submit(s.pool, w, s.source, diff)
 	if id != "" {
-		s.pending[id] = pendingShare{worker: w, diff: diff, at: now}
+		s.pending[id] = pendingShare{worker: w, diff: diff, at: now, billable: s.billableLocked()}
 	}
 }
 
@@ -415,7 +458,7 @@ func (s *session) resolve(resp PoolResponse) bool {
 		s.signalCommission()
 		return true
 	}
-	s.stats.Result(s.pool, p.worker, p.diff, resp.Accepted, resp.Error)
+	s.stats.ResultWork(s.pool, p.worker, p.diff, resp.Accepted, resp.Error, p.billable)
 	return true
 }
 

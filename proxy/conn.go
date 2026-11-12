@@ -317,7 +317,9 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 
 		if IsMinerSubmit(line) {
 			id, _ := SubmitID(line)
-			if id != "" && commission != nil && commission.Enabled() && !se.feeDeniedNow() && !se.restoringMiner() {
+			// coinAllowsCommission: по договору комиссия только с BTC —
+			// соединения с другими монетами идут прозрачно (coin.go).
+			if id != "" && commission != nil && commission.Enabled() && se.coinAllowsCommission() && !se.feeDeniedNow() && !se.restoringMiner() {
 				reservedWork := se.difficulty()
 				if feeAuth && se.feeDifficulty() > 0 {
 					reservedWork = se.feeDifficulty()
@@ -512,6 +514,9 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 			se.resolve(resp)
 		} else if jobID, ok := JobIDFromNotify(line); ok {
 			se.setJobID(jobID)
+			if netDiff, ok := NetworkDifficultyFromNotify(line); ok {
+				se.observeNotify(netDiff)
+			}
 		}
 
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))

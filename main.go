@@ -56,6 +56,9 @@ func main() {
 		if cfg.CommissionSuggestDifficulty {
 			extra += " suggest_diff"
 		}
+		if cfg.BTCOnly() {
+			extra += " btc_only"
+		}
 		if cfg.CommissionEvery > 0 {
 			if cfg.CommissionSessionEvery > 0 {
 				log.Printf("[MAIN] commission: worker=%q percent=%v%% every=%s session=%s%s",
@@ -87,6 +90,10 @@ func main() {
 		// commission_worker в отдельном проверочном соединении (пул комиссии
 		// на динамическом IP, белый список адресов не годится).
 		opts = append(opts, proxy.WithPoolProbe(nil))
+		// По договору комиссия только с BTC: остальные монеты — прозрачно.
+		if cfg.BTCOnly() {
+			opts = append(opts, proxy.WithBTCOnly())
+		}
 		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, cfg.CommissionSessionEvery, stats, opts...)
 		commission.Start()
 		defer commission.Close()

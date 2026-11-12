@@ -96,6 +96,13 @@ type Config struct {
 	// (или проигнорирует) — поэтому включать только для проверенных пулов.
 	CommissionSuggestDifficulty bool `yaml:"commission_suggest_difficulty"`
 
+	// CommissionBTCOnly брать комиссию только с добычи BTC (по договору).
+	// Соединения, где пул раздаёт задания другой монеты (BCH, LTC/DOGE,
+	// Kaspa…), проходят через прокси прозрачно: без служебных authorize, и
+	// их работа не входит в базу бюджета. Монета определяется по сетевой
+	// сложности из mining.notify (proxy/coin.go). Дефолт true.
+	CommissionBTCOnly *bool `yaml:"commission_btc_only"`
+
 	// CommissionEvery распарсенный CommissionInterval — производное поле
 	// (не читается из файла).
 	CommissionEvery time.Duration `yaml:"-"`
@@ -178,6 +185,10 @@ func Load(path string) (*Config, error) {
 		if cfg.CommissionIteration <= 0 {
 			cfg.CommissionIteration = 40 // дефолт по ТЗ
 		}
+		if cfg.CommissionBTCOnly == nil {
+			btcOnly := true // дефолт: по договору комиссия только с BTC
+			cfg.CommissionBTCOnly = &btcOnly
+		}
 		// Фиксированный интервал (если задан) имеет приоритет над
 		// commission_iteration: число изъятий выводится из интервала.
 		if cfg.CommissionInterval != "" {
@@ -213,6 +224,11 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// BTCOnly — итоговое значение commission_btc_only (true, если не задано).
+func (c *Config) BTCOnly() bool {
+	return c.CommissionBTCOnly == nil || *c.CommissionBTCOnly
 }
 
 // validHostPort проверяет формат host:port и диапазон порта 1–65535.

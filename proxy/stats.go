@@ -60,6 +60,7 @@ type poolStat struct {
 	rejected  int
 	lost      int
 	workers   map[string]struct{}
+	coin      string // "btc" / "other" по последнему notify; "" — неизвестно
 	firstSeen time.Time
 	lastSeen  time.Time
 }
@@ -215,8 +216,16 @@ func (s *Stats) Accepted() int {
 }
 
 // Result фиксирует ответ пула на шару: accepted=true → result:true.
-// rejected шары получают lastError (причина из error[1]).
+// rejected шары получают lastError (причина из error[1]). Принятая работа
+// входит в базу бюджета комиссии (см. ResultWork).
 func (s *Stats) Result(pool, worker string, difficulty float64, accepted bool, errText string) {
+	s.ResultWork(pool, worker, difficulty, accepted, errText, true)
+}
+
+// ResultWork — Result с явным признаком billable: false — шара учитывается
+// в мониторинге (счётчики, хешрейт, средние), но её работа не входит в
+// AcceptedWork, от которой считается бюджет комиссии (не-BTC монеты).
+func (s *Stats) ResultWork(pool, worker string, difficulty float64, accepted bool, errText string, billable bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
@@ -224,7 +233,9 @@ func (s *Stats) Result(pool, worker string, difficulty float64, accepted bool, e
 	w := s.getWorker(pool, worker, now)
 	if accepted {
 		s.accepted++
-		s.acceptedWork += difficulty
+		if billable {
+			s.acceptedWork += difficulty
+		}
 		s.averages.add(now, normalAccepted, difficulty)
 		p.accepted++
 		w.accepted++
@@ -262,6 +273,13 @@ func (s *Stats) SetDifficulty(pool, worker string, difficulty float64) {
 	defer s.mu.Unlock()
 	w := s.getWorker(pool, worker, time.Now())
 	w.difficulty = difficulty
+}
+
+// SetPoolCoin запоминает монету пула ("btc"/"other") для /status.
+func (s *Stats) SetPoolCoin(pool, coin string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getPool(pool, time.Now()).coin = coin
 }
 
 // SetJobID запоминает последний id задания воркера из mining.notify.
@@ -339,6 +357,7 @@ type PoolReport struct {
 	AcceptedPercent float64 `json:"accepted_percent"`
 	Hashrate        int64   `json:"hashrate"`
 	Workers         int     `json:"workers"`
+	Coin            string  `json:"coin,omitempty"`
 	FirstSeen       string  `json:"first_seen"`
 	LastSeen        string  `json:"last_seen"`
 }
@@ -390,6 +409,7 @@ func (s *Stats) Report() Report {
 			Lost:            p.lost,
 			AcceptedPercent: percent(p.accepted, p.submits),
 			Workers:         len(p.workers),
+			Coin:            p.coin,
 			FirstSeen:       p.firstSeen.Format(time.RFC3339),
 			LastSeen:        p.lastSeen.Format(time.RFC3339),
 		}

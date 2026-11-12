@@ -188,6 +188,26 @@ func JobIDFromNotify(raw []byte) (string, bool) {
 	return id, true
 }
 
+// NetworkDifficultyFromNotify достаёт сетевую сложность из mining.notify
+// формата Bitcoin Stratum V1: params = [job_id, prevhash, coinb1, coinb2,
+// merkle_branch, version, nbits, ntime, clean_jobs]. ok = false — строка не
+// notify; netDiff = 0 — notify другого формата (не BTC-подобное задание).
+func NetworkDifficultyFromNotify(raw []byte) (netDiff float64, ok bool) {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != "mining.notify" {
+		return 0, false
+	}
+	var params []json.RawMessage
+	if err := json.Unmarshal(msg.Params, &params); err != nil || len(params) < 9 {
+		return 0, true
+	}
+	var nbits string
+	if err := json.Unmarshal(params[6], &nbits); err != nil {
+		return 0, true
+	}
+	return networkDifficultyFromBits(nbits), true
+}
+
 // ParseSetDifficulty разбирает mining.set_difficulty (пул → майнер):
 // params[0] — новая сложность. По ней считается хешрейт воркера.
 func ParseSetDifficulty(raw []byte) (float64, bool) {

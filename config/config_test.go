@@ -198,3 +198,20 @@ func TestLoadCommissionSuggestDifficulty(t *testing.T) {
 		t.Error("commission_suggest_difficulty должен быть включён")
 	}
 }
+
+func TestLoadCommissionBTCOnly(t *testing.T) {
+	cfg, err := Load(writeTmp(t, "commission_worker: fee\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.BTCOnly() {
+		t.Fatal("commission_btc_only по умолчанию должен быть true")
+	}
+	cfg, err = Load(writeTmp(t, "commission_worker: fee\ncommission_btc_only: false\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BTCOnly() {
+		t.Fatal("commission_btc_only: false должен выключать фильтр")
+	}
+}

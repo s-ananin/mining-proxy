@@ -200,6 +200,11 @@ type Commission struct {
 	// сложность сессии на уровне сложности майнера (mining.suggest_difficulty).
 	suggestDiff bool
 
+	// btcOnly: комиссия берётся только в соединениях, где пул раздаёт
+	// задания BTC (см. coin.go). Остальные монеты идут прозрачно, и их
+	// работа не входит в базу бюджета.
+	btcOnly bool
+
 	// Состояние суточного окна.
 	windowStart     time.Time
 	baseWork        float64
@@ -261,6 +266,18 @@ func WithWorkerRotation() CommissionOption {
 // комиссии свой vardiff.
 func WithSuggestDifficulty() CommissionOption {
 	return func(c *Commission) { c.suggestDiff = true }
+}
+
+// WithBTCOnly ограничивает комиссию заданиями BTC: соединения с другими
+// монетами (и с ещё не опознанной монетой) проходят без изъятия.
+func WithBTCOnly() CommissionOption {
+	return func(c *Commission) { c.btcOnly = true }
+}
+
+// BTCOnly сообщает, ограничена ли комиссия заданиями BTC. Значение
+// задаётся опцией при создании и дальше не меняется.
+func (c *Commission) BTCOnly() bool {
+	return c != nil && c.btcOnly
 }
 
 // NewCommission создаёт сборщик комиссии. worker == "" — комиссия
@@ -458,7 +475,7 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		// Report accepted work separately from attempts and unanswered shares.
 		if c.workSinceTick > 0 || c.acceptedSinceTick > 0 {
 			actualTh := c.acceptedSinceTick * diffToHashF / c.interval.Seconds() / 1e12
-			expectedTh := float64(c.stats.Report().Totals.Hashrate) / 1e12 * c.percent / 100
+			expectedTh := float64(c.billableHashrateLocked()) / 1e12 * c.percent / 100
 			log.Printf("[COMMISSION] interval sent_work=%.0f accepted_work=%.0f accepted=%.2f TH/s expected=%.2f TH/s (total issued=%.0f accepted=%.0f rejected=%.0f)",
 				c.workSinceTick, c.acceptedSinceTick, actualTh, expectedTh, c.workIssued, c.workAccepted, c.workRejected)
 			c.workSinceTick = 0
@@ -517,6 +534,22 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	}
 	c.nextIterationAt = next
 	return next
+}
+
+// billableHashrateLocked — хешрейт, с которого берётся комиссия: весь поток
+// или, в режиме btcOnly, только пулы с заданиями BTC. Только для логов.
+func (c *Commission) billableHashrateLocked() int64 {
+	rep := c.stats.Report()
+	if !c.btcOnly {
+		return rep.Totals.Hashrate
+	}
+	var hr int64
+	for _, p := range rep.Pools {
+		if p.Coin == coinBTC.String() {
+			hr += p.Hashrate
+		}
+	}
+	return hr
 }
 
 // capCarryLocked ограничивает перенос неизрасходованного бюджета на новый
