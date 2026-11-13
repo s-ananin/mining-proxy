@@ -147,3 +147,20 @@ func TestStatusWithoutSubnetsReportsProblem(t *testing.T) {
 		t.Errorf("в проблемах ожидалось упоминание allowed_subnets, получено: %s", joined)
 	}
 }
+
+func TestDportFilter(t *testing.T) {
+	cases := []struct {
+		opts Options
+		want string
+	}{
+		{Options{CaptureAllTCP: true, CapturePorts: "25:9999", UpstreamPort: "3333"}, "25:9999"},
+		{Options{CaptureAllTCP: true, CapturePorts: "9999"}, "9999"},
+		{Options{CaptureAllTCP: true}, ""},
+		{Options{CaptureAllTCP: false, CapturePorts: "25:9999", UpstreamPort: "3333"}, "3333"},
+	}
+	for _, c := range cases {
+		if got := dportFilter(c.opts); got != c.want {
+			t.Errorf("dportFilter(%+v) = %q, want %q", c.opts, got, c.want)
+		}
+	}
+}

@@ -105,6 +105,7 @@ func main() {
 		ListenAddr:    cfg.ListenAddr,
 		UpstreamPort:  cfg.UpstreamPort,
 		CaptureAllTCP: cfg.CaptureAllTCP,
+		CapturePorts:  cfg.CapturePorts(),
 		IngressIfaces: cfg.NATIngressIfaces,
 	}
 
@@ -126,8 +127,8 @@ func main() {
 	// Cleanup снимает правила при остановке — fail-open: трафик майнеров
 	// уходит напрямую в пул, майнинг не прерывается.
 	if cfg.SetupIPTables {
-		log.Printf("[MAIN] iptables setup (capture_all_tcp=%v, subnets=%v)",
-			cfg.CaptureAllTCP, cfg.AllowedSubnets)
+		log.Printf("[MAIN] iptables setup (capture_all_tcp=%v, ports=%s, subnets=%v)",
+			cfg.CaptureAllTCP, cfg.CapturePorts(), cfg.AllowedSubnets)
 		if err := iptables.Setup(natOpts); err != nil {
 			log.Fatalf("[FATAL] iptables: %v", err)
 		}

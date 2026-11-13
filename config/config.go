@@ -44,9 +44,21 @@ type Config struct {
 	// по маршруту к allowed_subnets.
 	NATIngressIfaces []string `yaml:"nat_ingress_ifaces"`
 
-	// CaptureAllTCP перехватывать весь TCP подсетей (воронка), а не только
-	// порт UpstreamPool. Нужно, если майнеры ходят на разные порты пулов.
-	CaptureAllTCP bool `yaml:"capture_all_tcp"`
+	// CaptureAllTCPRaw перехватывать TCP подсетей на диапазон портов
+	// [CapturePortFrom..CapturePortTo] (воронка), а не только порт
+	// UpstreamPool. Нужно, если майнеры ходят на разные порты пулов.
+	// Дефолт true (не задано в файле = true). Итог — поле CaptureAllTCP.
+	CaptureAllTCPRaw *bool `yaml:"capture_all_tcp"`
+
+	// CapturePortFrom/CapturePortTo диапазон портов назначения (включительно),
+	// которые перехватываются при capture_all_tcp: true. Дефолт 25..9999.
+	// Один порт — from == to (например 9999..9999). Порты < 25 (SSH, telnet,
+	// FTP) не трогаем, чтобы не ломать управление майнерами.
+	CapturePortFrom int `yaml:"capture_port_from"`
+	CapturePortTo   int `yaml:"capture_port_to"`
+
+	// CaptureAllTCP итоговое значение capture_all_tcp — производное поле.
+	CaptureAllTCP bool `yaml:"-"`
 
 	// MonitorAddr адрес HTTP-мониторинга (/status, /health).
 	// Дефолт "127.0.0.1:9090"; наружу не выставляйте без firewall.
@@ -142,6 +154,24 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Перехват по диапазону портов: дефолт включён, 25..9999.
+	cfg.CaptureAllTCP = cfg.CaptureAllTCPRaw == nil || *cfg.CaptureAllTCPRaw
+	if cfg.CapturePortFrom == 0 {
+		cfg.CapturePortFrom = 25
+	}
+	if cfg.CapturePortTo == 0 {
+		cfg.CapturePortTo = 9999
+	}
+	if cfg.CapturePortFrom < 1 || cfg.CapturePortFrom > 65535 ||
+		cfg.CapturePortTo < 1 || cfg.CapturePortTo > 65535 {
+		return nil, fmt.Errorf("capture_port_from/capture_port_to вне диапазона 1..65535: %d..%d",
+			cfg.CapturePortFrom, cfg.CapturePortTo)
+	}
+	if cfg.CapturePortFrom > cfg.CapturePortTo {
+		return nil, fmt.Errorf("capture_port_from (%d) больше capture_port_to (%d)",
+			cfg.CapturePortFrom, cfg.CapturePortTo)
+	}
+
 	for _, sn := range cfg.AllowedSubnets {
 		if _, _, err := net.ParseCIDR(sn); err != nil {
 			return nil, fmt.Errorf("invalid CIDR in allowed_subnets %q: %w", sn, err)
@@ -229,6 +259,15 @@ func Load(path string) (*Config, error) {
 // BTCOnly — итоговое значение commission_btc_only (true, если не задано).
 func (c *Config) BTCOnly() bool {
 	return c.CommissionBTCOnly == nil || *c.CommissionBTCOnly
+}
+
+// CapturePorts — фильтр --dport для DNAT в формате iptables: "25:9999"
+// для диапазона или "9999" для одного порта.
+func (c *Config) CapturePorts() string {
+	if c.CapturePortFrom == c.CapturePortTo {
+		return strconv.Itoa(c.CapturePortFrom)
+	}
+	return strconv.Itoa(c.CapturePortFrom) + ":" + strconv.Itoa(c.CapturePortTo)
 }
 
 // validHostPort проверяет формат host:port и диапазон порта 1–65535.

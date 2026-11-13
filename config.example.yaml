@@ -27,9 +27,17 @@ setup_iptables: true
 # nat_ingress_ifaces:
 #   - "eth1"
 
-# Перехватывать весь TCP подсетей, а не только порт upstream_pool.
-# Нужно, если майнеры ходят на разные порты разных пулов.
-capture_all_tcp: false
+# Перехватывать TCP подсетей на любой порт из диапазона
+# capture_port_from..capture_port_to, а не только порт upstream_pool.
+# Нужно, если майнеры ходят на разные порты разных пулов. Дефолт true.
+# false — перехват только порта upstream_pool (диапазон не используется).
+capture_all_tcp: true
+
+# Диапазон портов назначения (включительно) для перехвата при
+# capture_all_tcp: true. Дефолт 25..9999. Один порт — одинаковые значения
+# (например 9999 и 9999). В iptables это --dport 25:9999.
+capture_port_from: 25
+capture_port_to: 9999
 
 # HTTP-мониторинг (/status, /health). Не выставляйте наружу без firewall.
 monitor_addr: "127.0.0.1:9090"

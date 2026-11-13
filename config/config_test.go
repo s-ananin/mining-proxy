@@ -215,3 +215,39 @@ func TestLoadCommissionBTCOnly(t *testing.T) {
 		t.Fatal("commission_btc_only: false должен выключать фильтр")
 	}
 }
+
+func TestLoadCapturePortsDefaults(t *testing.T) {
+	cfg, err := Load(writeTmp(t, "listen_addr: \"0.0.0.0:8443\"\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.CaptureAllTCP {
+		t.Errorf("capture_all_tcp по умолчанию должен быть true")
+	}
+	if got := cfg.CapturePorts(); got != "25:9999" {
+		t.Errorf("CapturePorts = %q, want 25:9999", got)
+	}
+}
+
+func TestLoadCapturePortsSingle(t *testing.T) {
+	cfg, err := Load(writeTmp(t, "capture_port_from: 9999\ncapture_port_to: 9999\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.CapturePorts(); got != "9999" {
+		t.Errorf("CapturePorts = %q, want 9999", got)
+	}
+}
+
+func TestLoadCapturePortsInvalid(t *testing.T) {
+	cases := []string{
+		"capture_port_from: 5000\ncapture_port_to: 100\n",
+		"capture_port_from: 25\ncapture_port_to: 70000\n",
+		"capture_port_from: -1\n",
+	}
+	for _, c := range cases {
+		if _, err := Load(writeTmp(t, c)); err == nil {
+			t.Errorf("ожидалась ошибка для %q", c)
+		}
+	}
+}
