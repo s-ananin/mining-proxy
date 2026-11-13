@@ -121,6 +121,23 @@ func workerFromParams(raw []byte, method string) string {
 	return name
 }
 
+// JobIDFromSubmit достаёт id задания из mining.submit: params[1].
+func JobIDFromSubmit(raw []byte) string {
+	msg, err := Parse(raw)
+	if err != nil || msg.Method != "mining.submit" {
+		return ""
+	}
+	var params []json.RawMessage
+	if err := json.Unmarshal(msg.Params, &params); err != nil || len(params) < 2 {
+		return ""
+	}
+	var id string
+	if err := json.Unmarshal(params[1], &id); err != nil {
+		return ""
+	}
+	return id
+}
+
 // SubmitID возвращает id запроса mining.submit в виде строки — по нему потом
 // сопоставляется ответ пула (пул эхом возвращает тот же id). Окавычки JSON
 // сохраняются: id 3 и id "3" — разные ключи, как и у пула.

@@ -22,6 +22,13 @@ import (
 // тех пор только росла; ближайший SHA-256 конкурент (BCH) на два порядка ниже.
 const btcMinNetworkDifficulty = 1e13
 
+// btcMaxNetworkDifficulty — верхняя граница правдоподобной сложности BTC
+// (сейчас ~1e14, запас ~три порядка). Нужна, чтобы nbits в чужом формате
+// (обратный порядок байт, другая монета с похожим notify) не дал случайно
+// огромную «сложность» и не был принят за BTC. Выше границы — «не BTC»
+// (fail-open в пользу клиента).
+const btcMaxNetworkDifficulty = 1e17
+
 // coinKind — монета соединения по последнему mining.notify.
 type coinKind int
 
@@ -44,7 +51,7 @@ func (k coinKind) String() string {
 // classifyCoin относит задание к монете по сетевой сложности из nbits.
 // netDiff <= 0 — формат задания не биткоиновский (или nbits не разобран).
 func classifyCoin(netDiff float64) coinKind {
-	if netDiff >= btcMinNetworkDifficulty {
+	if netDiff >= btcMinNetworkDifficulty && netDiff <= btcMaxNetworkDifficulty {
 		return coinBTC
 	}
 	return coinOther

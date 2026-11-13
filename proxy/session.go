@@ -54,7 +54,18 @@ type session struct {
 	suggestAt      time.Time     // когда последний раз просили у пула закрепить сложность
 	freqLimitUntil time.Time     // бэк-офф при "Frequency limit exceeded"
 	coin           coinKind      // монета по последнему mining.notify (coin.go)
+	// jobCoin — монета каждого из последних заданий (job_id → монета).
+	// Шара относится к конкретному заданию, а не к «последнему notify»:
+	// при смене монеты пулом майнер ещё какое-то время сдаёт шары по
+	// старым заданиям. Комиссия разрешена только для шары, чьё задание
+	// опознано как BTC. jobOrder — порядок для вытеснения старых id.
+	jobCoin  map[string]coinKind
+	jobOrder []string
 }
+
+// maxTrackedJobs — сколько последних заданий помнить для определения
+// монеты шары. Пулы держат валидными единицы–десятки заданий.
+const maxTrackedJobs = 128
 
 // newSession регистрирует соединение в реестре.
 func newSession(stats *Stats, pool, source string, commission *Commission) *session {
@@ -251,14 +262,27 @@ func (s *session) difficulty() float64 {
 	return s.diff
 }
 
-// observeNotify обновляет монету соединения по сетевой сложности из
-// mining.notify. Пул может переключить монету на лету (smart mining),
-// поэтому решение пересчитывается на каждом задании.
-func (s *session) observeNotify(netDiff float64) {
+// observeNotify обновляет монету соединения и задания jobID по сетевой
+// сложности из mining.notify. Пул может переключить монету на лету (smart
+// mining), поэтому решение пересчитывается на каждом задании.
+func (s *session) observeNotify(jobID string, netDiff float64) {
 	kind := classifyCoin(netDiff)
 	s.mu.Lock()
 	prev := s.coin
 	s.coin = kind
+	if jobID != "" {
+		if s.jobCoin == nil {
+			s.jobCoin = make(map[string]coinKind)
+		}
+		if _, seen := s.jobCoin[jobID]; !seen {
+			s.jobOrder = append(s.jobOrder, jobID)
+			if len(s.jobOrder) > maxTrackedJobs {
+				delete(s.jobCoin, s.jobOrder[0])
+				s.jobOrder = s.jobOrder[1:]
+			}
+		}
+		s.jobCoin[jobID] = kind
+	}
 	s.mu.Unlock()
 	if prev == kind {
 		return
@@ -273,21 +297,30 @@ func (s *session) observeNotify(netDiff float64) {
 	}
 }
 
-// coinAllowsCommission сообщает, можно ли изымать комиссию на этом
-// соединении с учётом монеты: в режиме btcOnly — только для заданий BTC.
-func (s *session) coinAllowsCommission() bool {
+// coinAllowsCommission сообщает, можно ли изъять в комиссию шару по
+// заданию jobID: в режиме btcOnly — только если и само задание шары, и
+// текущее задание соединения опознаны как BTC. Неизвестное задание (не
+// видели его notify, пустой job_id) — запрет (fail-open в пользу клиента).
+func (s *session) coinAllowsCommission(jobID string) bool {
 	if !s.commission.BTCOnly() {
 		return true
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.coin == coinBTC
+	return s.coin == coinBTC && jobID != "" && s.jobCoin[jobID] == coinBTC
 }
 
-// billableLocked — входит ли работа шары в базу бюджета комиссии.
-// Вызывается под s.mu.
-func (s *session) billableLocked() bool {
-	return !s.commission.BTCOnly() || s.coin == coinBTC
+// billableLocked — входит ли работа шары по заданию jobID в базу бюджета
+// комиссии. Задание известно — решает его монета, иначе текущая монета
+// соединения. Вызывается под s.mu.
+func (s *session) billableLocked(jobID string) bool {
+	if !s.commission.BTCOnly() {
+		return true
+	}
+	if k, ok := s.jobCoin[jobID]; ok && jobID != "" {
+		return k == coinBTC
+	}
+	return s.coin == coinBTC
 }
 
 // authorize обрабатывает mining.authorize.
@@ -332,6 +365,12 @@ func (s *session) setJobID(jobID string) {
 // id пустой (нет id в запросе) — шара учитывается, но сопоставить ответ
 // будет нельзя: она останется незакрытой до закрытия сессии.
 func (s *session) submit(id, worker string) {
+	s.submitJob(id, worker, "")
+}
+
+// submitJob — submit с id задания шары (params[1]): по нему определяется,
+// входит ли работа шары в базу бюджета комиссии (только BTC).
+func (s *session) submitJob(id, worker, jobID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -370,7 +409,7 @@ func (s *session) submit(id, worker string) {
 	}
 	s.stats.Submit(s.pool, w, s.source, diff)
 	if id != "" {
-		s.pending[id] = pendingShare{worker: w, diff: diff, at: now, billable: s.billableLocked()}
+		s.pending[id] = pendingShare{worker: w, diff: diff, at: now, billable: s.billableLocked(jobID)}
 	}
 }
 

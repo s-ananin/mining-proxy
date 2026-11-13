@@ -317,9 +317,11 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 
 		if IsMinerSubmit(line) {
 			id, _ := SubmitID(line)
+			submitJob := JobIDFromSubmit(line)
 			// coinAllowsCommission: по договору комиссия только с BTC —
-			// соединения с другими монетами идут прозрачно (coin.go).
-			if id != "" && commission != nil && commission.Enabled() && se.coinAllowsCommission() && !se.feeDeniedNow() && !se.restoringMiner() {
+			// шара берётся, только если её задание опознано как BTC
+			// (coin.go); остальное идёт прозрачно.
+			if id != "" && commission != nil && commission.Enabled() && se.coinAllowsCommission(submitJob) && !se.feeDeniedNow() && !se.restoringMiner() {
 				reservedWork := se.difficulty()
 				if feeAuth && se.feeDifficulty() > 0 {
 					reservedWork = se.feeDifficulty()
@@ -419,7 +421,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			if !se.waitMinerRestore() {
 				return
 			}
-			se.submit(id, WorkerFromSubmit(line))
+			se.submitJob(id, WorkerFromSubmit(line), submitJob)
 		} else if IsMinerAuthorize(line) {
 			se.authorize(WorkerFromAuthorize(line))
 		}
@@ -515,7 +517,7 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 		} else if jobID, ok := JobIDFromNotify(line); ok {
 			se.setJobID(jobID)
 			if netDiff, ok := NetworkDifficultyFromNotify(line); ok {
-				se.observeNotify(netDiff)
+				se.observeNotify(jobID, netDiff)
 			}
 		}
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,11 @@ func TestNetworkDifficultyFromBits(t *testing.T) {
 		{"not hex", "zz053894", 0, coinOther},
 		{"zero mantissa", "17000000", 0, coinOther},
 		{"negative", "17853894", 0, coinOther},
+		// Обратный порядок байт BTC-nbits "17053894" → "94380517": экспонента
+		// 0x94 даёт ничтожную «сложность» (~5e-289), не BTC.
+		{"reversed btc", "94380517", 4.69e-289, coinOther},
+		// Абсурдно большая «сложность» (экспонента 0x10) — не BTC.
+		{"absurd", "10053894", 3.88e30, coinOther},
 	}
 	for _, tc := range cases {
 		got := networkDifficultyFromBits(tc.nbits)
@@ -68,7 +74,7 @@ func TestNonBTCWorkNotBillable(t *testing.T) {
 	defer ltc.close()
 	ltc.authorize("client.l7")
 	ltc.setDifficulty(1000)
-	ltc.observeNotify(7e7)
+	ltc.observeNotify("l1", 7e7)
 	ltc.submit(`1`, "client.l7")
 	ltc.resolve(PoolResponse{ID: `1`, Accepted: true})
 
@@ -76,7 +82,7 @@ func TestNonBTCWorkNotBillable(t *testing.T) {
 	defer btc.close()
 	btc.authorize("client.s21")
 	btc.setDifficulty(500)
-	btc.observeNotify(1.4e14)
+	btc.observeNotify("b1", 1.4e14)
 	btc.submit(`1`, "client.s21")
 	btc.resolve(PoolResponse{ID: `1`, Accepted: true})
 
@@ -100,7 +106,7 @@ func TestNonBTCWorkNotBillable(t *testing.T) {
 	se := newSession(stats2, "ltc:3333", "10.0.0.1", c2)
 	defer se.close()
 	se.setDifficulty(1000)
-	se.observeNotify(7e7)
+	se.observeNotify("l1", 7e7)
 	se.submit(`1`, "client.l7")
 	se.resolve(PoolResponse{ID: `1`, Accepted: true})
 	if w := stats2.AcceptedWork(); w != 1000 {
@@ -136,7 +142,7 @@ func TestBTCOnlyCommissionGate(t *testing.T) {
 			se := newSession(stats, "pool:3333", "10.0.0.1", c)
 			se.setDifficulty(1)
 			if tc.netDiff >= 0 {
-				se.observeNotify(tc.netDiff)
+				se.observeNotify("job1", tc.netDiff)
 			}
 			defer se.close()
 
@@ -183,5 +189,102 @@ func TestBTCOnlyCommissionGate(t *testing.T) {
 				t.Fatalf("не-BTC: шара должна уйти без изменений, получено %s %s", m, w)
 			}
 		})
+	}
+}
+
+// Шара берётся в комиссию по монете СВОЕГО задания, а не последнего notify:
+// после переключения пула BCH→BTC запоздалая шара по заданию BCH — не BTC.
+func TestCoinGatePerJob(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithBTCOnly())
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+
+	se.observeNotify("bch1", 6e11)
+	if se.coinAllowsCommission("bch1") {
+		t.Fatal("задание BCH не должно облагаться")
+	}
+	se.observeNotify("btc1", 1.4e14)
+	if se.coinAllowsCommission("bch1") {
+		t.Fatal("запоздалая шара по заданию BCH после переключения на BTC облагаться не должна")
+	}
+	if !se.coinAllowsCommission("btc1") {
+		t.Fatal("шара по заданию BTC должна облагаться")
+	}
+	if se.coinAllowsCommission("never-seen") || se.coinAllowsCommission("") {
+		t.Fatal("шара по неизвестному заданию облагаться не должна")
+	}
+	// Обратное переключение BTC→BCH: даже шара по старому BTC-заданию уже
+	// не берётся — соединение сейчас не BTC.
+	se.observeNotify("bch2", 6e11)
+	if se.coinAllowsCommission("btc1") {
+		t.Fatal("после переключения на BCH комиссия запрещена целиком")
+	}
+
+	// В базу бюджета идёт только работа BTC-заданий.
+	se.setDifficulty(100)
+	se.submitJob(`1`, "client.w", "bch1")
+	se.resolve(PoolResponse{ID: `1`, Accepted: true})
+	se.submitJob(`2`, "client.w", "btc1")
+	se.resolve(PoolResponse{ID: `2`, Accepted: true})
+	if w := stats.AcceptedWork(); w != 100 {
+		t.Fatalf("в базу бюджета должна попасть только шара BTC: %g", w)
+	}
+}
+
+// Таблица заданий ограничена: старые id вытесняются и дальше считаются
+// неизвестными (без комиссии).
+func TestCoinJobTableBounded(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithBTCOnly())
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+	for i := 0; i < maxTrackedJobs+10; i++ {
+		se.observeNotify(strconv.Itoa(i), 1.4e14)
+	}
+	if len(se.jobCoin) != maxTrackedJobs || len(se.jobOrder) != maxTrackedJobs {
+		t.Fatalf("таблица заданий не ограничена: %d/%d", len(se.jobCoin), len(se.jobOrder))
+	}
+	if se.coinAllowsCommission("0") {
+		t.Fatal("вытесненное задание должно считаться неизвестным")
+	}
+	if !se.coinAllowsCommission(strconv.Itoa(maxTrackedJobs + 9)) {
+		t.Fatal("свежее задание BTC должно облагаться")
+	}
+}
+
+// Notify, пришедший во время restore (пул сменил монету именно тогда),
+// тоже обновляет монету соединения.
+func TestCoinObservedDuringRestore(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithBTCOnly())
+	se := newSession(stats, "pool:3333", "10.0.0.1", c)
+	defer se.close()
+	se.observeNotify("btc1", 1.4e14)
+
+	minerConn, minerSide := net.Pipe()
+	defer minerConn.Close()
+	defer minerSide.Close()
+	go func() { bufio.NewReader(minerSide).ReadString('\n') }()
+
+	se.beginMinerRestore(nil)
+	bch := []byte(`{"id":null,"method":"mining.notify","params":["bch1","p","c1","c2",[],"20000000","1801d4c0","6500a1b2",true]}`)
+	if err := se.publishMinerRestore(minerConn, [][]byte{bch}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if se.coinAllowsCommission("btc1") || se.coinAllowsCommission("bch1") {
+		t.Fatal("после notify BCH в restore комиссия должна быть запрещена")
+	}
+}
+
+func TestJobIDFromSubmit(t *testing.T) {
+	if j := JobIDFromSubmit([]byte(`{"id":2,"method":"mining.submit","params":["w","job1","n2","nt","nc"]}`)); j != "job1" {
+		t.Fatalf("job id: %q", j)
+	}
+	if j := JobIDFromSubmit([]byte(`{"id":2,"method":"mining.submit","params":["w"]}`)); j != "" {
+		t.Fatalf("короткий submit: %q", j)
+	}
+	if j := JobIDFromSubmit([]byte(`{"id":2,"method":"mining.authorize","params":["w","x"]}`)); j != "" {
+		t.Fatalf("не submit: %q", j)
 	}
 }

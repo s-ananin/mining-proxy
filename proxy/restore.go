@@ -88,6 +88,12 @@ func (s *session) publishMinerRestore(dst net.Conn, updates [][]byte) error {
 		}
 		if job, ok := JobIDFromNotify(line); ok {
 			s.setJobID(job)
+			// Монету отслеживаем и здесь: пул может сменить её именно в
+			// задании после restore-authorize, иначе соединение осталось
+			// бы с устаревшей отметкой «BTC».
+			if netDiff, ok := NetworkDifficultyFromNotify(line); ok {
+				s.observeNotify(job, netDiff)
+			}
 		}
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if err := writeLine(dst, line); err != nil {
