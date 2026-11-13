@@ -1,0 +1,528 @@
+// Файл session.go — состояние одного соединения майнер↔пул.
+//
+// Сессия живёт ровно столько, сколько TCP-соединение, и отвечает за три
+// вещи:
+//
+//   - текущий воркер соединения (authorize / подмена в submit);
+//   - текущую сложность пула (mining.set_difficulty) — ею штампуются шары;
+//   - таблицу ожидающих ответа шар (id запроса → воркер и сложность).
+//
+// Обе стороны соединения (майнер→пул и пул→майнер) работают в своих
+// goroutine и сюда заходят под мьютексом сессии; сам реестр Stats
+// потокобезопасен, обратных вызовов в сессию он не делает.
+package proxy
+
+import (
+	"log"
+	"sync"
+	"time"
+)
+
+// pendingShare — отправленная шара, ждущая ответа пула. commission = true,
+// если шара забрана комиссией (ответ учтётся в счётчиках комиссии, а не в
+// статистике воркера майнера).
+type pendingShare struct {
+	worker         string
+	diff           float64
+	at             time.Time
+	commission     bool
+	feeDiffUnknown bool
+	feeEstimate    float64
+	// billable — работа шары входит в базу бюджета комиссии. false для
+	// шар не-BTC соединений в режиме btcOnly (их работа не облагается).
+	billable bool
+}
+
+// session — привязка соединения к реестру статистики.
+type session struct {
+	mu             sync.Mutex
+	feeRetryAt     time.Time
+	restoreDone    chan struct{}
+	restore        *minerRestore
+	stats          *Stats
+	pool           string // адресат соединения (реальный пул из DNAT)
+	source         string // IP майнера (без порта)
+	worker         string // текущий воркер (пусто, пока не авторизовался)
+	diff           float64
+	pending        map[string]pendingShare
+	closed         bool
+	commission     *Commission   // сборщик комиссии; nil — выключена
+	feeDenied      bool          // пул отклонил служебный authorize — не изымаем
+	commAck        chan struct{} // ответ пула на текущую изъятую шару (сериализация)
+	feeActive      bool          // соединение сейчас авторизовано под commission_worker
+	feeDiff        float64       // сложность, которую пул назначил воркеру комиссии
+	suggestAt      time.Time     // когда последний раз просили у пула закрепить сложность
+	freqLimitUntil time.Time     // бэк-офф при "Frequency limit exceeded"
+	coin           coinKind      // монета по последнему mining.notify (coin.go)
+	// jobCoin — монета каждого из последних заданий (job_id → монета).
+	// Шара относится к конкретному заданию, а не к «последнему notify»:
+	// при смене монеты пулом майнер ещё какое-то время сдаёт шары по
+	// старым заданиям. Комиссия разрешена только для шары, чьё задание
+	// опознано как BTC. jobOrder — порядок для вытеснения старых id.
+	jobCoin  map[string]coinKind
+	jobOrder []string
+}
+
+// maxTrackedJobs — сколько последних заданий помнить для определения
+// монеты шары. Пулы держат валидными единицы–десятки заданий.
+const maxTrackedJobs = 128
+
+// newSession регистрирует соединение в реестре.
+func newSession(stats *Stats, pool, source string, commission *Commission) *session {
+	s := &session{
+		stats:      stats,
+		pool:       pool,
+		source:     source,
+		pending:    map[string]pendingShare{},
+		commission: commission,
+	}
+	s.stats.Connect(pool)
+	return s
+}
+
+// normalizeWorker пустое имя заменяет на заглушку, чтобы в отчёте не
+// появлялся воркер с пустым именем.
+func normalizeWorker(w string) string {
+	if w == "" {
+		return unknownWorker
+	}
+	return w
+}
+
+// bindWorkerLocked привязывает воркера к сессии (вызывается под s.mu).
+// Повторный authorize с тем же именем — no-op, смена имени переносит
+// привязку (unbind старого, bind нового).
+func (s *session) bindWorkerLocked(worker string) {
+	if worker == "" || worker == s.worker {
+		return
+	}
+	if s.worker != "" {
+		s.stats.UnbindWorker(s.pool, s.worker)
+	}
+	s.worker = worker
+	s.stats.BindWorker(s.pool, worker, s.source)
+}
+
+// workerName возвращает текущий воркер майнера (из mining.authorize) — по
+// нему комиссия возвращает соединение после изъятия.
+func (s *session) workerName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.worker
+}
+
+// denyFee помечает, что пул отклонил служебную переавторизацию: на этом
+// соединении комиссия больше не изымается (fail-open для майнера).
+func (s *session) denyFee() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.feeDenied = true
+}
+
+// feeDeniedNow сообщает, отклонял ли пул служебную переавторизацию.
+func (s *session) feeDeniedNow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.feeDenied
+}
+
+// setFeeActive включает/выключает режим «соединение под commission_worker».
+// Пока режим включён, mining.set_difficulty от пула (vardiff воркера
+// комиссии) НЕ прокидывается майнеру — иначе пул уронит сложность ASIC
+// до минимума, и изъятие обесценится.
+func (s *session) setFeeActive(active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.feeActive = active
+	if active {
+		// Сложность воркера комиссии на этом витке ещё неизвестна: пул
+		// пришлёт её после нашего authorize. До уведомления work неизвестен:
+		// сложность майнера не подтверждает сложность комиссионной шары.
+		s.feeDiff = 0
+	}
+}
+
+// suppressDifficulty сообщает, надо ли выбросить mining.set_difficulty,
+// пришедший от пула: только пока соединение авторизовано под воркером
+// комиссии.
+func (s *session) suppressDifficulty() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.feeActive
+}
+
+// setFeeDiff запоминает сложность, которую пул назначил воркеру комиссии.
+// По ней видно, как пул (vardiff) опускает сложность забираемых шар.
+func (s *session) setFeeDiff(diff float64) {
+	s.mu.Lock()
+	s.feeDiff = diff
+	// Only the first difficulty after fee authorization can price a submit
+	// sent before that notification. Never reprice an already known share.
+	if diff > 0 {
+		for id, p := range s.pending {
+			if p.commission && p.feeDiffUnknown && p.diff == 0 {
+				p.diff = diff
+				s.pending[id] = p
+			}
+		}
+	}
+	c := s.commission
+	pool := s.pool
+	s.mu.Unlock()
+
+	if c != nil {
+		c.setFeeDiff(pool, diff)
+	}
+}
+
+// allowSuggest сообщает, можно ли сейчас просить пул закрепить сложность
+// сессии: не чаще раза в commissionSuggestInterval. Пул и сам ограничивает
+// частоту запросов ("Frequency limit exceeded"), поэтому лишних просьб не
+// шлём.
+func (s *session) allowSuggest() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.freqLimitUntil.IsZero() && time.Now().Before(s.freqLimitUntil) {
+		return false
+	}
+	return time.Since(s.suggestAt) >= commissionSuggestInterval
+}
+
+// feeEntryAllowed avoids authorizing a known-too-difficult worker when a
+// difficulty request is still rate-limited. Lower fee difficulty is valid.
+func (s *session) feeEntryAllowed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if now.Before(s.feeRetryAt) {
+		return false
+	}
+	return s.diff <= 0 || s.feeDiff <= s.diff ||
+		(now.Sub(s.suggestAt) >= commissionSuggestInterval && !now.Before(s.freqLimitUntil))
+}
+
+func (s *session) confirmFeeAuthorization(accepted bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !accepted {
+		s.feeDenied = true
+	}
+}
+
+func (s *session) deferFeeEntry() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.feeRetryAt = time.Now().Add(commissionSuggestInterval)
+}
+
+func (s *session) waitMinerRestore() bool {
+	s.mu.Lock()
+	done := s.restoreDone
+	pending := s.restore != nil
+	s.mu.Unlock()
+	if !pending {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	case <-time.After(minerRestoreTimeout):
+		return false
+	}
+}
+
+// markSuggestFrequencyLimited ставит бэк-офф после "Frequency limit exceeded".
+func (s *session) markSuggestFrequencyLimited() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.freqLimitUntil.IsZero() || time.Now().Add(3*time.Minute).After(s.freqLimitUntil) {
+		s.freqLimitUntil = time.Now().Add(3 * time.Minute)
+	}
+}
+
+// markSuggestSent запоминает момент последней просьбы о закреплении
+// сложности.
+func (s *session) markSuggestSent() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.suggestAt = time.Now()
+}
+
+// feeDifficulty возвращает сложность воркера комиссии (0 — неизвестна).
+func (s *session) feeDifficulty() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.feeDiff
+}
+
+// difficulty возвращает текущую сложность сессии (сложность майнера).
+func (s *session) difficulty() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.diff
+}
+
+// observeNotify обновляет монету соединения и задания jobID по сетевой
+// сложности из mining.notify. Пул может переключить монету на лету (smart
+// mining), поэтому решение пересчитывается на каждом задании.
+func (s *session) observeNotify(jobID string, netDiff float64) {
+	kind := classifyCoin(netDiff)
+	s.mu.Lock()
+	prev := s.coin
+	s.coin = kind
+	if jobID != "" {
+		if s.jobCoin == nil {
+			s.jobCoin = make(map[string]coinKind)
+		}
+		if _, seen := s.jobCoin[jobID]; !seen {
+			s.jobOrder = append(s.jobOrder, jobID)
+			if len(s.jobOrder) > maxTrackedJobs {
+				delete(s.jobCoin, s.jobOrder[0])
+				s.jobOrder = s.jobOrder[1:]
+			}
+		}
+		s.jobCoin[jobID] = kind
+	}
+	s.mu.Unlock()
+	if prev == kind {
+		return
+	}
+	s.stats.SetPoolCoin(s.pool, kind.String())
+	if s.commission.BTCOnly() {
+		if kind == coinBTC {
+			log.Printf("[COIN] miner=%s pool=%s: задание BTC (сеть diff %.3g) — комиссия разрешена", s.source, s.pool, netDiff)
+		} else {
+			log.Printf("[COIN] miner=%s pool=%s: задание не BTC (сеть diff %.3g) — прозрачно, без комиссии", s.source, s.pool, netDiff)
+		}
+	}
+}
+
+// coinAllowsCommission сообщает, можно ли изъять в комиссию шару по
+// заданию jobID: в режиме btcOnly — только если и само задание шары, и
+// текущее задание соединения опознаны как BTC. Неизвестное задание (не
+// видели его notify, пустой job_id) — запрет (fail-open в пользу клиента).
+func (s *session) coinAllowsCommission(jobID string) bool {
+	if !s.commission.BTCOnly() {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.coin == coinBTC && jobID != "" && s.jobCoin[jobID] == coinBTC
+}
+
+// billableLocked — входит ли работа шары по заданию jobID в базу бюджета
+// комиссии. Задание известно — решает его монета, иначе текущая монета
+// соединения. Вызывается под s.mu.
+func (s *session) billableLocked(jobID string) bool {
+	if !s.commission.BTCOnly() {
+		return true
+	}
+	if k, ok := s.jobCoin[jobID]; ok && jobID != "" {
+		return k == coinBTC
+	}
+	return s.coin == coinBTC
+}
+
+// authorize обрабатывает mining.authorize.
+func (s *session) authorize(worker string) {
+	if worker == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bindWorkerLocked(worker)
+}
+
+// setDifficulty запоминает сложность из mining.set_difficulty и обновляет
+// её в реестре (текущая сложность воркера видна в /status).
+func (s *session) setDifficulty(diff float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.diff = diff
+	if s.worker != "" {
+		s.stats.SetDifficulty(s.pool, s.worker, diff)
+	}
+}
+
+// setJobID запоминает последний mining.notify (id задания) для текущего
+// воркера сессии — виден в /status как last_job_id.
+func (s *session) setJobID(jobID string) {
+	if jobID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.worker != "" {
+		s.stats.SetJobID(s.pool, s.worker, jobID)
+	}
+}
+
+// submit фиксирует mining.submit: штампует шару текущей сложностью,
+// кладёт её в таблицу ожидающих и увеличивает счётчики. Если майнер в
+// submit назвал другого воркера — привязка переносится.
+//
+// id пустой (нет id в запросе) — шара учитывается, но сопоставить ответ
+// будет нельзя: она останется незакрытой до закрытия сессии.
+func (s *session) submit(id, worker string) {
+	s.submitJob(id, worker, "")
+}
+
+// submitJob — submit с id задания шары (params[1]): по нему определяется,
+// входит ли работа шары в базу бюджета комиссии (только BTC).
+func (s *session) submitJob(id, worker, jobID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if worker != "" {
+		s.bindWorkerLocked(normalizeWorker(worker))
+	}
+	w := s.worker
+	if w == "" {
+		w = unknownWorker
+	}
+	now := time.Now()
+
+	// Шары, по которым пул промолчал дольше pendingTimeout, списываем
+	// в lost прямо по ходу — таблица не должна расти бесконечно.
+	for k, p := range s.pending {
+		if now.Sub(p.at) > pendingTimeout {
+			delete(s.pending, k)
+			if p.commission {
+				if s.commission != nil {
+					s.commission.lostWork(p.diff, p.at)
+					s.commission.pauseFailure(s.pool)
+				}
+				continue // комиссионные в lost воркера не пишем
+			}
+			s.stats.LostShare(s.pool, p.worker)
+		}
+	}
+
+	// Пока соединение под воркером комиссии, сложность сессии у пула —
+	// это сложность воркера комиссии: по ней пул зачитывает любую шару,
+	// включая шары майнера. Ставим ровно её, иначе статистика прокси
+	// разойдётся с пулом.
+	diff := s.diff
+	if s.feeActive && s.feeDiff > 0 {
+		diff = s.feeDiff
+	}
+	s.stats.Submit(s.pool, w, s.source, diff)
+	if id != "" {
+		s.pending[id] = pendingShare{worker: w, diff: diff, at: now, billable: s.billableLocked(jobID)}
+	}
+}
+
+// markCommissionSubmit регистрирует забранную комиссией шару как ожидающую
+// ответа пула. Ответ по её id уйдёт в счётчики комиссии, а не воркеру
+// майнера (см. resolve). worker — имя воркера комиссии, под которым шара
+// ушла в пул (при ротации имени оно меняется от окна к окну). Возвращает
+// сложность шары (текущую сложность соединения) — комиссия копит по ней work.
+func (s *session) markCommissionSubmit(id, worker string) float64 {
+	if id == "" {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	diff := s.diff
+	unknown := s.feeActive && s.feeDiff <= 0
+	if s.feeActive {
+		diff = s.feeDiff
+	}
+	s.pending[id] = pendingShare{worker: worker, commission: true, diff: diff, at: time.Now(), feeDiffUnknown: unknown, feeEstimate: s.diff}
+	return diff
+}
+
+// armCommissionAck заводит канал ответа для очередной изъятой шары: пока
+// ответа нет, pipeMinerToPool не отправляет следующую (сериализация изъятия).
+func (s *session) armCommissionAck() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.commAck = make(chan struct{}, 1)
+	return s.commAck
+}
+
+// signalCommission сообщает отправителю, что по текущей изъятой шаре пришёл
+// ответ пула (зачёт или отказ) — можно отправлять следующую.
+func (s *session) signalCommission() {
+	s.mu.Lock()
+	ch := s.commAck
+	s.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// resolve закрывает шару по ответу пула. Возвращает false, если id не
+// известен (ответ на subscribe/authorize или дубль) — тогда строка просто
+// проксируется дальше без влияния на статистику.
+func (s *session) resolve(resp PoolResponse) bool {
+	s.mu.Lock()
+	p, ok := s.pending[resp.ID]
+	if ok {
+		delete(s.pending, resp.ID)
+	}
+	s.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if p.commission {
+		if s.commission != nil {
+			if p.feeDiffUnknown {
+				// Keep the reservation charged until the fee difficulty is known.
+				// An unknown result must not repeatedly refund and steal more shares.
+				if p.diff > 0 {
+					s.commission.settleReservation(p.at, p.feeEstimate, p.diff)
+				}
+				s.commission.priceUnknownShare(s.pool, p.diff)
+				if p.diff == 0 {
+					log.Printf("[COMMISSION] pool=%s submit id=%s: fee difficulty unknown; work excluded", s.pool, resp.ID)
+				}
+			}
+			s.commission.countResult(s.pool, resp.Accepted, p.diff, p.at)
+			if !resp.Accepted {
+				s.deferFeeEntry()
+			}
+			if resp.Accepted {
+				log.Printf("[COMMISSION] пул %s зачёл шару воркера %q (diff %g)",
+					s.pool, p.worker, p.diff)
+			} else {
+				log.Printf("[COMMISSION] пул %s отклонил шару воркера %q (diff %g): %s",
+					s.pool, p.worker, p.diff, resp.Error)
+			}
+		}
+		s.signalCommission()
+		return true
+	}
+	s.stats.ResultWork(s.pool, p.worker, p.diff, resp.Accepted, resp.Error, p.billable)
+	return true
+}
+
+// close завершает сессию: неотвеченные шары списываются в lost,
+// привязка воркера и соединение снимаются. Идемпотентно.
+func (s *session) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	for _, p := range s.pending {
+		if p.commission {
+			if s.commission != nil {
+				s.commission.lostWork(p.diff, p.at)
+				s.commission.pauseFailure(s.pool)
+			}
+			continue // комиссионные шары в lost воркера не пишем
+		}
+		s.stats.LostShare(s.pool, p.worker)
+	}
+	s.pending = nil
+	if s.worker != "" {
+		s.stats.UnbindWorker(s.pool, s.worker)
+	}
+	s.stats.Disconnect(s.pool)
+}
