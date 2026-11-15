@@ -288,3 +288,55 @@ func TestJobIDFromSubmit(t *testing.T) {
 		t.Fatalf("не submit: %q", j)
 	}
 }
+
+// TestStatusCountsOnlyBTCAsics: btc_asics — уникальные IP майнеров с активным
+// BTC-соединением. Прозрачные (не BTC) ASIC, повторные соединения одного IP,
+// переключение монеты и закрытие учитываются корректно.
+func TestStatusCountsOnlyBTCAsics(t *testing.T) {
+	stats := NewStats()
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithBTCOnly())
+
+	btcA1 := newSession(stats, "btc:3333", "10.0.0.1", c)
+	btcA1.observeNotify("j1", 1.4e14)
+	btcA2 := newSession(stats, "btc2:3333", "10.0.0.1", c) // тот же ASIC, второй пул
+	btcA2.observeNotify("j1", 1.4e14)
+	btcB := newSession(stats, "btc:3333", "10.0.0.2", c)
+	btcB.observeNotify("j1", 1.4e14)
+	ltc := newSession(stats, "ltc:3333", "10.0.0.3", c)
+	ltc.observeNotify("l1", 7e7)
+
+	check := func(step string, wantTotal int, wantPool map[string]int) {
+		t.Helper()
+		rep := stats.Report()
+		if rep.Totals.BTCAsics != wantTotal {
+			t.Errorf("%s: totals btc_asics = %d, want %d", step, rep.Totals.BTCAsics, wantTotal)
+		}
+		for _, p := range rep.Pools {
+			if p.BTCAsics != wantPool[p.Pool] {
+				t.Errorf("%s: pool %s btc_asics = %d, want %d", step, p.Pool, p.BTCAsics, wantPool[p.Pool])
+			}
+		}
+	}
+	check("start", 2, map[string]int{"btc:3333": 2, "btc2:3333": 1})
+
+	// Повторный BTC notify не удваивает счёт.
+	btcB.observeNotify("j2", 1.4e14)
+	check("repeat notify", 2, map[string]int{"btc:3333": 2, "btc2:3333": 1})
+
+	// Пул переключил B на другую монету — B перестаёт считаться.
+	btcB.observeNotify("x1", 1e12)
+	check("switch to other", 1, map[string]int{"btc:3333": 1, "btc2:3333": 1})
+
+	// Закрытие одного из двух соединений ASIC A — A всё ещё считается.
+	btcA1.close()
+	check("close one of two", 1, map[string]int{"btc2:3333": 1})
+	btcA2.close()
+	check("close all", 0, map[string]int{})
+
+	// Notify после close не возвращает ASIC в счёт.
+	btcA2.observeNotify("j3", 1.4e14)
+	check("notify after close", 0, map[string]int{})
+
+	btcB.close()
+	ltc.close()
+}

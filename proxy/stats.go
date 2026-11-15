@@ -60,7 +60,8 @@ type poolStat struct {
 	rejected  int
 	lost      int
 	workers   map[string]struct{}
-	coin      string // "btc" / "other" по последнему notify; "" — неизвестно
+	btcAsics  map[string]int // IP майнера -> число его BTC-соединений к пулу
+	coin      string         // "btc" / "other" по последнему notify; "" — неизвестно
 	firstSeen time.Time
 	lastSeen  time.Time
 }
@@ -98,14 +99,18 @@ type Stats struct {
 	lost         int
 	pools        map[string]*poolStat
 	workers      map[string]*workerStat
+	// btcAsics: IP майнера -> число его соединений, у которых последнее
+	// задание BTC. Один IP = один ASIC; прозрачные (не BTC) не считаются.
+	btcAsics map[string]int
 }
 
 // NewStats создаёт пустой реестр.
 func NewStats() *Stats {
 	return &Stats{
-		start:   time.Now(),
-		pools:   map[string]*poolStat{},
-		workers: map[string]*workerStat{},
+		start:    time.Now(),
+		pools:    map[string]*poolStat{},
+		workers:  map[string]*workerStat{},
+		btcAsics: map[string]int{},
 	}
 }
 
@@ -116,7 +121,7 @@ func wkey(pool, worker string) string { return pool + "\x00" + worker }
 func (s *Stats) getPool(pool string, now time.Time) *poolStat {
 	p, ok := s.pools[pool]
 	if !ok {
-		p = &poolStat{pool: pool, firstSeen: now, workers: map[string]struct{}{}}
+		p = &poolStat{pool: pool, firstSeen: now, workers: map[string]struct{}{}, btcAsics: map[string]int{}}
 		s.pools[pool] = p
 	}
 	return p
@@ -275,6 +280,35 @@ func (s *Stats) SetDifficulty(pool, worker string, difficulty float64) {
 	w.difficulty = difficulty
 }
 
+// SetConnBTC отмечает, что соединение майнера source к пулу начало (btc=true)
+// или перестало (btc=false: задание другой монеты или закрытие) майнить BTC.
+// Вызывается только при смене состояния, парно: каждому true — один false.
+func (s *Stats) SetConnBTC(pool, source string, btc bool) {
+	if source == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.getPool(pool, time.Now())
+	if btc {
+		s.btcAsics[source]++
+		p.btcAsics[source]++
+		return
+	}
+	decCount(s.btcAsics, source)
+	decCount(p.btcAsics, source)
+}
+
+// decCount уменьшает счётчик и удаляет ключ при нуле, чтобы len(map) было
+// числом ASIC с активными BTC-соединениями.
+func decCount(m map[string]int, key string) {
+	if m[key] <= 1 {
+		delete(m, key)
+		return
+	}
+	m[key]--
+}
+
 // SetPoolCoin запоминает монету пула ("btc"/"other") для /status.
 func (s *Stats) SetPoolCoin(pool, coin string) {
 	s.mu.Lock()
@@ -325,6 +359,8 @@ type Totals struct {
 	Hashrate          int64   `json:"hashrate"`
 	Pools             int     `json:"pools"`
 	Workers           int     `json:"workers"`
+	// BTCAsics — уникальные IP майнеров с активным BTC-соединением.
+	BTCAsics int `json:"btc_asics"`
 }
 
 // WorkerReport — счётчики одного воркера.
@@ -357,6 +393,7 @@ type PoolReport struct {
 	AcceptedPercent float64 `json:"accepted_percent"`
 	Hashrate        int64   `json:"hashrate"`
 	Workers         int     `json:"workers"`
+	BTCAsics        int     `json:"btc_asics"`
 	Coin            string  `json:"coin,omitempty"`
 	FirstSeen       string  `json:"first_seen"`
 	LastSeen        string  `json:"last_seen"`
@@ -409,6 +446,7 @@ func (s *Stats) Report() Report {
 			Lost:            p.lost,
 			AcceptedPercent: percent(p.accepted, p.submits),
 			Workers:         len(p.workers),
+			BTCAsics:        len(p.btcAsics),
 			Coin:            p.coin,
 			FirstSeen:       p.firstSeen.Format(time.RFC3339),
 			LastSeen:        p.lastSeen.Format(time.RFC3339),
@@ -462,6 +500,7 @@ func (s *Stats) Report() Report {
 	}
 	rep.Totals.Pools = len(rep.Pools)
 	rep.Totals.Workers = len(rep.Workers)
+	rep.Totals.BTCAsics = len(s.btcAsics)
 	return rep
 }
 

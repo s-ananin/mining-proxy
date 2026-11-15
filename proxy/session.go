@@ -283,6 +283,15 @@ func (s *session) observeNotify(jobID string, netDiff float64) {
 		}
 		s.jobCoin[jobID] = kind
 	}
+	// Счётчик BTC-ASIC меняем под s.mu вместе с проверкой closed: иначе
+	// гонка с close() оставила бы «вечный» ASIC в /status.
+	if prev != kind && !s.closed {
+		if kind == coinBTC {
+			s.stats.SetConnBTC(s.pool, s.source, true)
+		} else if prev == coinBTC {
+			s.stats.SetConnBTC(s.pool, s.source, false)
+		}
+	}
 	s.mu.Unlock()
 	if prev == kind {
 		return
@@ -523,6 +532,9 @@ func (s *session) close() {
 	s.pending = nil
 	if s.worker != "" {
 		s.stats.UnbindWorker(s.pool, s.worker)
+	}
+	if s.coin == coinBTC {
+		s.stats.SetConnBTC(s.pool, s.source, false)
 	}
 	s.stats.Disconnect(s.pool)
 }
