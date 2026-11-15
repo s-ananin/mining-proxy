@@ -57,6 +57,22 @@ type Config struct {
 	CapturePortFrom int `yaml:"capture_port_from"`
 	CapturePortTo   int `yaml:"capture_port_to"`
 
+	// CapturePortsExtra отдельные порты назначения сверх диапазона
+	// capture_port_from..capture_port_to (например 25000, 14444 у пулов с
+	// нестандартными портами). Перехватываются и при capture_all_tcp: false
+	// (вместе с портом upstream_pool). Порты, уже входящие в диапазон,
+	// пропускаются — дублей правил не будет.
+	CapturePortsExtra []int `yaml:"capture_ports"`
+
+	// StdoutTruncateInterval период очистки stdout/stderr, если они
+	// перенаправлены в обычный файл (nohup.out при запуске через nohup):
+	// файл обрезается до нуля, процесс продолжает писать в него же.
+	// Go-длительность, дефолт "48h"; "0" — не чистить.
+	StdoutTruncateInterval string `yaml:"stdout_truncate_interval"`
+
+	// StdoutTruncateEvery распарсенный StdoutTruncateInterval — производное поле.
+	StdoutTruncateEvery time.Duration `yaml:"-"`
+
 	// CaptureAllTCP итоговое значение capture_all_tcp — производное поле.
 	CaptureAllTCP bool `yaml:"-"`
 
@@ -171,6 +187,27 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("capture_port_from (%d) больше capture_port_to (%d)",
 			cfg.CapturePortFrom, cfg.CapturePortTo)
 	}
+	for _, p := range cfg.CapturePortsExtra {
+		if p < 1 || p > 65535 {
+			return nil, fmt.Errorf("capture_ports: порт %d вне диапазона 1..65535", p)
+		}
+	}
+
+	if cfg.StdoutTruncateInterval == "" {
+		cfg.StdoutTruncateEvery = 48 * time.Hour
+	} else {
+		d, err := time.ParseDuration(cfg.StdoutTruncateInterval)
+		if err != nil {
+			return nil, fmt.Errorf("stdout_truncate_interval %q: %w", cfg.StdoutTruncateInterval, err)
+		}
+		if d < 0 {
+			return nil, fmt.Errorf("stdout_truncate_interval %v отрицательный", d)
+		}
+		if d > 0 && d < time.Minute {
+			return nil, fmt.Errorf("stdout_truncate_interval %v меньше 1m", d)
+		}
+		cfg.StdoutTruncateEvery = d
+	}
 
 	for _, sn := range cfg.AllowedSubnets {
 		if _, _, err := net.ParseCIDR(sn); err != nil {
@@ -261,13 +298,39 @@ func (c *Config) BTCOnly() bool {
 	return c.CommissionBTCOnly == nil || *c.CommissionBTCOnly
 }
 
-// CapturePorts — фильтр --dport для DNAT в формате iptables: "25:9999"
-// для диапазона или "9999" для одного порта.
-func (c *Config) CapturePorts() string {
-	if c.CapturePortFrom == c.CapturePortTo {
-		return strconv.Itoa(c.CapturePortFrom)
+// CapturePorts — фильтры --dport для DNAT в формате iptables, по одному
+// правилу на элемент: при capture_all_tcp — диапазон ("25:9999" или "9999",
+// если from == to), иначе порт upstream_pool (если известен); затем порты
+// capture_ports, не попавшие в уже перечисленное. Пустой список (при
+// capture_all_tcp: false и без upstream_pool) — перехват без фильтра порта.
+func (c *Config) CapturePorts() []string {
+	var out []string
+	seen := map[int]bool{}
+	inRange := func(p int) bool { return false }
+	if c.CaptureAllTCP {
+		if c.CapturePortFrom == c.CapturePortTo {
+			out = append(out, strconv.Itoa(c.CapturePortFrom))
+		} else {
+			out = append(out, strconv.Itoa(c.CapturePortFrom)+":"+strconv.Itoa(c.CapturePortTo))
+		}
+		inRange = func(p int) bool { return p >= c.CapturePortFrom && p <= c.CapturePortTo }
+	} else if c.UpstreamPort == "" {
+		// Без фильтра перехватывается весь TCP — доп. порты уже внутри.
+		return nil
+	} else {
+		out = append(out, c.UpstreamPort)
+		if p, err := strconv.Atoi(c.UpstreamPort); err == nil {
+			seen[p] = true
+		}
 	}
-	return strconv.Itoa(c.CapturePortFrom) + ":" + strconv.Itoa(c.CapturePortTo)
+	for _, p := range c.CapturePortsExtra {
+		if seen[p] || inRange(p) {
+			continue
+		}
+		seen[p] = true
+		out = append(out, strconv.Itoa(p))
+	}
+	return out
 }
 
 // validHostPort проверяет формат host:port и диапазон порта 1–65535.

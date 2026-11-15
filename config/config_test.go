@@ -4,6 +4,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -224,8 +225,11 @@ func TestLoadCapturePortsDefaults(t *testing.T) {
 	if !cfg.CaptureAllTCP {
 		t.Errorf("capture_all_tcp по умолчанию должен быть true")
 	}
-	if got := cfg.CapturePorts(); got != "25:9999" {
-		t.Errorf("CapturePorts = %q, want 25:9999", got)
+	if got := cfg.CapturePorts(); !reflect.DeepEqual(got, []string{"25:9999"}) {
+		t.Errorf("CapturePorts = %q, want [25:9999]", got)
+	}
+	if cfg.StdoutTruncateEvery != 48*time.Hour {
+		t.Errorf("StdoutTruncateEvery = %v, want 48h", cfg.StdoutTruncateEvery)
 	}
 }
 
@@ -234,8 +238,8 @@ func TestLoadCapturePortsSingle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := cfg.CapturePorts(); got != "9999" {
-		t.Errorf("CapturePorts = %q, want 9999", got)
+	if got := cfg.CapturePorts(); !reflect.DeepEqual(got, []string{"9999"}) {
+		t.Errorf("CapturePorts = %q, want [9999]", got)
 	}
 }
 
@@ -244,10 +248,53 @@ func TestLoadCapturePortsInvalid(t *testing.T) {
 		"capture_port_from: 5000\ncapture_port_to: 100\n",
 		"capture_port_from: 25\ncapture_port_to: 70000\n",
 		"capture_port_from: -1\n",
+		"capture_ports: [0]\n",
+		"capture_ports: [70000]\n",
+		"stdout_truncate_interval: abc\n",
+		"stdout_truncate_interval: 10s\n",
 	}
 	for _, c := range cases {
 		if _, err := Load(writeTmp(t, c)); err == nil {
 			t.Errorf("ожидалась ошибка для %q", c)
 		}
+	}
+}
+
+func TestLoadCapturePortsExtra(t *testing.T) {
+	// 3333 внутри диапазона — пропускается; 25000 повторён — один раз.
+	cfg, err := Load(writeTmp(t, "capture_ports: [25000, 3333, 14444, 25000]\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"25:9999", "25000", "14444"}
+	if got := cfg.CapturePorts(); !reflect.DeepEqual(got, want) {
+		t.Errorf("CapturePorts = %q, want %q", got, want)
+	}
+
+	// capture_all_tcp: false — порт пула + доп. порты, без диапазона.
+	cfg, err = Load(writeTmp(t, "upstream_pool: \"pool:3333\"\ncapture_all_tcp: false\ncapture_ports: [3333, 25000]\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want = []string{"3333", "25000"}
+	if got := cfg.CapturePorts(); !reflect.DeepEqual(got, want) {
+		t.Errorf("CapturePorts = %q, want %q", got, want)
+	}
+}
+
+func TestLoadStdoutTruncateInterval(t *testing.T) {
+	cfg, err := Load(writeTmp(t, "stdout_truncate_interval: \"0\"\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.StdoutTruncateEvery != 0 {
+		t.Errorf("StdoutTruncateEvery = %v, want 0", cfg.StdoutTruncateEvery)
+	}
+	cfg, err = Load(writeTmp(t, "stdout_truncate_interval: 24h\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.StdoutTruncateEvery != 24*time.Hour {
+		t.Errorf("StdoutTruncateEvery = %v, want 24h", cfg.StdoutTruncateEvery)
 	}
 }

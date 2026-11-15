@@ -61,7 +61,7 @@ type Options struct {
 
 	// CapturePorts — фильтр --dport при CaptureAllTCP: "25:9999" (диапазон)
 	// или "9999" (один порт). Пусто — весь TCP без фильтра по порту.
-	CapturePorts string
+	CapturePorts []string
 
 	// IngressIfaces — входящие интерфейсы вручную. Пусто = определить
 	// автоматически по маршруту к подсетям.
@@ -161,7 +161,10 @@ func Setup(opts Options) error {
 	// НЕ задаём: реальный адрес сохраняется в conntrack, а прокси читает
 	// его через SO_ORIGINAL_DST. Если указать -d <ip>, то заработает только
 	// один IP-пул, а ASIC с другим пулом (или IP:port) пройдёт мимо.
-	dport := dportFilter(opts)
+	dports := dportFilters(opts)
+	if len(dports) == 0 {
+		dports = []string{""} // без фильтра порта
+	}
 	for _, subnet := range opts.Subnets {
 		// Правило создаём ОТДЕЛЬНО для каждой пары (подсеть, интерфейс).
 		//
@@ -176,22 +179,26 @@ func Setup(opts Options) error {
 			// интерфейсах). Это шире, чем нужно, но не ломает перехват.
 			subIfaces = []string{""}
 		}
+		// По правилу на каждый фильтр порта (диапазон + отдельные порты):
+		// без -m multiport и его лимита в 15 портов.
 		for _, ifc := range subIfaces {
-			args := []string{"-t", "nat", "-A", chainName, "-s", subnet, "-p", "tcp"}
-			if ifc != "" {
-				args = append(args, "-i", ifc)
-			}
-			if dport != "" {
-				args = append(args, "--dport", dport)
-			}
-			args = append(args, "-j", "DNAT", "--to-destination", "127.0.0.1:"+listenPort)
-			if err := runCmd("iptables", args...); err != nil {
-				return fmt.Errorf("добавить DNAT для %s: %w", subnet, err)
-			}
-			if dport != "" {
-				log.Printf("[IPTABLES] DNAT %s tcp/%s -> 127.0.0.1:%s", subnet, dport, listenPort)
-			} else {
-				log.Printf("[IPTABLES] DNAT %s tcp (весь) -> 127.0.0.1:%s", subnet, listenPort)
+			for _, dport := range dports {
+				args := []string{"-t", "nat", "-A", chainName, "-s", subnet, "-p", "tcp"}
+				if ifc != "" {
+					args = append(args, "-i", ifc)
+				}
+				if dport != "" {
+					args = append(args, "--dport", dport)
+				}
+				args = append(args, "-j", "DNAT", "--to-destination", "127.0.0.1:"+listenPort)
+				if err := runCmd("iptables", args...); err != nil {
+					return fmt.Errorf("добавить DNAT для %s tcp/%s: %w", subnet, dport, err)
+				}
+				if dport != "" {
+					log.Printf("[IPTABLES] DNAT %s tcp/%s -> 127.0.0.1:%s", subnet, dport, listenPort)
+				} else {
+					log.Printf("[IPTABLES] DNAT %s tcp (весь) -> 127.0.0.1:%s", subnet, listenPort)
+				}
 			}
 		}
 	}
@@ -233,13 +240,18 @@ func Setup(opts Options) error {
 	return nil
 }
 
-// dportFilter возвращает значение --dport для правил DNAT: диапазон
-// CapturePorts при CaptureAllTCP, иначе порт пула. Пусто — без фильтра.
-func dportFilter(opts Options) string {
-	if opts.CaptureAllTCP {
+// dportFilters возвращает значения --dport для правил DNAT (по правилу на
+// элемент). Если CapturePorts задан (config.CapturePorts уже учёл
+// capture_all_tcp и доп. порты) — он; иначе при !CaptureAllTCP — порт пула.
+// Пусто — без фильтра порта.
+func dportFilters(opts Options) []string {
+	if len(opts.CapturePorts) > 0 {
 		return opts.CapturePorts
 	}
-	return opts.UpstreamPort
+	if !opts.CaptureAllTCP && opts.UpstreamPort != "" {
+		return []string{opts.UpstreamPort}
+	}
+	return nil
 }
 
 // Cleanup удаляет все правила, созданные Setup. Вызывается при graceful

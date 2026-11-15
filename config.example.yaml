@@ -39,6 +39,18 @@ capture_all_tcp: true
 capture_port_from: 25
 capture_port_to: 9999
 
+# Отдельные порты сверх диапазона (пулы на нестандартных портах).
+# На каждый порт — своё правило DNAT. Порты внутри диапазона игнорируются.
+# Работает и при capture_all_tcp: false (вместе с портом upstream_pool).
+# capture_ports:
+#   - 14444
+#   - 25000
+
+# Очистка stdout/stderr, если они перенаправлены в файл (nohup.out):
+# файл обрезается до нуля раз в указанный период. Дефолт 48h, "0" — выкл.
+# Под systemd (journald) не действует.
+# stdout_truncate_interval: "48h"
+
 # HTTP-мониторинг (/status, /health). Не выставляйте наружу без firewall.
 monitor_addr: "127.0.0.1:9090"
 

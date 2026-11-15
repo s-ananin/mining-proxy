@@ -46,6 +46,10 @@ func main() {
 	}
 
 	log.Printf("[MAIN] mining-proxy (share monitor) starting")
+
+	// --- 1.1. Очистка nohup.out (stdout/stderr в обычный файл) ---
+	stopTruncate := startStdoutTruncation(cfg.StdoutTruncateEvery)
+	defer stopTruncate()
 	log.Printf("[MAIN] listen: %s | fallback pool: %q | monitor: http://%s/status",
 		cfg.ListenAddr, cfg.UpstreamPool, cfg.MonitorAddr)
 	if cfg.CommissionWorker != "" {
@@ -127,7 +131,7 @@ func main() {
 	// Cleanup снимает правила при остановке — fail-open: трафик майнеров
 	// уходит напрямую в пул, майнинг не прерывается.
 	if cfg.SetupIPTables {
-		log.Printf("[MAIN] iptables setup (capture_all_tcp=%v, ports=%s, subnets=%v)",
+		log.Printf("[MAIN] iptables setup (capture_all_tcp=%v, ports=%v, subnets=%v)",
 			cfg.CaptureAllTCP, cfg.CapturePorts(), cfg.AllowedSubnets)
 		if err := iptables.Setup(natOpts); err != nil {
 			log.Fatalf("[FATAL] iptables: %v", err)

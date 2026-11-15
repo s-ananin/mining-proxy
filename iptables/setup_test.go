@@ -1,6 +1,7 @@
 package iptables
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -148,19 +149,20 @@ func TestStatusWithoutSubnetsReportsProblem(t *testing.T) {
 	}
 }
 
-func TestDportFilter(t *testing.T) {
+func TestDportFilters(t *testing.T) {
 	cases := []struct {
 		opts Options
-		want string
+		want []string
 	}{
-		{Options{CaptureAllTCP: true, CapturePorts: "25:9999", UpstreamPort: "3333"}, "25:9999"},
-		{Options{CaptureAllTCP: true, CapturePorts: "9999"}, "9999"},
-		{Options{CaptureAllTCP: true}, ""},
-		{Options{CaptureAllTCP: false, CapturePorts: "25:9999", UpstreamPort: "3333"}, "3333"},
+		{Options{CaptureAllTCP: true, CapturePorts: []string{"25:9999"}, UpstreamPort: "3333"}, []string{"25:9999"}},
+		{Options{CaptureAllTCP: true, CapturePorts: []string{"25:9999", "25000", "14444"}}, []string{"25:9999", "25000", "14444"}},
+		{Options{CaptureAllTCP: true}, nil},
+		{Options{CaptureAllTCP: false, CapturePorts: []string{"3333", "25000"}, UpstreamPort: "3333"}, []string{"3333", "25000"}},
+		{Options{CaptureAllTCP: false, UpstreamPort: "3333"}, []string{"3333"}},
 	}
 	for _, c := range cases {
-		if got := dportFilter(c.opts); got != c.want {
-			t.Errorf("dportFilter(%+v) = %q, want %q", c.opts, got, c.want)
+		if got := dportFilters(c.opts); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("dportFilters(%+v) = %q, want %q", c.opts, got, c.want)
 		}
 	}
 }
