@@ -901,35 +901,42 @@ type PoolCommissionReport struct {
 
 // CommissionReport — снимок комиссии для /status.commission.
 type CommissionReport struct {
-	Enabled          bool                   `json:"enabled"`
-	Worker           string                 `json:"worker,omitempty"`
-	WindowWorker     string                 `json:"-"`
-	WorkerRotate     bool                   `json:"worker_rotate,omitempty"`
-	Percent          float64                `json:"percent,omitempty"`
-	Interval         string                 `json:"interval,omitempty"`
-	Session          string                 `json:"session,omitempty"`
-	SessionStart     string                 `json:"session_start,omitempty"`
-	SessionEnd       string                 `json:"session_end,omitempty"`
-	IterationsPerDay int                    `json:"iterations_per_day,omitempty"`
-	Attempts         int                    `json:"attempts"`
-	Accepted         int                    `json:"accepted"`
-	Rejected         int                    `json:"rejected"`
-	Failed           int                    `json:"failed"`
-	WorkIssued       float64                `json:"-"`
-	WorkAccepted     float64                `json:"-"`
-	WorkRejected     float64                `json:"-"`
-	EffectivePercent float64                `json:"effective_percent"`
-	ChargedPercent   float64                `json:"charged_percent"`
-	ForfeitedWork    float64                `json:"forfeited_work"`
-	PoolChecks       map[string]string      `json:"pool_checks,omitempty"`
-	AcceptedToday    int                    `json:"accepted_today"`
-	TargetToday      float64                `json:"-"`
-	TakenToday       int                    `json:"taken_today"`
-	IterationsUsed   int                    `json:"iterations_used"`
-	IterationsLeft   int                    `json:"iterations_left"`
-	NextIterationAt  string                 `json:"next_iteration_at,omitempty"`
-	WindowEnd        string                 `json:"window_end,omitempty"`
-	Pools            []PoolCommissionReport `json:"-"`
+	Enabled          bool              `json:"enabled"`
+	Worker           string            `json:"worker,omitempty"`
+	WindowWorker     string            `json:"-"`
+	WorkerRotate     bool              `json:"worker_rotate,omitempty"`
+	Percent          float64           `json:"percent,omitempty"`
+	Interval         string            `json:"interval,omitempty"`
+	Session          string            `json:"session,omitempty"`
+	SessionStart     string            `json:"session_start,omitempty"`
+	SessionEnd       string            `json:"session_end,omitempty"`
+	IterationsPerDay int               `json:"iterations_per_day,omitempty"`
+	Attempts         int               `json:"attempts"`
+	Accepted         int               `json:"accepted"`
+	Rejected         int               `json:"rejected"`
+	Failed           int               `json:"failed"`
+	WorkIssued       float64           `json:"-"`
+	WorkAccepted     float64           `json:"-"`
+	WorkRejected     float64           `json:"-"`
+	EffectivePercent float64           `json:"effective_percent"`
+	ChargedPercent   float64           `json:"charged_percent"`
+	ForfeitedWork    float64           `json:"forfeited_work"`
+	PoolChecks       map[string]string `json:"pool_checks,omitempty"`
+	// Активность на момент снимка (по открытым соединениям):
+	// *_active — все подключённые воркеры/пулы; *_with_commission — те, что
+	// на пулах, где комиссия сейчас может браться (см. poolChargeableLocked).
+	WorkersActive         int                    `json:"workers_active"`
+	WorkersWithCommission int                    `json:"workers_with_commission"`
+	PoolsActive           int                    `json:"pools_active"`
+	PoolsWithCommission   int                    `json:"pools_with_commission"`
+	AcceptedToday         int                    `json:"accepted_today"`
+	TargetToday           float64                `json:"-"`
+	TakenToday            int                    `json:"taken_today"`
+	IterationsUsed        int                    `json:"iterations_used"`
+	IterationsLeft        int                    `json:"iterations_left"`
+	NextIterationAt       string                 `json:"next_iteration_at,omitempty"`
+	WindowEnd             string                 `json:"window_end,omitempty"`
+	Pools                 []PoolCommissionReport `json:"-"`
 }
 
 // intervalString возвращает читаемое представление интервала ("" если 0).
@@ -1027,7 +1034,42 @@ func (c *Commission) Snapshot() CommissionReport {
 		}
 	}
 	sort.Slice(rep.Pools, func(i, j int) bool { return rep.Pools[i].Pool < rep.Pools[j].Pool })
+
+	// Активные воркеры и пулы. Порядок блокировок c.mu → stats.mu тот же,
+	// что в billableHashrateLocked.
+	st := c.stats.Report()
+	chargeable := map[string]bool{}
+	for _, p := range st.Pools {
+		rep.PoolsActive++
+		if c.poolChargeableLocked(p.Pool, p.Coin, now) {
+			chargeable[p.Pool] = true
+			rep.PoolsWithCommission++
+		}
+	}
+	for _, w := range st.Workers {
+		rep.WorkersActive++
+		if chargeable[w.Pool] {
+			rep.WorkersWithCommission++
+		}
+	}
 	return rep
+}
+
+// poolChargeableLocked — может ли комиссия браться на пуле сейчас: монета
+// подходит (в режиме btcOnly — BTC), пул подтверждён проверкой commission_worker
+// и предохранитель закрыт. Окно сессии не учитывается: пул остаётся
+// «с комиссией», даже если текущий момент вне окна. В отличие от
+// poolVerifiedLocked, проверку не запускает. Вызывается под c.mu.
+func (c *Commission) poolChargeableLocked(pool, coin string, now time.Time) bool {
+	if c.btcOnly && coin != coinBTC.String() {
+		return false
+	}
+	if c.probe != nil {
+		if p := c.probes[pool]; p == nil || p.status != probeOK {
+			return false
+		}
+	}
+	return !c.poolOpenLocked(pool, now)
 }
 
 func (c *Commission) difficultyRetryStringLocked(pool string, now time.Time) string {
