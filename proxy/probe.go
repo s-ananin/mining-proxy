@@ -41,9 +41,6 @@ const (
 	// недоступен). Короткая: это не признак того, что пул чужой.
 	probeNetRetry = time.Minute
 
-	// failurePauseMax — потолок растущей паузы по неудачам боевых соединений.
-	failurePauseMax = 6 * time.Hour
-
 	probeSubscribeTag = "__commission_probe_subscribe__"
 	probeAuthTag      = "__commission_probe_auth__"
 	probeAuthID       = `"` + probeAuthTag + `"`

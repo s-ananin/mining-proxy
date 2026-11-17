@@ -156,8 +156,6 @@ type poolBreaker struct {
 	denies            int
 	openTill          time.Time
 	difficultyRetryAt time.Time
-	failureUntil      time.Time
-	failures          int // неудач боевых соединений подряд (растущая пауза)
 }
 
 // Commission — сборщик комиссии. Потокобезопасен (mu).
@@ -585,9 +583,6 @@ func (c *Commission) poolOpenLocked(pool string, now time.Time) bool {
 	if !ok {
 		return false
 	}
-	if now.Before(b.failureUntil) {
-		return true
-	}
 	if now.Before(b.difficultyRetryAt) {
 		return true
 	}
@@ -724,28 +719,6 @@ func (c *Commission) reportDeny(pool string) {
 	}
 }
 
-// Pause on unanswered commission work, including resets before the submit
-// timeout. Authorization success must not clear this independent cooldown.
-// Consecutive failures double the pause (up to failurePauseMax); an accepted
-// commission share on the pool resets the streak.
-func (c *Commission) pauseFailure(pool string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	b := c.breakers[pool]
-	if b == nil {
-		b = &poolBreaker{}
-		c.breakers[pool] = b
-	}
-	if time.Now().Before(b.failureUntil) {
-		return
-	}
-	b.failures++
-	pause := backoff(commissionBreakerCooldown, failurePauseMax, b.failures)
-	b.failureUntil = time.Now().Add(pause)
-	log.Printf("[COMMISSION] pool=%s unanswered commission work (%d in a row); paused for %s until %s",
-		pool, b.failures, pause, b.failureUntil.Format(time.RFC3339))
-}
-
 func acceptedRate(samples []stealSample, now time.Time) float64 {
 	var work float64
 	start := now.Add(-commissionRateWindow)
@@ -854,9 +827,6 @@ func (c *Commission) countResult(pool string, accepted bool, diff float64, submi
 		p.acceptedSamples = append(p.acceptedSamples[cut:], stealSample{at: now, diff: diff})
 		p.accepted++
 		p.workAccepted += diff
-		if b := c.breakers[pool]; b != nil {
-			b.failures = 0
-		}
 	} else {
 		c.rejectedCnt++
 		c.workRejected += diff

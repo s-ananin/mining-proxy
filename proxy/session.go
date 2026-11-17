@@ -400,7 +400,6 @@ func (s *session) submitJob(id, worker, jobID string) {
 			if p.commission {
 				if s.commission != nil {
 					s.commission.lostWork(p.diff, p.at)
-					s.commission.pauseFailure(s.pool)
 				}
 				continue // комиссионные в lost воркера не пишем
 			}
@@ -523,7 +522,6 @@ func (s *session) close() {
 		if p.commission {
 			if s.commission != nil {
 				s.commission.lostWork(p.diff, p.at)
-				s.commission.pauseFailure(s.pool)
 			}
 			continue // комиссионные шары в lost воркера не пишем
 		}

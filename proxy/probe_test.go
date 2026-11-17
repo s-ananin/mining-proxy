@@ -199,37 +199,6 @@ func TestStratumProbe(t *testing.T) {
 	}
 }
 
-func TestFailurePauseGrowsAndResetsOnAccept(t *testing.T) {
-	c := NewCommission("fee", 1, 0, time.Minute, 0, NewStats())
-	defer c.Close()
-	expire := func() {
-		c.mu.Lock()
-		c.breakers["p"].failureUntil = time.Now().Add(-time.Second)
-		c.mu.Unlock()
-	}
-	pause := func() time.Duration {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return time.Until(c.breakers["p"].failureUntil).Round(time.Minute)
-	}
-	c.pauseFailure("p")
-	if got := pause(); got != commissionBreakerCooldown {
-		t.Fatalf("first pause %s", got)
-	}
-	c.pauseFailure("p") // same incident while paused: no escalation
-	expire()
-	c.pauseFailure("p")
-	if got := pause(); got != 2*commissionBreakerCooldown {
-		t.Fatalf("second pause %s", got)
-	}
-	expire()
-	c.countResult("p", true, 16)
-	c.pauseFailure("p")
-	if got := pause(); got != commissionBreakerCooldown {
-		t.Fatalf("pause after accepted share %s, want reset", got)
-	}
-}
-
 func TestCarryCapKeepsDebtAndNoCatchUpBurst(t *testing.T) {
 	stats := NewStats()
 	c := NewCommission("fee", 1, 0, 5*time.Minute, 0, stats)

@@ -8,7 +8,9 @@ import (
 	"time"
 )
 
-func TestCommissionLostWorkPausesPoolAcrossReconnects(t *testing.T) {
+// Lost commission work (no answer before timeout or reset) is accounted
+// but never pauses commission on the pool.
+func TestCommissionLostWorkDoesNotPausePool(t *testing.T) {
 	c := NewCommission("fee.worker", 1, 40, 0, 0, NewStats())
 	defer c.Close()
 	c.takeBudget = 100
@@ -16,22 +18,12 @@ func TestCommissionLostWorkPausesPoolAcrossReconnects(t *testing.T) {
 	se.setDifficulty(16)
 	se.markCommissionSubmit("1", "fee.worker")
 	c.countSteal("bad", 16)
-	se.close() // Reset before the share timeout must also trip the pause.
-	c.reportAuthOK("bad")
-	if c.reserve("bad", 16) {
-		t.Fatal("authorization cleared failure pause")
-	}
-	if !c.reserve("good", 16) {
-		t.Fatal("unrelated pool disabled")
-	}
+	se.close()
 	if c.Snapshot().Failed != 1 {
 		t.Fatal("lost share not accounted exactly once")
 	}
-	c.mu.Lock()
-	c.breakers["bad"].failureUntil = time.Now().Add(-time.Second)
-	c.mu.Unlock()
 	if !c.reserve("bad", 16) {
-		t.Fatal("failure pause did not expire")
+		t.Fatal("lost commission work paused the pool")
 	}
 }
 
