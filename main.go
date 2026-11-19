@@ -36,6 +36,11 @@ type appStatus struct {
 }
 
 func main() {
+	// --- 0. Подкоманда: интерактивный мастер конфига ---
+	if len(os.Args) > 1 && os.Args[1] == "configure" {
+		os.Exit(runConfigure(os.Args[2:]))
+	}
+
 	// --- 1. Аргументы и конфиг ---
 	cfgPath := flag.String("config", "config.local.yaml", "path to YAML config file")
 	flag.Parse()
@@ -164,7 +169,17 @@ func main() {
 			Nat:        iptables.Status(natOpts),
 			Commission: commSnap,
 		}
-	}, func() bool { return true })
+	}, func() bool { return true }, monitor.Endpoint{
+		// /port-info: какие порты пулов идут через DNAT в прокси, какие
+		// мимо (по conntrack), плюс пулы, которые видит сам прокси.
+		Path: "/port-info",
+		Snapshot: func() interface{} {
+			return portInfo{
+				PortInfo:   iptables.PortReport(natOpts),
+				ProxyPools: proxyPools(stats.Report().Pools),
+			}
+		},
+	})
 
 	log.Printf("[MAIN] running; статистика: curl -s http://%s/status", cfg.MonitorAddr)
 

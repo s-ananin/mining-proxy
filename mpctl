@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# mpctl — установка и управление mining-proxy как systemd-сервисом.
+#
+#   sudo ./mpctl install   сборка, установка бинарника/юнита, настройка конфига
+#   sudo mpctl update      git pull + install + перезапуск
+#   sudo mpctl config      мастер конфига (с перезапуском, если сервис работает)
+#   sudo mpctl start|stop|restart
+#   mpctl status           статус systemd + /health
+#   mpctl logs             journalctl -f
+#
+# После install сервис управляется и штатно:
+#   sudo service mining-proxy start|stop|restart|status
+set -euo pipefail
+
+readonly NAME="mining-proxy"
+readonly BIN="/usr/local/bin/${NAME}"
+readonly CTL="/usr/local/bin/mpctl"
+readonly ETC="/etc/${NAME}"
+readonly CONF="${ETC}/config.yaml"
+readonly SRC_FILE="${ETC}/source-dir"
+readonly UNIT="/etc/systemd/system/${NAME}.service"
+# Процесс, запущенный по-старому (nohup ./mining-proxy --config ...).
+readonly LEGACY_PATTERN='mining-proxy --config config.local.yaml'
+
+say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+
+need_root() {
+  [[ ${EUID} -eq 0 ]] || exec sudo -- "$0" "$@"
+}
+
+is_tty() { [[ -t 0 && -t 1 ]]; }
+
+# ask "вопрос" y|n — возвращает 0 на «да».
+ask() {
+  local q=$1 def=$2 hint ans
+  [[ $def == y ]] && hint="Y/n" || hint="y/N"
+  while true; do
+    read -r -p "$q ($hint): " ans || return 1
+    ans=${ans,,}
+    [[ -z $ans ]] && ans=$def
+    case $ans in
+      y|yes|д|да) return 0 ;;
+      n|no|н|нет) return 1 ;;
+    esac
+  done
+}
+
+# Каталог исходников: рядом со скриптом (запуск из репо) или сохранённый при install.
+source_dir() {
+  local here
+  here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+  if [[ -f $here/go.mod && -f $here/main.go ]]; then
+    echo "$here"
+  elif [[ -f $SRC_FILE ]]; then
+    cat "$SRC_FILE"
+  else
+    die "не найден каталог исходников: запустите ./mpctl install из репозитория"
+  fi
+}
+
+build() {
+  local src=$1 owner
+  owner=$(stat -c %U "$src")
+  say "сборка в $src (от пользователя $owner)"
+  # Собираем от владельца репо: его PATH/GOPATH, и файлы в репо не станут root-овыми.
+  if ! sudo -u "$owner" -H bash -lc "cd '$src' && command -v go >/dev/null && go build -o '${NAME}' ."; then
+    if [[ -x $src/$NAME ]]; then
+      warn "go build не удался — ставлю уже собранный $src/$NAME"
+    else
+      die "go build не удался и готового бинарника нет"
+    fi
+  fi
+}
+
+stop_legacy() {
+  local pids
+  pids=$(pgrep -f "$LEGACY_PATTERN" || true)
+  [[ -z $pids ]] && return 0
+  warn "найден процесс, запущенный через nohup (PID: $(echo $pids))"
+  if is_tty && ! ask "Остановить его (иначе сервис не займёт порт)?" y; then
+    die "отменено: старый процесс работает"
+  fi
+  kill -9 $pids || true
+  say "старый процесс остановлен"
+}
+
+# Настройка конфига: первый раз — мастер, иначе выбор «старый / новый».
+setup_config() {
+  local src=$1
+  mkdir -p "$ETC"
+  if [[ ! -f $CONF ]]; then
+    if [[ -f $src/config.local.yaml ]] && is_tty \
+        && ask "Конфига нет. Взять за основу $src/config.local.yaml?" y; then
+      install -m 0640 "$src/config.local.yaml" "$CONF"
+      say "скопирован config.local.yaml → $CONF"
+    else
+      is_tty || die "конфига $CONF нет, а терминала для мастера нет"
+      "$BIN" configure --config "$CONF"
+      return
+    fi
+  fi
+  is_tty || { say "использую существующий $CONF"; return 0; }
+  echo
+  say "текущий конфиг $CONF:"
+  grep -Ev '^[[:space:]]*(#|$)' "$CONF" | sed 's/^/    /'
+  echo
+  if ask "Использовать этот конфиг?" y; then
+    return 0
+  fi
+  "$BIN" configure --config "$CONF"
+}
+
+cmd_install() {
+  local src
+  src=$(source_dir)
+  build "$src"
+
+  say "установка в $BIN, $CTL, $UNIT"
+  # Работающий бинарник заменяем через rename (install), а не перезаписью.
+  install -m 0755 "$src/$NAME" "$BIN"
+  install -m 0755 "$src/mpctl" "$CTL"
+  install -m 0644 "$src/${NAME}.service" "$UNIT"
+  mkdir -p "$ETC"
+  echo "$src" > "$SRC_FILE"
+  systemctl daemon-reload
+  systemctl enable "$NAME" >/dev/null 2>&1
+  say "автозапуск при загрузке включён"
+
+  setup_config "$src"
+  stop_legacy
+
+  if systemctl is-active --quiet "$NAME"; then
+    if ! is_tty || ask "Сервис работает. Перезапустить с новой версией?" y; then
+      cmd_restart
+    fi
+  else
+    say "готово. Запуск: sudo service ${NAME} start"
+  fi
+}
+
+cmd_update() {
+  local src owner
+  src=$(source_dir)
+  owner=$(stat -c %U "$src")
+  say "git pull в $src"
+  sudo -u "$owner" -H git -C "$src" pull --ff-only
+  exec "$src/mpctl" install
+}
+
+cmd_config() {
+  [[ -x $BIN ]] || die "сначала: sudo ./mpctl install"
+  "$BIN" configure --config "$CONF"
+  if systemctl is-active --quiet "$NAME" && ask "Перезапустить сервис с новым конфигом?" y; then
+    cmd_restart
+  fi
+}
+
+# show_result — короткий итог после start/restart.
+show_result() {
+  sleep 2
+  if systemctl is-active --quiet "$NAME"; then
+    say "${NAME} запущен"
+  else
+    warn "${NAME} не запустился, последние строки лога:"
+  fi
+  journalctl -u "$NAME" -n 15 --no-pager || true
+}
+
+cmd_start()   { stop_legacy; systemctl start "$NAME"; show_result; }
+cmd_restart() { stop_legacy; systemctl restart "$NAME"; show_result; }
+cmd_stop()    { systemctl stop "$NAME"; say "${NAME} остановлен"; }
+
+cmd_status() {
+  systemctl status "$NAME" --no-pager || true
+  local addr
+  addr=$(sed -n 's/^monitor_addr:[[:space:]]*"\{0,1\}\([^"#[:space:]]*\).*/\1/p' "$CONF" 2>/dev/null || true)
+  addr=${addr:-127.0.0.1:9090}
+  echo
+  printf 'health (%s): ' "$addr"
+  curl -fsS -m 3 "http://${addr}/health" || echo "нет ответа"
+  echo
+}
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local cmd=${1:-}
+  case $cmd in
+    install|update|config|start|stop|restart) need_root "$@" ;;
+  esac
+  case $cmd in
+    install) cmd_install ;;
+    update)  cmd_update ;;
+    config)  cmd_config ;;
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_restart ;;
+    status)  cmd_status ;;
+    logs)    exec journalctl -u "$NAME" -f ;;
+    *)       usage; [[ -z $cmd || $cmd == -h || $cmd == --help || $cmd == help ]] || exit 2 ;;
+  esac
+}
+
+main "$@"

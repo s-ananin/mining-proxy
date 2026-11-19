@@ -65,18 +65,60 @@ curl -s http://127.0.0.1:9090/health
 }
 ```
 
+### `/port-info` — какие пулы идут через прокси
+
+```sh
+curl -s http://127.0.0.1:9090/port-info | jq '.problems, .ports'
+```
+
+Отчёт строится по таблице conntrack ядра (`/proc/net/nf_conntrack` или
+`conntrack -L`, нужен root): для каждого TCP-соединения из
+`allowed_subnets` видно, ответил ли на него прокси (`127.0.0.1:<listen>`,
+т.е. DNAT сработал) или сам пул (соединение идёт мимо).
+
+- `capture_filters` / `rule_ports` — фильтры `--dport` по конфигу и
+  фактически стоящие в iptables (расхождение попадёт в `problems`);
+- `ports` — сводка по портам назначения: `captured_conns` /
+  `bypassed_conns`, `in_filter`, адреса пулов; порты с обходом — первыми;
+- `bypassed` / `captured` — по адресатам `ip:port` с состояниями TCP и IP
+  майнеров;
+- `proxy_pools` — пулы, до которых реально дошли соединения прокси;
+- `problems` — выводы, например «порт 14444: 12 соединений мимо прокси
+  (…): порт не входит в фильтры DNAT — добавьте его в capture_ports».
+
 `monitor_addr` по умолчанию слушает только `127.0.0.1` — наружу не
 выставляйте без firewall.
 
-## systemd
+## Установка и запуск (systemd)
 
 ```sh
-sudo cp mining-proxy /usr/local/bin/
-sudo cp config.example.yaml /etc/mining-proxy/config.yaml   # и поправить
-sudo cp mining-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now mining-proxy
-journalctl -u mining-proxy -f
+git pull
+sudo ./mpctl install                 # сборка, установка, настройка конфига
+sudo service mining-proxy start      # или restart / stop / status
+```
+
+`mpctl install` собирает бинарник (`go build` от владельца репо), ставит
+`/usr/local/bin/mining-proxy`, `/usr/local/bin/mpctl` и юнит
+`/etc/systemd/system/mining-proxy.service`, включает автозапуск.
+Конфиг — `/etc/mining-proxy/config.yaml`:
+
+- первая установка — интерактивный мастер (`mining-proxy configure`);
+  если в репо есть `config.local.yaml`, его можно взять за основу;
+- повторная — показывает текущий конфиг и спрашивает, оставить его или
+  заполнить заново (ответы по умолчанию — текущие значения, прежний файл
+  сохраняется в `config.yaml.bak`).
+
+Если найден процесс, запущенный по-старому через `nohup`, `mpctl`
+предложит его остановить. Сам `service mining-proxy start` вопросов не
+задаёт: под systemd у сервиса нет терминала, он берёт готовый конфиг.
+
+Прочие команды:
+
+```sh
+sudo mpctl update     # git pull + install + перезапуск
+sudo mpctl config     # изменить конфиг (и перезапустить)
+mpctl status          # systemctl status + /health
+mpctl logs            # journalctl -u mining-proxy -f
 ```
 
 ## Тестовый стенд

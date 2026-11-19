@@ -1,11 +1,11 @@
 # systemd unit для mining-proxy.
-# Копируется в /etc/systemd/system/mining-proxy.service.
+# Устанавливается командой: sudo ./mpctl install
+# (копируется в /etc/systemd/system/mining-proxy.service).
 #
 # Управление:
-#   systemctl start mining-proxy    — запустить
-#   systemctl enable mining-proxy   — автозапуск при загрузке
-#   systemctl status mining-proxy   — статус
-#   journalctl -u mining-proxy -f   — логи
+#   sudo service mining-proxy start|stop|restart|status
+#   sudo mpctl config               — изменить конфиг
+#   mpctl logs                      — логи (journalctl -u mining-proxy -f)
 
 [Unit]
 Description=Mining Proxy — прозрачный Stratum-прокси со статистикой шар
@@ -22,6 +22,10 @@ ExecStart=/usr/local/bin/mining-proxy --config /etc/mining-proxy/config.yaml
 Restart=always
 # Пауза между перезапусками (чтобы не было цикла рестартов).
 RestartSec=5
+# Shutdown ждёт закрытия сессий ASIC, а они долгоживущие: не ждём 90 с по
+# умолчанию. Правила DNAT при SIGKILL остаются, но следующий старт
+# пересоздаёт их (Setup идемпотентен).
+TimeoutStopSec=15
 # Лимит открытых файловых дескрипторов: 65536.
 # Нужен для обслуживания тысяч одновременных TCP-соединений от ASIC.
 LimitNOFILE=65536
