@@ -166,3 +166,41 @@ func TestDportFilters(t *testing.T) {
 		}
 	}
 }
+
+func TestParseRouteDev(t *testing.T) {
+	cases := map[string]string{
+		"default via 10.110.255.254 dev eth0 proto dhcp src 10.110.255.1 metric 100\n": "eth0",
+		"default via 1.2.3.4 dev ens18\ndefault via 5.6.7.8 dev ens19\n":               "ens18",
+		"":                    "",
+		"default via 1.2.3.4": "",
+	}
+	for in, want := range cases {
+		if got := parseRouteDev(in); got != want {
+			t.Errorf("parseRouteDev(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestMissingIfaces(t *testing.T) {
+	got := missingIfaces([]string{"eth1", "eth0", "eth1"}, []string{"eth0"})
+	if !reflect.DeepEqual(got, []string{"eth1"}) {
+		t.Errorf("missingIfaces = %v, want [eth1]", got)
+	}
+	if got := missingIfaces(nil, []string{"eth0"}); got != nil {
+		t.Errorf("missingIfaces(nil) = %v, want nil", got)
+	}
+}
+
+// MASQUERADE не должен трогать собственные соединения прокси (адрес сервера
+// может входить в allowed_subnets) и при известном выходе — ограничиваться им.
+func TestMasqueradeArgs(t *testing.T) {
+	got := masqueradeArgs("10.0.0.0/9", "eth0")
+	want := []string{"-t", "nat", "-A", postChainName, "-s", "10.0.0.0/9", "-o", "eth0",
+		"-m", "addrtype", "!", "--src-type", "LOCAL", "-j", "MASQUERADE"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("masqueradeArgs = %q, want %q", got, want)
+	}
+	if got := masqueradeArgs("10.0.0.0/9", ""); strings.Contains(strings.Join(got, " "), "-o") {
+		t.Errorf("без интерфейса не должно быть -o: %q", got)
+	}
+}

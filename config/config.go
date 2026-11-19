@@ -44,6 +44,17 @@ type Config struct {
 	// по маршруту к allowed_subnets.
 	NATIngressIfaces []string `yaml:"nat_ingress_ifaces"`
 
+	// NATMasqueradeRaw подменять источник (MASQUERADE) у трафика
+	// allowed_subnets, который сервер форвардит дальше, а не перехватывает
+	// (DNS, UDP, порты вне перехвата). Нужно, когда сервер — шлюз майнеров
+	// (роутер заворачивает их трафик на него): без этого такой трафик
+	// зацикливается между сервером и роутером. Дефолт true; действует только
+	// при setup_iptables: true. Итог — поле NATMasquerade.
+	NATMasqueradeRaw *bool `yaml:"nat_masquerade"`
+
+	// NATMasquerade итоговое значение nat_masquerade — производное поле.
+	NATMasquerade bool `yaml:"-"`
+
 	// CaptureAllTCPRaw перехватывать TCP подсетей на диапазон портов
 	// [CapturePortFrom..CapturePortTo] (воронка), а не только порт
 	// UpstreamPool. Нужно, если майнеры ходят на разные порты пулов.
@@ -169,6 +180,8 @@ func Load(path string) (*Config, error) {
 	if err := validHostPort(cfg.MonitorAddr, "monitor_addr"); err != nil {
 		return nil, err
 	}
+
+	cfg.NATMasquerade = cfg.SetupIPTables && (cfg.NATMasqueradeRaw == nil || *cfg.NATMasqueradeRaw)
 
 	// Перехват по диапазону портов: дефолт включён, 25..9999.
 	cfg.CaptureAllTCP = cfg.CaptureAllTCPRaw == nil || *cfg.CaptureAllTCPRaw

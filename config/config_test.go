@@ -298,3 +298,25 @@ func TestLoadStdoutTruncateInterval(t *testing.T) {
 		t.Errorf("StdoutTruncateEvery = %v, want 24h", cfg.StdoutTruncateEvery)
 	}
 }
+
+// nat_masquerade: по умолчанию включён при setup_iptables, выключается явно,
+// без setup_iptables не действует.
+func TestNATMasquerade(t *testing.T) {
+	cases := []struct {
+		yaml string
+		want bool
+	}{
+		{"setup_iptables: true\nallowed_subnets: [\"10.0.0.0/9\"]\n", true},
+		{"setup_iptables: true\nallowed_subnets: [\"10.0.0.0/9\"]\nnat_masquerade: false\n", false},
+		{"setup_iptables: false\nnat_masquerade: true\n", false},
+	}
+	for _, c := range cases {
+		cfg, err := Load(writeTmp(t, c.yaml))
+		if err != nil {
+			t.Fatalf("Load(%q): %v", c.yaml, err)
+		}
+		if cfg.NATMasquerade != c.want {
+			t.Errorf("NATMasquerade для %q = %v, want %v", c.yaml, cfg.NATMasquerade, c.want)
+		}
+	}
+}

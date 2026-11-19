@@ -26,6 +26,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"mining-proxy/config"
+	"mining-proxy/iptables"
 )
 
 // errAborted — ввод закончился (Ctrl+D) до завершения мастера.
@@ -128,9 +129,28 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 		return c, err
 	}
 	if c.SetupIPTables {
-		if c.NATIngressIfaces, err = p.askList("Входящие интерфейсы через запятую (пусто — автоопределение)", c.NATIngressIfaces, false, nil); err != nil {
+		have := iptables.ExistingIfaces()
+		ifaceQ := "Входящие интерфейсы через запятую (пусто — автоопределение)"
+		var checkIface func(string) error
+		if have != nil {
+			ifaceQ = fmt.Sprintf("Входящие интерфейсы через запятую (есть: %s; пусто — автоопределение)", strings.Join(have, ", "))
+			checkIface = func(s string) error {
+				for _, h := range have {
+					if h == s {
+						return nil
+					}
+				}
+				return fmt.Errorf("интерфейса нет в системе (есть: %s)", strings.Join(have, ", "))
+			}
+		}
+		if c.NATIngressIfaces, err = p.askList(ifaceQ, c.NATIngressIfaces, false, checkIface); err != nil {
 			return c, err
 		}
+		masq := c.NATMasqueradeRaw == nil || *c.NATMasqueradeRaw
+		if masq, err = p.askBool("Сервер — шлюз майнеров: MASQUERADE для остального их трафика, DNS/UDP (nat_masquerade)?", masq); err != nil {
+			return c, err
+		}
+		c.NATMasqueradeRaw = &masq
 		captureAll := c.CaptureAllTCPRaw == nil || *c.CaptureAllTCPRaw
 		if captureAll, err = p.askBool("Перехватывать диапазон портов, а не только порт upstream_pool (capture_all_tcp)?", captureAll); err != nil {
 			return c, err
@@ -511,6 +531,7 @@ monitor_addr: {{q .MonitorAddr}}
 setup_iptables: {{.SetupIPTables}}
 allowed_subnets: {{strs .AllowedSubnets}}
 nat_ingress_ifaces: {{strs .NATIngressIfaces}}
+nat_masquerade: {{bptr .NATMasqueradeRaw}}
 capture_all_tcp: {{bptr .CaptureAllTCPRaw}}
 capture_port_from: {{.CapturePortFrom}}
 capture_port_to: {{.CapturePortTo}}

@@ -34,6 +34,11 @@ import (
 // (см. Cleanup) и не наследовать мусор от прошлых запусков.
 const chainName = "MINING_PROXY"
 
+// postChainName — цепочка nat/POSTROUTING с MASQUERADE для трафика майнеров,
+// который сервер форвардит дальше (DNS, UDP, порты вне перехвата). См.
+// setupMasquerade.
+const postChainName = "MINING_PROXY_POST"
+
 // sysctlConf — файл с постоянными настройками ядра. Без него после
 // перезагрузки сервера route_localnet сбросится в 0, и перехват перестанет
 // работать при живом процессе и правильных правилах iptables.
@@ -66,6 +71,14 @@ type Options struct {
 	// IngressIfaces — входящие интерфейсы вручную. Пусто = определить
 	// автоматически по маршруту к подсетям.
 	IngressIfaces []string
+
+	// Masquerade — подменять источник (MASQUERADE) у трафика подсетей,
+	// который сервер форвардит дальше, а не перехватывает. Нужно, когда
+	// сервер стоит шлюзом для майнеров (роутер заворачивает их трафик на
+	// него): без подмены пакет уходит обратно на роутер с адресом майнера,
+	// роутер снова отдаёт его серверу — петля, DNS не резолвится, ASIC не
+	// подключается к пулу. См. setupMasquerade.
+	Masquerade bool
 }
 
 // NATStatus — снимок состояния NAT для диагностики (поле "nat" в /status).
@@ -90,6 +103,11 @@ type NATStatus struct {
 	// становится локальным и проходит через INPUT; при policy DROP он
 	// отбрасывается, и прокси «не видит» трафик.
 	InputAccept bool `json:"input_accept"`
+	// Masquerade есть ли правило MASQUERADE для форвардимого трафика
+	// подсетей (цепочка MINING_PROXY_POST).
+	Masquerade bool `json:"masquerade"`
+	// MasqueradeRules — правила цепочки MINING_PROXY_POST.
+	MasqueradeRules []string `json:"masquerade_rules,omitempty"`
 	// Problems — список конкретных проблем (пусто = всё настроено).
 	Problems []string `json:"problems,omitempty"`
 }
@@ -122,6 +140,16 @@ func Setup(opts Options) error {
 	for _, sn := range opts.Subnets {
 		if _, _, err := net.ParseCIDR(sn); err != nil {
 			return fmt.Errorf("некорректная подсеть %q в allowed_subnets: %w", sn, err)
+		}
+	}
+	// Несуществующий интерфейс в nat_ingress_ifaces — частая ошибка при
+	// переносе конфига на другой сервер (eth1 vs ens18). Без этой проверки
+	// процесс падал на sysctl с невнятным "exit status 1".
+	if have := existingIfaces(); have != nil {
+		if miss := missingIfaces(opts.IngressIfaces, have); len(miss) > 0 {
+			return fmt.Errorf("nat_ingress_ifaces: интерфейс(ы) %s не найдены, в системе есть: %s "+
+				"(исправьте: sudo mpctl config; пусто — автоопределение)",
+				strings.Join(miss, ", "), strings.Join(have, ", "))
 		}
 	}
 
@@ -212,6 +240,11 @@ func Setup(opts Options) error {
 		return fmt.Errorf("открыть порт прокси в INPUT: %w", err)
 	}
 
+	// --- 5.1. MASQUERADE для форвардимого трафика (сервер-шлюз) ---
+	if err := setupMasquerade(opts); err != nil {
+		return fmt.Errorf("MASQUERADE для allowed_subnets: %w", err)
+	}
+
 	// --- 6. Убрать MASQUERADE, оставшийся от старых версий ---
 	// Постарой код ставил "-o lo -j MASQUERADE". Он ЛОМАЛ связь: conntrack
 	// восстанавливает источник ответа в адрес пула, а MASQUERADE поверх
@@ -258,6 +291,12 @@ func dportFilters(opts Options) []string {
 // shutdown: пока прокси жив, трафик перенаправляем (т.е. всё работает); при
 // остановке правила снимаются, и трафик ASIC идёт напрямую в пул — fail-open,
 // майнинг не прерывается.
+//
+// MASQUERADE (цепочка MINING_PROXY_POST) Cleanup НЕ снимает: это функция
+// шлюза, а не прокси. Если сервер — шлюз майнеров, то без MASQUERADE после
+// остановки прокси форвардимый трафик зациклится между сервером и роутером,
+// и майнинг встанет. С ним трафик идёт в пул напрямую через сервер.
+// Снимается MASQUERADE только при nat_masquerade: false (см. setupMasquerade).
 func Cleanup(opts Options) {
 	// Убираем jump из PREROUTING.
 	//
@@ -360,6 +399,21 @@ func Status(opts Options) NATStatus {
 
 	st.InputAccept = hasInputRule(st.ListenPort, st.IngressIfaces)
 
+	if out, err := exec.Command("iptables", "-t", "nat", "-S", postChainName).CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "-A "+postChainName) {
+				st.MasqueradeRules = append(st.MasqueradeRules, line)
+				if strings.Contains(line, "MASQUERADE") {
+					st.Masquerade = true
+				}
+			}
+		}
+	}
+	if st.Masquerade && runCmdQuiet("iptables", "-t", "nat", "-C", "POSTROUTING", "-j", postChainName) != nil {
+		st.Masquerade = false // цепочка есть, но в неё никто не заходит
+	}
+
 	// --- Собираем список конкретных проблем ---
 	if len(opts.Subnets) == 0 {
 		st.Problems = append(st.Problems,
@@ -384,6 +438,10 @@ func Status(opts Options) NATStatus {
 	if st.ListenPort != "" && !st.InputAccept {
 		st.Problems = append(st.Problems,
 			"порт прокси "+st.ListenPort+" не открыт в filter/INPUT — после DNAT пакет локальный и может отбрасываться политикой DROP")
+	}
+	if opts.Masquerade && !st.Masquerade {
+		st.Problems = append(st.Problems,
+			"nat_masquerade включён, но правила MASQUERADE ("+postChainName+") нет — если сервер шлюз для майнеров, их DNS/UDP зациклится между сервером и роутером")
 	}
 	if len(st.IngressIfaces) == 0 && len(opts.Subnets) > 0 {
 		st.Problems = append(st.Problems,
@@ -558,6 +616,114 @@ func ifaceSysctlLines(keys []string) string {
 	return b.String()
 }
 
+// setupMasquerade приводит цепочку MINING_PROXY_POST в соответствие с
+// opts.Masquerade (идемпотентно).
+//
+// Схема «роутер заворачивает трафик майнеров на сервер» (сервер — шлюз,
+// часто с одной сетевой картой): TCP на порты пулов перехватывает DNAT, а
+// остальное (DNS, NTP, порты вне перехвата) сервер форвардит дальше. Без
+// подмены источника такой пакет уходит на роутер с адресом майнера, роутер
+// по своему правилу снова отдаёт его серверу — петля до истечения TTL.
+//
+// Правило: -s <подсеть> [-o <интерфейс маршрута по умолчанию>]
+// -m addrtype ! --src-type LOCAL -j MASQUERADE.
+//   - -o: только трафик в сторону выхода. При двух сетевых картах (майнеры
+//     на eth1, аплинк на eth0) обмен внутри сети майнеров не трогается.
+//   - ! --src-type LOCAL: собственные соединения прокси к пулам (адрес
+//     сервера может входить в allowed_subnets) не трогаем.
+//   - Перехваченные соединения через POSTROUTING наружу не идут вовсе:
+//     после DNAT они доставляются локально.
+func setupMasquerade(opts Options) error {
+	if !opts.Masquerade {
+		removeMasquerade()
+		return nil
+	}
+	// -N падает, если цепочка уже есть — норма при повторном запуске.
+	_ = runCmdQuiet("iptables", "-t", "nat", "-N", postChainName)
+	if err := runCmd("iptables", "-t", "nat", "-F", postChainName); err != nil {
+		return fmt.Errorf("очистить цепочку %s: %w", postChainName, err)
+	}
+	if runCmdQuiet("iptables", "-t", "nat", "-C", "POSTROUTING", "-j", postChainName) != nil {
+		if err := runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-j", postChainName); err != nil {
+			return fmt.Errorf("добавить jump из POSTROUTING: %w", err)
+		}
+	}
+	egress := defaultRouteIface()
+	for _, subnet := range opts.Subnets {
+		args := masqueradeArgs(subnet, egress)
+		if err := runCmd("iptables", args...); err != nil {
+			return err
+		}
+		if egress != "" {
+			log.Printf("[IPTABLES] MASQUERADE %s -> %s (форвардимый трафик майнеров)", subnet, egress)
+		} else {
+			log.Printf("[IPTABLES] MASQUERADE %s (форвардимый трафик майнеров, интерфейс маршрута по умолчанию не найден)", subnet)
+		}
+	}
+	return nil
+}
+
+// masqueradeArgs — аргументы iptables для правила MASQUERADE одной подсети.
+func masqueradeArgs(subnet, egress string) []string {
+	args := []string{"-t", "nat", "-A", postChainName, "-s", subnet}
+	if egress != "" {
+		args = append(args, "-o", egress)
+	}
+	return append(args, "-m", "addrtype", "!", "--src-type", "LOCAL", "-j", "MASQUERADE")
+}
+
+// removeMasquerade снимает jump из POSTROUTING (все дубли) и цепочку.
+func removeMasquerade() {
+	for runCmdQuiet("iptables", "-t", "nat", "-C", "POSTROUTING", "-j", postChainName) == nil {
+		if runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-j", postChainName) != nil {
+			break
+		}
+	}
+	runCmdQuiet("iptables", "-t", "nat", "-F", postChainName)
+	runCmdQuiet("iptables", "-t", "nat", "-X", postChainName)
+}
+
+// defaultRouteIface — интерфейс маршрута по умолчанию ("ip -4 route show
+// default" → "default via 10.110.255.254 dev eth0 ..."). Пусто — не найден.
+func defaultRouteIface() string {
+	out, err := exec.Command("ip", "-4", "route", "show", "default").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return parseRouteDev(string(out))
+}
+
+// parseRouteDev достаёт имя интерфейса после "dev" из первой строки вывода ip route.
+func parseRouteDev(out string) string {
+	line := strings.SplitN(strings.TrimSpace(out), "\n", 2)[0]
+	fields := strings.Fields(line)
+	for i, f := range fields {
+		if f == "dev" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
+}
+
+// missingIfaces — интерфейсы из want, которых нет в have.
+func missingIfaces(want, have []string) []string {
+	set := map[string]bool{}
+	for _, h := range have {
+		set[h] = true
+	}
+	var miss []string
+	for _, w := range uniqStrings(want) {
+		if !set[w] {
+			miss = append(miss, w)
+		}
+	}
+	return miss
+}
+
+// ExistingIfaces — сетевые интерфейсы системы без lo (для мастера конфига).
+// nil — список прочитать не удалось.
+func ExistingIfaces() []string { return existingIfaces() }
+
 // existingIfaces — физические интерфейсы системы (без lo).
 func existingIfaces() []string {
 	dir, err := ioutil.ReadDir("/sys/class/net")
@@ -644,6 +810,12 @@ func uniqStrings(in []string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// runCmdQuiet выполняет команду без логирования: для проверок -C/-N, где
+// ошибка — ожидаемый ответ «правила нет».
+func runCmdQuiet(name string, args ...string) error {
+	return exec.Command(name, args...).Run()
 }
 
 // runCmd выполняет команду и логирует вывод при ошибке.
