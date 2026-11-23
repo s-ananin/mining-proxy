@@ -33,9 +33,6 @@ type appStatus struct {
 	proxy.Report
 	Nat        interface{}             `json:"nat,omitempty"`
 	Commission *proxy.CommissionReport `json:"commission,omitempty"`
-	// InactivePools — пулы вне upstream_pool (IP:port) и число шар, не
-	// попавших из-за этого в комиссию. null — комиссия выключена.
-	InactivePools map[string]int `json:"inactive_pools"`
 }
 
 func main() {
@@ -58,8 +55,8 @@ func main() {
 	// --- 1.1. Очистка nohup.out (stdout/stderr в обычный файл) ---
 	stopTruncate := startStdoutTruncation(cfg.StdoutTruncateEvery)
 	defer stopTruncate()
-	log.Printf("[MAIN] listen: %s | upstream pools: %v | monitor: http://%s/status",
-		cfg.ListenAddr, []string(cfg.UpstreamPools), cfg.MonitorAddr)
+	log.Printf("[MAIN] listen: %s | monitor: http://%s/status",
+		cfg.ListenAddr, cfg.MonitorAddr)
 	for _, d := range cfg.Deprecated {
 		log.Printf("[MAIN] config: %s", d)
 	}
@@ -97,15 +94,6 @@ func main() {
 		if cfg.BTCOnly() {
 			opts = append(opts, proxy.WithBTCOnly())
 		}
-		// Белый список пулов комиссии: воркер подменяется только на
-		// пулах из upstream_pool (там commission_worker зарегистрирован).
-		allow := proxy.NewPoolAllowlist(cfg.UpstreamPools, nil)
-		allow.Start()
-		defer allow.Close()
-		if allow.Len() == 0 {
-			log.Printf("[MAIN] commission: upstream_pool пуст — комиссия не будет браться ни на одном пуле")
-		}
-		opts = append(opts, proxy.WithPoolAllowlist(allow))
 		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, cfg.CommissionSessionEvery, stats, opts...)
 		commission.Start()
 		defer commission.Close()
@@ -156,19 +144,16 @@ func main() {
 	// ли правила iptables снаружи после старта.
 	monitor.StartServer(cfg.MonitorAddr, func() interface{} {
 		var commSnap *proxy.CommissionReport
-		var inactive map[string]int
 		if commission != nil {
 			s := commission.Snapshot()
 			commSnap = &s
-			inactive = s.InactivePools
 		}
 		return appStatus{
-			Status:        "ok",
-			ListenAddr:    cfg.ListenAddr,
-			Report:        stats.Report(),
-			Nat:           iptables.Status(natOpts),
-			Commission:    commSnap,
-			InactivePools: inactive,
+			Status:     "ok",
+			ListenAddr: cfg.ListenAddr,
+			Report:     stats.Report(),
+			Nat:        iptables.Status(natOpts),
+			Commission: commSnap,
 		}
 	}, func() bool { return true }, monitor.Endpoint{
 		// /port-info: какие порты пулов идут через DNAT в прокси, какие

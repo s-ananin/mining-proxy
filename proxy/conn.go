@@ -300,12 +300,6 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			// шара берётся, только если её задание опознано как BTC
 			// (coin.go); остальное идёт прозрачно.
 			eligible := id != "" && commission != nil && commission.Enabled() && se.coinAllowsCommission(submitJob)
-			// admitPool: пул шары должен быть в upstream_pool — на чужом
-			// пуле commission_worker нет, и шара ушла бы в пустоту. Такая
-			// шара идёт майнеру и считается в inactive_pools.
-			if eligible && !commission.admitPool(se.pool) {
-				eligible = false
-			}
 			if eligible && !se.feeDeniedNow() && !se.restoringMiner() {
 				reservedWork := se.difficulty()
 				if feeAuth && se.feeDifficulty() > 0 {

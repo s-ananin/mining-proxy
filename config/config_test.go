@@ -27,7 +27,7 @@ func writeTmp(t *testing.T, content string) string {
 }
 
 func TestLoadDefaults(t *testing.T) {
-	path := writeTmp(t, "upstream_pool: \"bs.poolbinance.com:3333\"\n")
+	path := writeTmp(t, "listen_addr: \"\"\n")
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -37,9 +37,6 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.MonitorAddr != "127.0.0.1:9090" {
 		t.Errorf("MonitorAddr = %q, want 127.0.0.1:9090", cfg.MonitorAddr)
-	}
-	if !reflect.DeepEqual([]string(cfg.UpstreamPools), []string{"bs.poolbinance.com:3333"}) {
-		t.Errorf("UpstreamPools = %q", cfg.UpstreamPools)
 	}
 }
 
@@ -149,7 +146,6 @@ func TestLoadCommissionSessionIgnoredWithoutWorker(t *testing.T) {
 func TestLoadFull(t *testing.T) {
 	path := writeTmp(t, `
 listen_addr: "0.0.0.0:8443"
-upstream_pool: "bs.poolbinance.com:3333"
 allowed_subnets:
   - "10.4.6.0/24"
 setup_iptables: true
@@ -175,6 +171,7 @@ monitor_addr: "127.0.0.1:9091"
 // Убранные из конфига ключи не ломают старт, а попадают в предупреждения.
 func TestLoadDeprecatedKeys(t *testing.T) {
 	cfg, err := Load(writeTmp(t, `
+upstream_pool: ["btc.viabtc.io:3333"]
 upstream_ssl: true
 nat_masquerade: false
 commission_worker_rotate: true
@@ -183,8 +180,8 @@ commission_suggest_difficulty: false
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(cfg.Deprecated) != 4 {
-		t.Fatalf("Deprecated = %q, want 4 entries", cfg.Deprecated)
+	if len(cfg.Deprecated) != 5 {
+		t.Fatalf("Deprecated = %q, want 5 entries", cfg.Deprecated)
 	}
 	cfg, err = Load(writeTmp(t, "listen_addr: \"0.0.0.0:8443\"\n"))
 	if err != nil || len(cfg.Deprecated) != 0 {
@@ -263,9 +260,8 @@ func TestLoadCapturePortsExtra(t *testing.T) {
 		t.Errorf("CapturePorts = %q, want %q", got, want)
 	}
 
-	// capture_all_tcp: false — только capture_ports, без диапазона; порты
-	// upstream_pool на перехват не влияют.
-	cfg, err = Load(writeTmp(t, "upstream_pool: \"pool:4444\"\ncapture_all_tcp: false\ncapture_ports: [3333, 25000]\n"))
+	// capture_all_tcp: false — только capture_ports, без диапазона.
+	cfg, err = Load(writeTmp(t, "capture_all_tcp: false\ncapture_ports: [3333, 25000]\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -292,44 +288,10 @@ func TestLoadStdoutTruncateInterval(t *testing.T) {
 	}
 }
 
-func TestLoadUpstreamPoolList(t *testing.T) {
-	cfg, err := Load(writeTmp(t, `
-upstream_pool:
-  - "BS.PoolBinance.com:3333"
-  - "btc.viabtc.io:443"
-  - "bs.poolbinance.com:3333"
-  - " sha256.poolbinance.com:3333 "
-`))
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	wantPools := []string{"bs.poolbinance.com:3333", "btc.viabtc.io:443", "sha256.poolbinance.com:3333"}
-	if !reflect.DeepEqual([]string(cfg.UpstreamPools), wantPools) {
-		t.Errorf("UpstreamPools = %q, want %q", cfg.UpstreamPools, wantPools)
-	}
-}
-
 // capture_all_tcp: false без capture_ports перехватывал бы весь TCP подсетей.
 func TestLoadCaptureAllFalseRequiresPorts(t *testing.T) {
 	_, err := Load(writeTmp(t, "setup_iptables: true\nallowed_subnets: [\"10.0.0.0/9\"]\ncapture_all_tcp: false\n"))
 	if err == nil {
 		t.Fatal("capture_all_tcp: false без capture_ports должен падать")
-	}
-}
-
-func TestLoadUpstreamPoolInvalid(t *testing.T) {
-	for _, body := range []string{
-		"upstream_pool: [\"pool\"]\n",
-		"upstream_pool: [\":3333\"]\n",
-		"upstream_pool: [\"pool:0\"]\n",
-		"upstream_pool: {a: b}\n",
-	} {
-		if _, err := Load(writeTmp(t, body)); err == nil {
-			t.Errorf("Load(%q) должен падать", body)
-		}
-	}
-	cfg, err := Load(writeTmp(t, "upstream_pool: \"\"\n"))
-	if err != nil || len(cfg.UpstreamPools) != 0 {
-		t.Errorf("пустая строка: %v %q", err, cfg.UpstreamPools)
 	}
 }

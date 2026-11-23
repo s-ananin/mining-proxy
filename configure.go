@@ -184,11 +184,6 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 	if c.CommissionWorker == "" {
 		return c, nil
 	}
-	pools, err := p.askList("Пулы комиссии host:port через запятую (upstream_pool; на остальных пулах комиссии нет)", c.UpstreamPools, true, checkHostPort)
-	if err != nil {
-		return c, err
-	}
-	c.UpstreamPools = config.HostPortList(pools)
 	if c.CommissionPercent, err = p.askFloat("Процент комиссии (commission_percent)", c.CommissionPercent, 0, 100); err != nil {
 		return c, err
 	}
@@ -518,9 +513,6 @@ var configTemplate = template.Must(template.New("config").Funcs(template.FuncMap
 
 # Адрес прокси — сюда приходит трафик майнеров после DNAT.
 listen_addr: {{q .ListenAddr}}
-
-# Пулы комиссии: воркер подменяется только на них.
-upstream_pool: {{strs .UpstreamPools}}
 
 # HTTP-мониторинг (/status, /health).
 monitor_addr: {{q .MonitorAddr}}

@@ -23,14 +23,6 @@ type Config struct {
 	// Дефолт "0.0.0.0:8443".
 	ListenAddr string `yaml:"listen_addr"`
 
-	// UpstreamPools пулы комиссии (host:port): белый список, на котором
-	// разрешено подменять воркер шары на commission_worker. Шары на
-	// остальные пулы идут майнеру без изменений и считаются в
-	// /status.inactive_pools. Домены резолвятся прокси сам и сверяются с IP
-	// адресата соединения (SO_ORIGINAL_DST). Пусто — комиссия не берётся
-	// нигде. В YAML — строка (один пул) или список.
-	UpstreamPools HostPortList `yaml:"upstream_pool"`
-
 	// AllowedSubnets подсети майнеров (CIDR), трафик которых перехватывается.
 	// Обязательно, если setup_iptables: true.
 	AllowedSubnets []string `yaml:"allowed_subnets"`
@@ -129,40 +121,11 @@ type Config struct {
 // deprecatedKeys — ключи, убранные из конфига, и поведение, которое теперь
 // действует всегда.
 var deprecatedKeys = []struct{ key, behavior string }{
+	{"upstream_pool", "комиссия берётся на любом пуле, принявшем commission_worker при проверке"},
 	{"upstream_ssl", "прямых подключений к прокси мимо iptables больше нет"},
 	{"nat_masquerade", "MASQUERADE ставится всегда"},
 	{"commission_suggest_difficulty", "сложность у пула запрашивается всегда"},
 	{"commission_worker_rotate", "ротации имени воркера комиссии нет"},
-}
-
-// HostPortList — список адресов host:port. В YAML принимает и строку
-// (один адрес, обратная совместимость со старым upstream_pool), и список.
-type HostPortList []string
-
-// UnmarshalYAML разбирает скаляр или последовательность строк.
-func (l *HostPortList) UnmarshalYAML(n *yaml.Node) error {
-	switch n.Kind {
-	case yaml.ScalarNode:
-		var s string
-		if err := n.Decode(&s); err != nil {
-			return err
-		}
-		if strings.TrimSpace(s) == "" {
-			*l = nil
-		} else {
-			*l = HostPortList{s}
-		}
-		return nil
-	case yaml.SequenceNode:
-		var items []string
-		if err := n.Decode(&items); err != nil {
-			return err
-		}
-		*l = HostPortList(items)
-		return nil
-	default:
-		return fmt.Errorf("строка или список host:port, а не %s", n.Tag)
-	}
 }
 
 // Load читает YAML-файл, применяет дефолты и валидирует поля.
@@ -262,28 +225,6 @@ func Load(path string) (*Config, error) {
 		if strings.TrimSpace(ifc) == "" {
 			return nil, fmt.Errorf("invalid nat_ingress_ifaces: пустое имя интерфейса")
 		}
-	}
-
-	// Пулы комиссии: валидация, нормализация (регистр домена, пробелы) и
-	// удаление дублей.
-	pools := cfg.UpstreamPools
-	cfg.UpstreamPools = nil
-	seenPool := map[string]bool{}
-	for _, raw := range pools {
-		addr := strings.TrimSpace(raw)
-		if err := validHostPort(addr, "upstream_pool"); err != nil {
-			return nil, err
-		}
-		host, port, _ := net.SplitHostPort(addr)
-		if host == "" {
-			return nil, fmt.Errorf("invalid upstream_pool %q: пустой хост", raw)
-		}
-		addr = net.JoinHostPort(strings.ToLower(host), port)
-		if seenPool[addr] {
-			continue
-		}
-		seenPool[addr] = true
-		cfg.UpstreamPools = append(cfg.UpstreamPools, addr)
 	}
 
 	// Комиссия: дефолты и валидация только когда воркер задан. Пусто —
