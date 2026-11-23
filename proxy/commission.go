@@ -187,6 +187,12 @@ type Commission struct {
 	// работа не входит в базу бюджета.
 	btcOnly bool
 
+	// poolTags: подписи пулов из coinbase, на которых разрешено изымать
+	// комиссию (commission_pools, например "ViaBTC"). Пусто — фильтр
+	// выключен, комиссия берётся на любом пуле. Задаётся опцией при
+	// создании и дальше не меняется, поэтому читается без c.mu.
+	poolTags []string
+
 	// Состояние суточного окна.
 	windowStart     time.Time
 	baseWork        float64
@@ -238,6 +244,35 @@ type CommissionOption func(*Commission)
 // монетами (и с ещё не опознанной монетой) проходят без изъятия.
 func WithBTCOnly() CommissionOption {
 	return func(c *Commission) { c.btcOnly = true }
+}
+
+// WithCommissionPools ограничивает изъятие пулами, чья подпись в coinbase
+// входит в tags (например "ViaBTC"). Пустой список — ограничения нет.
+func WithCommissionPools(tags []string) CommissionOption {
+	return func(c *Commission) { c.poolTags = tags }
+}
+
+// PoolTags возвращает настроенные подписи пулов комиссии (для /status и
+// логов). Список задаётся при создании и дальше не меняется.
+func (c *Commission) PoolTags() []string {
+	if c == nil {
+		return nil
+	}
+	return c.poolTags
+}
+
+// PoolFilterOn сообщает, включён ли фильтр по подписи пула.
+func (c *Commission) PoolFilterOn() bool {
+	return c != nil && len(c.poolTags) > 0
+}
+
+// MatchPoolTag возвращает подпись из списка, совпавшую с coinbase, или "".
+// Без настроенного фильтра всегда "".
+func (c *Commission) MatchPoolTag(coinbase []byte) string {
+	if c == nil {
+		return ""
+	}
+	return matchPoolTag(coinbase, c.poolTags)
 }
 
 // inSessionLocked — идёт ли сейчас окно изъятия (без session — всегда).
@@ -827,6 +862,9 @@ type CommissionReport struct {
 	ChargedPercent   float64           `json:"charged_percent"`
 	ForfeitedWork    float64           `json:"forfeited_work"`
 	PoolChecks       map[string]string `json:"pool_checks,omitempty"`
+	// PoolFilter — подписи пулов из commission_pools (ViaBTC и т.п.), на
+	// которых разрешено изымать комиссию. Пусто — фильтр выключен.
+	PoolFilter []string `json:"pool_filter,omitempty"`
 	// Активность на момент снимка (по открытым соединениям):
 	// *_active — все подключённые воркеры/пулы; *_with_commission — те, что
 	// на пулах, где комиссия сейчас может браться (см. poolChargeableLocked).
@@ -889,6 +927,7 @@ func (c *Commission) Snapshot() CommissionReport {
 		IterationsLeft:   left,
 		NextIterationAt:  c.nextIterationAt.Format(time.RFC3339),
 		WindowEnd:        c.windowStart.Add(commissionWindow).Format(time.RFC3339),
+		PoolFilter:       c.poolTags,
 	}
 	if c.nextIterationAt.IsZero() {
 		rep.NextIterationAt = ""

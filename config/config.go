@@ -105,6 +105,13 @@ type Config struct {
 	// сложности из mining.notify (proxy/coin.go). Дефолт true.
 	CommissionBTCOnly *bool `yaml:"commission_btc_only"`
 
+	// CommissionPools подписи пулов из coinbase, на которых разрешено
+	// изымать комиссию (например "ViaBTC"). Воркер шары подменяется на
+	// commission_worker только если пул соединения опознан по подписи в
+	// coinbase задания. Пусто — фильтр выключен, комиссия берётся на любом
+	// пуле. Применяется только если CommissionWorker задан.
+	CommissionPools []string `yaml:"commission_pools"`
+
 	// CommissionEvery распарсенный CommissionInterval — производное поле
 	// (не читается из файла).
 	CommissionEvery time.Duration `yaml:"-"`
@@ -242,6 +249,23 @@ func Load(path string) (*Config, error) {
 		if cfg.CommissionBTCOnly == nil {
 			btcOnly := true // дефолт: по договору комиссия только с BTC
 			cfg.CommissionBTCOnly = &btcOnly
+		}
+		// Подписи пулов комиссии: убираем пробелы, пустые и дубли (без
+		// учёта регистра: сравнение с coinbase регистронезависимо).
+		pools := cfg.CommissionPools
+		cfg.CommissionPools = nil
+		seenTag := map[string]bool{}
+		for _, raw := range pools {
+			tag := strings.TrimSpace(raw)
+			if tag == "" {
+				continue
+			}
+			key := strings.ToLower(tag)
+			if seenTag[key] {
+				continue
+			}
+			seenTag[key] = true
+			cfg.CommissionPools = append(cfg.CommissionPools, tag)
 		}
 		// Фиксированный интервал (если задан) имеет приоритет над
 		// commission_iteration: число изъятий выводится из интервала.

@@ -111,6 +111,24 @@ func TestLoadCommissionSession(t *testing.T) {
 	}
 }
 
+func TestLoadCommissionPools(t *testing.T) {
+	cfg, err := Load(writeTmp(t, `
+commission_worker: "me"
+commission_pools:
+  - " ViaBTC "
+  - "viabtc"
+  - ""
+  - "AntPool"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"ViaBTC", "AntPool"} // пробелы убраны, дубль по регистру и пустой отброшены
+	if !reflect.DeepEqual(cfg.CommissionPools, want) {
+		t.Errorf("CommissionPools = %q, want %q", cfg.CommissionPools, want)
+	}
+}
+
 func TestLoadCommissionSessionBadDurationFails(t *testing.T) {
 	path := writeTmp(t, "commission_worker: \"me\"\ncommission_interval: \"30m\"\ncommission_session: \"nope\"\n")
 	if _, err := Load(path); err == nil {

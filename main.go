@@ -94,6 +94,14 @@ func main() {
 		if cfg.BTCOnly() {
 			opts = append(opts, proxy.WithBTCOnly())
 		}
+		// Фильтр по подписи пула в coinbase: комиссия только на пулах из
+		// commission_pools (ViaBTC и т.п.). Пусто — на любом пуле.
+		if len(cfg.CommissionPools) > 0 {
+			opts = append(opts, proxy.WithCommissionPools(cfg.CommissionPools))
+			log.Printf("[MAIN] commission: пулы комиссии (по подписи coinbase): %v", cfg.CommissionPools)
+		} else {
+			log.Printf("[MAIN] commission: commission_pools пуст — комиссия берётся на любом пуле, принявшем воркера")
+		}
 		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, cfg.CommissionSessionEvery, stats, opts...)
 		commission.Start()
 		defer commission.Close()

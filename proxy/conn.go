@@ -300,6 +300,12 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			// шара берётся, только если её задание опознано как BTC
 			// (coin.go); остальное идёт прозрачно.
 			eligible := id != "" && commission != nil && commission.Enabled() && se.coinAllowsCommission(submitJob)
+			// poolTagAllowsCommission: при включённом commission_pools шара
+			// берётся только если пул соединения опознан по подписи в
+			// coinbase (ViaBTC и т.п.); на чужом пуле — прозрачно.
+			if eligible && !se.poolTagAllowsCommission() {
+				eligible = false
+			}
 			if eligible && !se.feeDeniedNow() && !se.restoringMiner() {
 				reservedWork := se.difficulty()
 				if feeAuth && se.feeDifficulty() > 0 {
@@ -497,6 +503,9 @@ func pipePoolToMiner(src net.Conn, dst net.Conn, se *session) {
 			se.setJobID(jobID)
 			if netDiff, ok := NetworkDifficultyFromNotify(line); ok {
 				se.observeNotify(jobID, netDiff)
+			}
+			if coinbase, ok := coinbaseFromNotify(line); ok {
+				se.observeCoinbase(coinbase)
 			}
 		}
 
