@@ -54,16 +54,6 @@ type Options struct {
 	// только порт.
 	ListenAddr string
 
-	// UpstreamPort — порт реального пула. Используется как фильтр --dport,
-	// только если CaptureAllTCP == false.
-	UpstreamPort string
-
-	// CaptureAllTCP — перенаправлять TCP подсетей на любые порты из
-	// CapturePorts (а не только UpstreamPort). Нужно, когда ASIC ходят на
-	// разные пулы/порты (типично для контейнеров), а `upstream_pool` в
-	// конфиге — лишь значение по умолчанию для pass-through.
-	CaptureAllTCP bool
-
 	// CapturePorts — фильтр --dport при CaptureAllTCP: "25:9999" (диапазон)
 	// или "9999" (один порт). Пусто — весь TCP без фильтра по порту.
 	CapturePorts []string
@@ -71,14 +61,6 @@ type Options struct {
 	// IngressIfaces — входящие интерфейсы вручную. Пусто = определить
 	// автоматически по маршруту к подсетям.
 	IngressIfaces []string
-
-	// Masquerade — подменять источник (MASQUERADE) у трафика подсетей,
-	// который сервер форвардит дальше, а не перехватывает. Нужно, когда
-	// сервер стоит шлюзом для майнеров (роутер заворачивает их трафик на
-	// него): без подмены пакет уходит обратно на роутер с адресом майнера,
-	// роутер снова отдаёт его серверу — петля, DNS не резолвится, ASIC не
-	// подключается к пулу. См. setupMasquerade.
-	Masquerade bool
 }
 
 // NATStatus — снимок состояния NAT для диагностики (поле "nat" в /status).
@@ -274,17 +256,10 @@ func Setup(opts Options) error {
 }
 
 // dportFilters возвращает значения --dport для правил DNAT (по правилу на
-// элемент). Если CapturePorts задан (config.CapturePorts уже учёл
-// capture_all_tcp и доп. порты) — он; иначе при !CaptureAllTCP — порт пула.
-// Пусто — без фильтра порта.
+// элемент): CapturePorts (config.CapturePorts уже учёл capture_all_tcp и
+// доп. порты). Пусто — без фильтра порта.
 func dportFilters(opts Options) []string {
-	if len(opts.CapturePorts) > 0 {
-		return opts.CapturePorts
-	}
-	if !opts.CaptureAllTCP && opts.UpstreamPort != "" {
-		return []string{opts.UpstreamPort}
-	}
-	return nil
+	return opts.CapturePorts
 }
 
 // Cleanup удаляет все правила, созданные Setup. Вызывается при graceful
@@ -296,7 +271,6 @@ func dportFilters(opts Options) []string {
 // шлюза, а не прокси. Если сервер — шлюз майнеров, то без MASQUERADE после
 // остановки прокси форвардимый трафик зациклится между сервером и роутером,
 // и майнинг встанет. С ним трафик идёт в пул напрямую через сервер.
-// Снимается MASQUERADE только при nat_masquerade: false (см. setupMasquerade).
 func Cleanup(opts Options) {
 	// Убираем jump из PREROUTING.
 	//
@@ -439,9 +413,9 @@ func Status(opts Options) NATStatus {
 		st.Problems = append(st.Problems,
 			"порт прокси "+st.ListenPort+" не открыт в filter/INPUT — после DNAT пакет локальный и может отбрасываться политикой DROP")
 	}
-	if opts.Masquerade && !st.Masquerade {
+	if len(opts.Subnets) > 0 && !st.Masquerade {
 		st.Problems = append(st.Problems,
-			"nat_masquerade включён, но правила MASQUERADE ("+postChainName+") нет — если сервер шлюз для майнеров, их DNS/UDP зациклится между сервером и роутером")
+			"правила MASQUERADE ("+postChainName+") нет — если сервер шлюз для майнеров, их DNS/UDP зациклится между сервером и роутером")
 	}
 	if len(st.IngressIfaces) == 0 && len(opts.Subnets) > 0 {
 		st.Problems = append(st.Problems,
@@ -616,8 +590,9 @@ func ifaceSysctlLines(keys []string) string {
 	return b.String()
 }
 
-// setupMasquerade приводит цепочку MINING_PROXY_POST в соответствие с
-// opts.Masquerade (идемпотентно).
+// setupMasquerade пересоздаёт цепочку MINING_PROXY_POST (идемпотентно).
+// Ставится всегда: если сервер не шлюз, форвардимого трафика нет и правило
+// ни на что не влияет.
 //
 // Схема «роутер заворачивает трафик майнеров на сервер» (сервер — шлюз,
 // часто с одной сетевой картой): TCP на порты пулов перехватывает DNAT, а
@@ -634,10 +609,6 @@ func ifaceSysctlLines(keys []string) string {
 //   - Перехваченные соединения через POSTROUTING наружу не идут вовсе:
 //     после DNAT они доставляются локально.
 func setupMasquerade(opts Options) error {
-	if !opts.Masquerade {
-		removeMasquerade()
-		return nil
-	}
 	// -N падает, если цепочка уже есть — норма при повторном запуске.
 	_ = runCmdQuiet("iptables", "-t", "nat", "-N", postChainName)
 	if err := runCmd("iptables", "-t", "nat", "-F", postChainName); err != nil {
@@ -670,17 +641,6 @@ func masqueradeArgs(subnet, egress string) []string {
 		args = append(args, "-o", egress)
 	}
 	return append(args, "-m", "addrtype", "!", "--src-type", "LOCAL", "-j", "MASQUERADE")
-}
-
-// removeMasquerade снимает jump из POSTROUTING (все дубли) и цепочку.
-func removeMasquerade() {
-	for runCmdQuiet("iptables", "-t", "nat", "-C", "POSTROUTING", "-j", postChainName) == nil {
-		if runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-j", postChainName) != nil {
-			break
-		}
-	}
-	runCmdQuiet("iptables", "-t", "nat", "-F", postChainName)
-	runCmdQuiet("iptables", "-t", "nat", "-X", postChainName)
 }
 
 // defaultRouteIface — интерфейс маршрута по умолчанию ("ip -4 route show

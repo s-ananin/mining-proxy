@@ -114,9 +114,6 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 	if c.ListenAddr, err = p.askString("Адрес прокси (listen_addr)", c.ListenAddr, true, checkHostPort); err != nil {
 		return c, err
 	}
-	if c.UpstreamPool, err = p.askString("Fallback-пул host:port (upstream_pool, можно пусто)", c.UpstreamPool, false, checkHostPort); err != nil {
-		return c, err
-	}
 	if c.MonitorAddr, err = p.askString("Адрес мониторинга /status (monitor_addr)", c.MonitorAddr, true, checkHostPort); err != nil {
 		return c, err
 	}
@@ -146,13 +143,8 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 		if c.NATIngressIfaces, err = p.askList(ifaceQ, c.NATIngressIfaces, false, checkIface); err != nil {
 			return c, err
 		}
-		masq := c.NATMasqueradeRaw == nil || *c.NATMasqueradeRaw
-		if masq, err = p.askBool("Сервер — шлюз майнеров: MASQUERADE для остального их трафика, DNS/UDP (nat_masquerade)?", masq); err != nil {
-			return c, err
-		}
-		c.NATMasqueradeRaw = &masq
 		captureAll := c.CaptureAllTCPRaw == nil || *c.CaptureAllTCPRaw
-		if captureAll, err = p.askBool("Перехватывать диапазон портов, а не только порт upstream_pool (capture_all_tcp)?", captureAll); err != nil {
+		if captureAll, err = p.askBool("Перехватывать диапазон портов, а не только отдельные порты capture_ports (capture_all_tcp)?", captureAll); err != nil {
 			return c, err
 		}
 		c.CaptureAllTCPRaw = &captureAll
@@ -170,8 +162,18 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 				fmt.Fprintln(p.out, "  ! начало диапазона больше конца")
 			}
 		}
-		if c.CapturePortsExtra, err = p.askPorts("Доп. порты через запятую (capture_ports, можно пусто)", c.CapturePortsExtra); err != nil {
-			return c, err
+		portsQ := "Доп. порты через запятую (capture_ports, можно пусто)"
+		if !captureAll {
+			portsQ = "Порты пулов через запятую (capture_ports, обязательно)"
+		}
+		for {
+			if c.CapturePortsExtra, err = p.askPorts(portsQ, c.CapturePortsExtra); err != nil {
+				return c, err
+			}
+			if captureAll || len(c.CapturePortsExtra) > 0 {
+				break
+			}
+			fmt.Fprintln(p.out, "  ! без диапазона нужен хотя бы один порт")
 		}
 	}
 
@@ -180,10 +182,13 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 		return c, err
 	}
 	if c.CommissionWorker == "" {
-		c.CommissionWorkerRotate = false
-		c.CommissionSuggestDifficulty = false
 		return c, nil
 	}
+	pools, err := p.askList("Пулы комиссии host:port через запятую (upstream_pool; на остальных пулах комиссии нет)", c.UpstreamPools, true, checkHostPort)
+	if err != nil {
+		return c, err
+	}
+	c.UpstreamPools = config.HostPortList(pools)
 	if c.CommissionPercent, err = p.askFloat("Процент комиссии (commission_percent)", c.CommissionPercent, 0, 100); err != nil {
 		return c, err
 	}
@@ -215,12 +220,6 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 		return c, err
 	}
 	c.CommissionBTCOnly = &btcOnly
-	if c.CommissionSuggestDifficulty, err = p.askBool("Просить у пула сложность (commission_suggest_difficulty)?", c.CommissionSuggestDifficulty); err != nil {
-		return c, err
-	}
-	if c.CommissionWorkerRotate, err = p.askBool("Ротация имени воркера комиссии (commission_worker_rotate)?", c.CommissionWorkerRotate); err != nil {
-		return c, err
-	}
 	return c, nil
 }
 
@@ -520,9 +519,8 @@ var configTemplate = template.Must(template.New("config").Funcs(template.FuncMap
 # Адрес прокси — сюда приходит трафик майнеров после DNAT.
 listen_addr: {{q .ListenAddr}}
 
-# Fallback-пул (прямое подключение мимо iptables) и фильтр порта DNAT.
-upstream_pool: {{q .UpstreamPool}}
-upstream_ssl: {{.UpstreamSSL}}
+# Пулы комиссии: воркер подменяется только на них.
+upstream_pool: {{strs .UpstreamPools}}
 
 # HTTP-мониторинг (/status, /health).
 monitor_addr: {{q .MonitorAddr}}
@@ -531,7 +529,6 @@ monitor_addr: {{q .MonitorAddr}}
 setup_iptables: {{.SetupIPTables}}
 allowed_subnets: {{strs .AllowedSubnets}}
 nat_ingress_ifaces: {{strs .NATIngressIfaces}}
-nat_masquerade: {{bptr .NATMasqueradeRaw}}
 capture_all_tcp: {{bptr .CaptureAllTCPRaw}}
 capture_port_from: {{.CapturePortFrom}}
 capture_port_to: {{.CapturePortTo}}
@@ -549,6 +546,4 @@ commission_interval: {{q .CommissionInterval}}
 commission_session: {{q .CommissionSession}}
 commission_iteration: {{.CommissionIteration}}
 commission_btc_only: {{bptr .CommissionBTCOnly}}
-commission_suggest_difficulty: {{.CommissionSuggestDifficulty}}
-commission_worker_rotate: {{.CommissionWorkerRotate}}
 `))

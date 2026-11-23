@@ -100,32 +100,26 @@ func originalDstAddr(dst net.Addr) string {
 	return dst.String()
 }
 
-// resolveDestination решает, на какой адрес подключаться для данного
-// соединения:
+// resolveDestination возвращает реальный пул конкретного ASIC, восстановленный
+// из DNAT (у разных клиентов может быть свой пул). Пустая строка — адресат
+// не восстановлен или это прямой коннект на наш listener мимо iptables:
+// такое соединение обслуживать некуда.
 //
-//   - адресат восстановлен из DNAT и это не наш listener → реальный пул
-//     конкретного ASIC (у разных клиентов может быть свой пул);
-//   - иначе (прямой коннект мимо iptables, локальный тест) → fallback
-//     из конфига (upstream_pool).
-func resolveDestination(conn net.Conn, pass ProxyPass) (addr string, ssl bool) {
-	addr, ssl = pass.Fallback, pass.FallbackSSL
-	if !pass.Transparent {
-		return addr, ssl
-	}
+// TLS не терминируется: если ASIC работает с пулом по TLS, сессия идёт
+// сквозь нашу байтовую трубу.
+func resolveDestination(conn net.Conn, listenAddr string) string {
 	tcp, ok := conn.(*net.TCPConn)
 	if !ok {
-		return addr, ssl
+		return ""
 	}
 	dst, ok := getOriginalDst(tcp)
 	if !ok {
-		return addr, ssl
+		return ""
 	}
-	if isProxyAddr(dst, pass.ListenAddr) {
-		return addr, ssl
+	if isProxyAddr(dst, listenAddr) {
+		return ""
 	}
-	// TLS здесь НЕ терминируется: клиент говорит с пулом напрямую через
-	// нашу байтовую трубу, поэтому ssl=false всегда.
-	return originalDstAddr(dst), false
+	return originalDstAddr(dst)
 }
 
 // isProxyAddr проверяет, что адрес назначения — наш же listener,

@@ -12,7 +12,6 @@ package proxy
 
 import (
 	"bufio"
-	"crypto/tls"
 	"io"
 	"log"
 	"net"
@@ -51,20 +50,10 @@ type ProxyPass struct {
 	// от DNAT-перенаправленного (см. dest.go isProxyAddr).
 	ListenAddr string
 
-	// Fallback реальный пул из конфига (upstream_pool): используется при
-	// прямом подключении к прокси мимо iptables (локальный тест).
-	Fallback string
-
-	// FallbackSSL TLS к Fallback. В прозрачном режиме не применяется:
-	// клиент сам держит TLS-сессию с пулом сквозь нашу трубу.
-	FallbackSSL bool
-
-	// Transparent включает определение адресата через SO_ORIGINAL_DST.
-	Transparent bool
-
 	// ResolveDest переопределение адресата — ТОЛЬКО для тестов
-	// (эмуляция DNAT без root и iptables). В проде nil.
-	ResolveDest func(net.Conn) (string, bool)
+	// (эмуляция DNAT без root и iptables). В проде nil: адресат берётся
+	// из SO_ORIGINAL_DST.
+	ResolveDest func(net.Conn) string
 
 	// Commission сборщик комиссии; nil — комиссия выключена.
 	Commission *Commission
@@ -78,14 +67,13 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 
 	// --- 1. Реальный адресат (пул именно этого майнера) ---
 	var dest string
-	var destSSL bool
 	if pass.ResolveDest != nil {
-		dest, destSSL = pass.ResolveDest(clientConn)
+		dest = pass.ResolveDest(clientConn)
 	} else {
-		dest, destSSL = resolveDestination(clientConn, pass)
+		dest = resolveDestination(clientConn, pass.ListenAddr)
 	}
 	if dest == "" {
-		log.Printf("[CONN] %s: не удалось определить адресат (нет SO_ORIGINAL_DST и upstream_pool)", clientConn.RemoteAddr())
+		log.Printf("[CONN] %s: не удалось определить адресат (нет SO_ORIGINAL_DST — подключение мимо DNAT)", clientConn.RemoteAddr())
 		return
 	}
 
@@ -94,7 +82,7 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 	defer se.close()
 
 	// --- 2. Подключаемся к реальному пулу ---
-	upstream, err := dialUpstream(dest, destSSL)
+	upstream, err := net.DialTimeout("tcp", dest, upstreamDialTimeout)
 	if err != nil {
 		log.Printf("[CONN] upstream %s: %v", dest, err)
 		return
@@ -150,16 +138,6 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 	upstream.Close()
 	<-done
 	log.Printf("[DISCONNECT] %s (pool=%s)", source, dest)
-}
-
-// dialUpstream создаёт TCP или TLS соединение с реальным пулом.
-func dialUpstream(addr string, ssl bool) (net.Conn, error) {
-	if ssl {
-		// InsecureSkipVerify — публичные пулы часто работают на
-		// самоподписанных сертификатах (риск осознан: это fallback).
-		return tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
-	}
-	return net.DialTimeout("tcp", addr, upstreamDialTimeout)
 }
 
 // sourceHost превращает RemoteAddr в чистый IP (без эфемерного порта).
@@ -225,11 +203,12 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 
 	// feeAuth — соединение сейчас авторизовано под commission_worker.
 	feeAuth := false
-	// feeWorker — имя воркера комиссии, под которым идёт текущее изъятие.
-	// Фиксируется при открытии служебного authorize: ротация имени (новый
-	// воркер на каждое окно) не должна рассинхронизировать authorize и
-	// submit — пул зачисляет шары на того воркера, которому отдан authorize.
+	// feeWorker — имя воркера комиссии (commission_worker): под ним идут
+	// служебный authorize и изъятые шары.
 	feeWorker := ""
+	if commission != nil {
+		feeWorker = commission.Worker()
+	}
 	writeAuthorize := func(worker string) bool {
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if err := writeLine(dst, miningAuthorizeLine(worker, commissionAuthTag)); err != nil {
@@ -260,7 +239,6 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			return true
 		}
 		se.setFeeActive(true)
-		feeWorker = commission.WindowWorker()
 		if !writeAuthorize(feeWorker) {
 			se.setFeeActive(false)
 			return false
@@ -278,7 +256,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 		if target <= 0 {
 			return true
 		}
-		if commission.SuggestDifficulty() && actual > 0 && actual != target && se.allowSuggest() {
+		if actual > 0 && actual != target && se.allowSuggest() {
 			if !writeSuggestDifficulty(target, time.Now().Add(writeTimeout)) {
 				return false
 			}
@@ -321,7 +299,14 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			// coinAllowsCommission: по договору комиссия только с BTC —
 			// шара берётся, только если её задание опознано как BTC
 			// (coin.go); остальное идёт прозрачно.
-			if id != "" && commission != nil && commission.Enabled() && se.coinAllowsCommission(submitJob) && !se.feeDeniedNow() && !se.restoringMiner() {
+			eligible := id != "" && commission != nil && commission.Enabled() && se.coinAllowsCommission(submitJob)
+			// admitPool: пул шары должен быть в upstream_pool — на чужом
+			// пуле commission_worker нет, и шара ушла бы в пустоту. Такая
+			// шара идёт майнеру и считается в inactive_pools.
+			if eligible && !commission.admitPool(se.pool) {
+				eligible = false
+			}
+			if eligible && !se.feeDeniedNow() && !se.restoringMiner() {
 				reservedWork := se.difficulty()
 				if feeAuth && se.feeDifficulty() > 0 {
 					reservedWork = se.feeDifficulty()

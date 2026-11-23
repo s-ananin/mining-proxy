@@ -23,7 +23,6 @@ import (
 	"math"
 	"math/rand"
 	"sort"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -183,21 +182,6 @@ type Commission struct {
 	session          time.Duration // >0 — окно изъятия внутри интервала
 	stats            *Stats
 
-	// Ротация имени воркера комиссии. У пула с vardiff сложность
-	// воркера падает в разы, если воркер шлёт мало шар (а комиссия шлёт их
-	// мало по определению): изъятые шары зачитываются в десятки раз
-	// дешевле, и комиссия обесценивается. У нового имени истории нет —
-	// пул не трогает сложность сессии, и комиссия остаётся полной.
-	// Имя вида "<worker>.rN": аккаунт у пула — часть до первой точки, так
-	// что деньги по-прежнему идут на commission_worker.
-	rotateWorkers bool
-	workerSeq     int
-	windowWorker  string // имя воркера, действующее в текущем окне изъятия
-
-	// suggestDiff — после служебного authorize просить у пула закрепить
-	// сложность сессии на уровне сложности майнера (mining.suggest_difficulty).
-	suggestDiff bool
-
 	// btcOnly: комиссия берётся только в соединениях, где пул раздаёт
 	// задания BTC (см. coin.go). Остальные монеты идут прозрачно, и их
 	// работа не входит в базу бюджета.
@@ -234,6 +218,15 @@ type Commission struct {
 	// commissionCarryFraction (не выдаётся повторно).
 	forfeited float64
 
+	// allow — белый список пулов комиссии (upstream_pool, allowlist.go).
+	// nil — ограничения нет (комиссия на любом пуле). Задаётся опцией при
+	// создании и дальше не меняется, поэтому читается без c.mu.
+	allow *PoolAllowlist
+
+	// inactive — шары, не попавшие в комиссию из-за того, что их пул не
+	// входит в allow (адресат → число шар). Для /status.inactive_pools.
+	inactive map[string]int
+
 	// Проверка пулов отдельным соединением (probe.go); probe == nil — выкл.
 	probe  ProbeFunc
 	probes map[string]*poolProbe
@@ -250,26 +243,49 @@ type Commission struct {
 // расчёт порций.
 type CommissionOption func(*Commission)
 
-// WithWorkerRotation включает ротацию имени воркера комиссии: в каждом окне
-// изъятия используется новое имя ("<worker>.r1", "<worker>.r2" и т.д.).
-// Нужно пулам с vardiff: у нового воркера нет истории, поэтому пул не
-// обрушивает сложность сессии и изъятые шары зачитываются полностью.
-func WithWorkerRotation() CommissionOption {
-	return func(c *Commission) { c.rotateWorkers = true }
-}
-
-// WithSuggestDifficulty включает запрос сложности сессии у пула
-// (mining.suggest_difficulty) сразу после служебного authorize: пул
-// закрепляет сложность на уровне сложности майнера, даже если у воркера
-// комиссии свой vardiff.
-func WithSuggestDifficulty() CommissionOption {
-	return func(c *Commission) { c.suggestDiff = true }
-}
-
 // WithBTCOnly ограничивает комиссию заданиями BTC: соединения с другими
 // монетами (и с ещё не опознанной монетой) проходят без изъятия.
 func WithBTCOnly() CommissionOption {
 	return func(c *Commission) { c.btcOnly = true }
+}
+
+// WithPoolAllowlist ограничивает комиссию пулами из белого списка
+// (upstream_pool): шары остальных пулов идут майнеру без изменений, их
+// работа не входит в базу бюджета и считается в inactive_pools. Пустой
+// список — комиссия не берётся нигде.
+func WithPoolAllowlist(a *PoolAllowlist) CommissionOption {
+	return func(c *Commission) { c.allow = a }
+}
+
+// PoolAllowed сообщает, разрешена ли комиссия на адресате pool по белому
+// списку. Без списка (или без комиссии) — true.
+func (c *Commission) PoolAllowed(pool string) bool {
+	if c == nil || c.allow == nil {
+		return true
+	}
+	_, ok := c.allow.Match(pool)
+	return ok
+}
+
+// admitPool — проверка шары по белому списку перед изъятием. Пул вне списка
+// не допускается; если в этот момент комиссия брала бы шары (есть бюджет и
+// идёт окно изъятия), шара учитывается в inactive_pools как недобранная.
+func (c *Commission) admitPool(pool string) bool {
+	if c.PoolAllowed(pool) {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.worker != "" && c.takeBudget > 0 && c.inSessionLocked(time.Now()) {
+		c.inactive[pool]++
+	}
+	return false
+}
+
+// inSessionLocked — идёт ли сейчас окно изъятия (без session — всегда).
+// Вызывается под c.mu.
+func (c *Commission) inSessionLocked(now time.Time) bool {
+	return c.session <= 0 || !now.Before(c.sessionStart) && now.Before(c.sessionEnd)
 }
 
 // BTCOnly сообщает, ограничена ли комиссия заданиями BTC. Значение
@@ -313,9 +329,9 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 		breakers:         map[string]*poolBreaker{},
 		breakerLogs:      map[string]time.Time{},
 		probes:           map[string]*poolProbe{},
+		inactive:         map[string]int{},
 		rng:              rand.New(rand.NewSource(now.UnixNano())),
 	}
-	c.windowWorker = worker
 	for _, opt := range opts {
 		if opt != nil {
 			opt(c)
@@ -324,33 +340,10 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 	return c
 }
 
-// WindowWorker возвращает имя воркера комиссии, действующее в текущем окне
-// изъятия. При ротации это новое имя в каждом окне; без ротации —
-// commission_worker как есть.
-func (c *Commission) WindowWorker() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.windowWorker
-}
-
-// SuggestDifficulty сообщает, нужно ли просить у пула закрепить сложность
-// сессии (mining.suggest_difficulty) после служебного authorize.
-func (c *Commission) SuggestDifficulty() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.suggestDiff
-}
-
-// advanceWindowWorkerLocked готовит имя воркера для нового окна изъятия:
-// при ротации — следующее по счёту имя, без ротации — имя как есть.
-// Вызывается под c.mu.
-func (c *Commission) advanceWindowWorkerLocked() {
-	if !c.rotateWorkers || c.worker == "" {
-		c.windowWorker = c.worker
-		return
-	}
-	c.workerSeq++
-	c.windowWorker = c.worker + ".r" + strconv.Itoa(c.workerSeq)
+// Worker — имя воркера комиссии (commission_worker). Задаётся при создании
+// и дальше не меняется.
+func (c *Commission) Worker() string {
+	return c.worker
 }
 
 // Enabled true, если комиссия сконфигурирована (worker задан).
@@ -442,12 +435,6 @@ func (c *Commission) iterate(now time.Time) time.Time {
 		c.takeBudget += batch
 		c.budgetIssued += batch
 		c.iterationsUsed++
-		if batch > 0 {
-			// Новое окно изъятия — новое имя воркера (если включена
-			// ротация): у пула нет истории по этому имени, поэтому
-			// сложность сессии не обрушивается.
-			c.advanceWindowWorkerLocked()
-		}
 
 		// Окно изъятия на предстоящий интервал: случайное начало,
 		// длина ровно session (влезает в интервал: offset ≤ interval-session).
@@ -502,10 +489,6 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	c.budgetIssued += batch
 	c.iterationsUsed++
 	if batch > 0 {
-		// Новое окно изъятия — новое имя воркера (если включена ротация).
-		c.advanceWindowWorkerLocked()
-	}
-	if batch > 0 {
 		log.Printf("[COMMISSION] iteration %d/%d: work budget %.3f (accepted work=%.3f, target=%.3f, taken=%.3f)",
 			c.iterationsUsed, c.iterationsPerDay, batch, acceptedToday,
 			target, c.workAccepted-c.baseFeeWork)
@@ -534,18 +517,23 @@ func (c *Commission) iterate(now time.Time) time.Time {
 	return next
 }
 
-// billableHashrateLocked — хешрейт, с которого берётся комиссия: весь поток
-// или, в режиме btcOnly, только пулы с заданиями BTC. Только для логов.
+// billableHashrateLocked — хешрейт, с которого берётся комиссия: пулы из
+// белого списка (если задан), в режиме btcOnly — только с заданиями BTC.
+// Только для логов.
 func (c *Commission) billableHashrateLocked() int64 {
 	rep := c.stats.Report()
-	if !c.btcOnly {
+	if !c.btcOnly && c.allow == nil {
 		return rep.Totals.Hashrate
 	}
 	var hr int64
 	for _, p := range rep.Pools {
-		if p.Coin == coinBTC.String() {
-			hr += p.Hashrate
+		if c.btcOnly && p.Coin != coinBTC.String() {
+			continue
 		}
+		if !c.PoolAllowed(p.Pool) {
+			continue
+		}
+		hr += p.Hashrate
 	}
 	return hr
 }
@@ -628,14 +616,14 @@ func (c *Commission) reserveLocked(pool string, difficulty ...float64) bool {
 	if c.worker == "" || c.takeBudget <= 0 {
 		return false
 	}
+	if !c.PoolAllowed(pool) {
+		return false
+	}
 	if c.poolOpenLocked(pool, time.Now()) {
 		return false
 	}
-	if c.session > 0 {
-		now := time.Now()
-		if now.Before(c.sessionStart) || !now.Before(c.sessionEnd) {
-			return false
-		}
+	if !c.inSessionLocked(time.Now()) {
+		return false
 	}
 	c.takeBudget -= work
 	return true
@@ -691,8 +679,8 @@ func (c *Commission) hasBudget(pool string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
-	return c.worker != "" && c.takeBudget > 0 && !c.poolOpenLocked(pool, now) &&
-		(c.session <= 0 || !now.Before(c.sessionStart) && now.Before(c.sessionEnd))
+	return c.worker != "" && c.takeBudget > 0 && c.PoolAllowed(pool) &&
+		!c.poolOpenLocked(pool, now) && c.inSessionLocked(now)
 }
 
 // reportDeny сообщает об отказе пула переавторизовать соединение под
@@ -873,8 +861,6 @@ type PoolCommissionReport struct {
 type CommissionReport struct {
 	Enabled          bool              `json:"enabled"`
 	Worker           string            `json:"worker,omitempty"`
-	WindowWorker     string            `json:"-"`
-	WorkerRotate     bool              `json:"worker_rotate,omitempty"`
 	Percent          float64           `json:"percent,omitempty"`
 	Interval         string            `json:"interval,omitempty"`
 	Session          string            `json:"session,omitempty"`
@@ -892,6 +878,11 @@ type CommissionReport struct {
 	ChargedPercent   float64           `json:"charged_percent"`
 	ForfeitedWork    float64           `json:"forfeited_work"`
 	PoolChecks       map[string]string `json:"pool_checks,omitempty"`
+	// UpstreamPools — пулы белого списка и их текущие IP:port (по DNS).
+	UpstreamPools map[string][]string `json:"upstream_pools,omitempty"`
+	// InactivePools — адресат вне белого списка → число шар, не попавших в
+	// комиссию. Выводится на верхнем уровне /status (inactive_pools).
+	InactivePools map[string]int `json:"-"`
 	// Активность на момент снимка (по открытым соединениям):
 	// *_active — все подключённые воркеры/пулы; *_with_commission — те, что
 	// на пулах, где комиссия сейчас может браться (см. poolChargeableLocked).
@@ -933,8 +924,6 @@ func (c *Commission) Snapshot() CommissionReport {
 	rep := CommissionReport{
 		Enabled:          true,
 		Worker:           c.worker,
-		WindowWorker:     c.windowWorker,
-		WorkerRotate:     c.rotateWorkers,
 		Percent:          c.percent,
 		Interval:         intervalString(c.interval),
 		Session:          intervalString(c.session),
@@ -1004,6 +993,11 @@ func (c *Commission) Snapshot() CommissionReport {
 		}
 	}
 	sort.Slice(rep.Pools, func(i, j int) bool { return rep.Pools[i].Pool < rep.Pools[j].Pool })
+	rep.UpstreamPools = c.allow.Snapshot()
+	rep.InactivePools = make(map[string]int, len(c.inactive))
+	for pool, n := range c.inactive {
+		rep.InactivePools[pool] = n
+	}
 
 	// Активные воркеры и пулы. Порядок блокировок c.mu → stats.mu тот же,
 	// что в billableHashrateLocked.
@@ -1025,12 +1019,15 @@ func (c *Commission) Snapshot() CommissionReport {
 	return rep
 }
 
-// poolChargeableLocked — может ли комиссия браться на пуле сейчас: монета
-// подходит (в режиме btcOnly — BTC), пул подтверждён проверкой commission_worker
-// и предохранитель закрыт. Окно сессии не учитывается: пул остаётся
+// poolChargeableLocked — может ли комиссия браться на пуле сейчас: пул в
+// белом списке, монета подходит (в режиме btcOnly — BTC), пул подтверждён
+// проверкой commission_worker и предохранитель закрыт. Окно сессии не учитывается: пул остаётся
 // «с комиссией», даже если текущий момент вне окна. В отличие от
 // poolVerifiedLocked, проверку не запускает. Вызывается под c.mu.
 func (c *Commission) poolChargeableLocked(pool, coin string, now time.Time) bool {
+	if !c.PoolAllowed(pool) {
+		return false
+	}
 	if c.btcOnly && coin != coinBTC.String() {
 		return false
 	}

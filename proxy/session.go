@@ -29,7 +29,8 @@ type pendingShare struct {
 	feeDiffUnknown bool
 	feeEstimate    float64
 	// billable — работа шары входит в базу бюджета комиссии. false для
-	// шар не-BTC соединений в режиме btcOnly (их работа не облагается).
+	// шар пулов вне upstream_pool и не-BTC соединений в режиме btcOnly
+	// (их работа не облагается).
 	billable bool
 }
 
@@ -320,9 +321,14 @@ func (s *session) coinAllowsCommission(jobID string) bool {
 }
 
 // billableLocked — входит ли работа шары по заданию jobID в базу бюджета
-// комиссии. Задание известно — решает его монета, иначе текущая монета
-// соединения. Вызывается под s.mu.
+// комиссии. Пул вне белого списка (upstream_pool) — не входит: комиссию с
+// него не взять, и его работа не должна увеличивать изъятие на остальных
+// пулах. Дальше в режиме btcOnly: задание известно — решает его монета,
+// иначе текущая монета соединения. Вызывается под s.mu.
 func (s *session) billableLocked(jobID string) bool {
+	if !s.commission.PoolAllowed(s.pool) {
+		return false
+	}
 	if !s.commission.BTCOnly() {
 		return true
 	}
@@ -424,8 +430,8 @@ func (s *session) submitJob(id, worker, jobID string) {
 // markCommissionSubmit регистрирует забранную комиссией шару как ожидающую
 // ответа пула. Ответ по её id уйдёт в счётчики комиссии, а не воркеру
 // майнера (см. resolve). worker — имя воркера комиссии, под которым шара
-// ушла в пул (при ротации имени оно меняется от окна к окну). Возвращает
-// сложность шары (текущую сложность соединения) — комиссия копит по ней work.
+// ушла в пул. Возвращает сложность шары (текущую сложность соединения) —
+// комиссия копит по ней work.
 func (s *session) markCommissionSubmit(id, worker string) float64 {
 	if id == "" {
 		return 0

@@ -33,6 +33,9 @@ type appStatus struct {
 	proxy.Report
 	Nat        interface{}             `json:"nat,omitempty"`
 	Commission *proxy.CommissionReport `json:"commission,omitempty"`
+	// InactivePools — пулы вне upstream_pool (IP:port) и число шар, не
+	// попавших из-за этого в комиссию. null — комиссия выключена.
+	InactivePools map[string]int `json:"inactive_pools"`
 }
 
 func main() {
@@ -55,16 +58,13 @@ func main() {
 	// --- 1.1. Очистка nohup.out (stdout/stderr в обычный файл) ---
 	stopTruncate := startStdoutTruncation(cfg.StdoutTruncateEvery)
 	defer stopTruncate()
-	log.Printf("[MAIN] listen: %s | fallback pool: %q | monitor: http://%s/status",
-		cfg.ListenAddr, cfg.UpstreamPool, cfg.MonitorAddr)
+	log.Printf("[MAIN] listen: %s | upstream pools: %v | monitor: http://%s/status",
+		cfg.ListenAddr, []string(cfg.UpstreamPools), cfg.MonitorAddr)
+	for _, d := range cfg.Deprecated {
+		log.Printf("[MAIN] config: %s", d)
+	}
 	if cfg.CommissionWorker != "" {
 		extra := ""
-		if cfg.CommissionWorkerRotate {
-			extra += " rotate"
-		}
-		if cfg.CommissionSuggestDifficulty {
-			extra += " suggest_diff"
-		}
 		if cfg.BTCOnly() {
 			extra += " btc_only"
 		}
@@ -89,20 +89,23 @@ func main() {
 	var commission *proxy.Commission
 	if cfg.CommissionWorker != "" {
 		var opts []proxy.CommissionOption
-		if cfg.CommissionWorkerRotate {
-			opts = append(opts, proxy.WithWorkerRotation())
-		}
-		if cfg.CommissionSuggestDifficulty {
-			opts = append(opts, proxy.WithSuggestDifficulty())
-		}
 		// Комиссия на адресе пула — только после того, как пул принял
 		// commission_worker в отдельном проверочном соединении (пул комиссии
-		// на динамическом IP, белый список адресов не годится).
+		// на динамическом IP: новый адрес проверяется при первом соединении).
 		opts = append(opts, proxy.WithPoolProbe(nil))
 		// По договору комиссия только с BTC: остальные монеты — прозрачно.
 		if cfg.BTCOnly() {
 			opts = append(opts, proxy.WithBTCOnly())
 		}
+		// Белый список пулов комиссии: воркер подменяется только на
+		// пулах из upstream_pool (там commission_worker зарегистрирован).
+		allow := proxy.NewPoolAllowlist(cfg.UpstreamPools, nil)
+		allow.Start()
+		defer allow.Close()
+		if allow.Len() == 0 {
+			log.Printf("[MAIN] commission: upstream_pool пуст — комиссия не будет браться ни на одном пуле")
+		}
+		opts = append(opts, proxy.WithPoolAllowlist(allow))
 		commission = proxy.NewCommission(cfg.CommissionWorker, cfg.CommissionPercent, cfg.CommissionIteration, cfg.CommissionEvery, cfg.CommissionSessionEvery, stats, opts...)
 		commission.Start()
 		defer commission.Close()
@@ -112,20 +115,14 @@ func main() {
 	natOpts := iptables.Options{
 		Subnets:       cfg.AllowedSubnets,
 		ListenAddr:    cfg.ListenAddr,
-		UpstreamPort:  cfg.UpstreamPort,
-		CaptureAllTCP: cfg.CaptureAllTCP,
 		CapturePorts:  cfg.CapturePorts(),
 		IngressIfaces: cfg.NATIngressIfaces,
-		Masquerade:    cfg.NATMasquerade,
 	}
 
 	// --- 4. Listener ДО перехвата (см. doc пакета) ---
 	srv := proxy.NewServer(proxy.Options{
-		ListenAddr:  cfg.ListenAddr,
-		Fallback:    cfg.UpstreamPool,
-		FallbackSSL: cfg.UpstreamSSL,
-		Transparent: true,
-		Commission:  commission,
+		ListenAddr: cfg.ListenAddr,
+		Commission: commission,
 	}, stats)
 	if err := srv.Listen(); err != nil {
 		log.Fatalf("[FATAL] listen %s: %v", cfg.ListenAddr, err)
@@ -137,8 +134,8 @@ func main() {
 	// Cleanup снимает правила при остановке — fail-open: трафик майнеров
 	// уходит напрямую в пул, майнинг не прерывается.
 	if cfg.SetupIPTables {
-		log.Printf("[MAIN] iptables setup (capture_all_tcp=%v, ports=%v, subnets=%v, masquerade=%v)",
-			cfg.CaptureAllTCP, cfg.CapturePorts(), cfg.AllowedSubnets, cfg.NATMasquerade)
+		log.Printf("[MAIN] iptables setup (capture_all_tcp=%v, ports=%v, subnets=%v)",
+			cfg.CaptureAllTCP, cfg.CapturePorts(), cfg.AllowedSubnets)
 		if err := iptables.Setup(natOpts); err != nil {
 			log.Fatalf("[FATAL] iptables: %v", err)
 		}
@@ -159,16 +156,19 @@ func main() {
 	// ли правила iptables снаружи после старта.
 	monitor.StartServer(cfg.MonitorAddr, func() interface{} {
 		var commSnap *proxy.CommissionReport
+		var inactive map[string]int
 		if commission != nil {
 			s := commission.Snapshot()
 			commSnap = &s
+			inactive = s.InactivePools
 		}
 		return appStatus{
-			Status:     "ok",
-			ListenAddr: cfg.ListenAddr,
-			Report:     stats.Report(),
-			Nat:        iptables.Status(natOpts),
-			Commission: commSnap,
+			Status:        "ok",
+			ListenAddr:    cfg.ListenAddr,
+			Report:        stats.Report(),
+			Nat:           iptables.Status(natOpts),
+			Commission:    commSnap,
+			InactivePools: inactive,
 		}
 	}, func() bool { return true }, monitor.Endpoint{
 		// /port-info: какие порты пулов идут через DNAT в прокси, какие

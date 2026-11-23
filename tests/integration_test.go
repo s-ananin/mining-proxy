@@ -155,9 +155,9 @@ func (m *mockPool) handle(conn net.Conn) {
 
 // --- прокси и клиент -------------------------------------------------------
 
-// startProxy поднимает прокси на свободном порту. Fallback = пул: прямое
-// подключение к прокси мимо iptables уходит в fallback (resolveDestination).
-func startProxy(t *testing.T, fallback string, stats *proxy.Stats) (string, func()) {
+// startProxy поднимает прокси на свободном порту. DNAT эмулируется через
+// ResolveDest: каждое соединение уходит в pool.
+func startProxy(t *testing.T, pool string, stats *proxy.Stats) (string, func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -165,8 +165,7 @@ func startProxy(t *testing.T, fallback string, stats *proxy.Stats) (string, func
 	}
 	pass := proxy.ProxyPass{
 		ListenAddr:  ln.Addr().String(),
-		Fallback:    fallback,
-		Transparent: true,
+		ResolveDest: func(net.Conn) string { return pool },
 	}
 	go func() {
 		for {

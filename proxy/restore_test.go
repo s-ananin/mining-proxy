@@ -58,7 +58,7 @@ func TestRestoreRejectsFailedAuthorization(t *testing.T) {
 // while the restore is pending. No aliases or automatic reconnects are used.
 func TestImmediateMinerRestoreAcrossThreeWindows(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("fee.worker", 1, 40, 0, 0, stats, WithSuggestDifficulty())
+	c := NewCommission("fee.worker", 1, 40, 0, 0, stats)
 	defer c.Close()
 	se := newSession(stats, "pool", "miner", c)
 	defer se.close()

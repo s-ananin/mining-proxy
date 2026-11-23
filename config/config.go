@@ -23,15 +23,13 @@ type Config struct {
 	// Дефолт "0.0.0.0:8443".
 	ListenAddr string `yaml:"listen_addr"`
 
-	// UpstreamPool реальный пул (host:port), если SO_ORIGINAL_DST недоступен:
-	// прямое подключение к прокси мимо iptables (локальный тест) или
-	// fallback. Пусто = работаем только в прозрачном режиме.
-	UpstreamPool string `yaml:"upstream_pool"`
-
-	// UpstreamSSL TLS при подключении к UpstreamPool (fallback-соединение).
-	// В прозрачном режиме TLS не терминируется никогда: клиент сам держит
-	// TLS-сессию с пулом сквозь байтовую трубу.
-	UpstreamSSL bool `yaml:"upstream_ssl"`
+	// UpstreamPools пулы комиссии (host:port): белый список, на котором
+	// разрешено подменять воркер шары на commission_worker. Шары на
+	// остальные пулы идут майнеру без изменений и считаются в
+	// /status.inactive_pools. Домены резолвятся прокси сам и сверяются с IP
+	// адресата соединения (SO_ORIGINAL_DST). Пусто — комиссия не берётся
+	// нигде. В YAML — строка (один пул) или список.
+	UpstreamPools HostPortList `yaml:"upstream_pool"`
 
 	// AllowedSubnets подсети майнеров (CIDR), трафик которых перехватывается.
 	// Обязательно, если setup_iptables: true.
@@ -44,21 +42,10 @@ type Config struct {
 	// по маршруту к allowed_subnets.
 	NATIngressIfaces []string `yaml:"nat_ingress_ifaces"`
 
-	// NATMasqueradeRaw подменять источник (MASQUERADE) у трафика
-	// allowed_subnets, который сервер форвардит дальше, а не перехватывает
-	// (DNS, UDP, порты вне перехвата). Нужно, когда сервер — шлюз майнеров
-	// (роутер заворачивает их трафик на него): без этого такой трафик
-	// зацикливается между сервером и роутером. Дефолт true; действует только
-	// при setup_iptables: true. Итог — поле NATMasquerade.
-	NATMasqueradeRaw *bool `yaml:"nat_masquerade"`
-
-	// NATMasquerade итоговое значение nat_masquerade — производное поле.
-	NATMasquerade bool `yaml:"-"`
-
 	// CaptureAllTCPRaw перехватывать TCP подсетей на диапазон портов
-	// [CapturePortFrom..CapturePortTo] (воронка), а не только порт
-	// UpstreamPool. Нужно, если майнеры ходят на разные порты пулов.
-	// Дефолт true (не задано в файле = true). Итог — поле CaptureAllTCP.
+	// [CapturePortFrom..CapturePortTo] (воронка). false — только порты
+	// capture_ports (тогда список обязателен). Дефолт true (не задано в
+	// файле = true). Итог — поле CaptureAllTCP.
 	CaptureAllTCPRaw *bool `yaml:"capture_all_tcp"`
 
 	// CapturePortFrom/CapturePortTo диапазон портов назначения (включительно),
@@ -70,9 +57,9 @@ type Config struct {
 
 	// CapturePortsExtra отдельные порты назначения сверх диапазона
 	// capture_port_from..capture_port_to (например 25000, 14444 у пулов с
-	// нестандартными портами). Перехватываются и при capture_all_tcp: false
-	// (вместе с портом upstream_pool). Порты, уже входящие в диапазон,
-	// пропускаются — дублей правил не будет.
+	// нестандартными портами). При capture_all_tcp: false — единственные
+	// перехватываемые порты. Порты, уже входящие в диапазон, пропускаются —
+	// дублей правил не будет.
 	CapturePortsExtra []int `yaml:"capture_ports"`
 
 	// StdoutTruncateInterval период очистки stdout/stderr, если они
@@ -119,22 +106,6 @@ type Config struct {
 	// не больше него.
 	CommissionSession string `yaml:"commission_session"`
 
-	// CommissionWorkerRotate включает ротацию имени воркера комиссии: в
-	// каждом окне изъятия используется новое имя ("<worker>.r1", "<worker>.r2"
-	// и т.д.). Нужно для пулов с vardiff: сложность воркера падает в разы,
-	// если воркер шлёт мало шар (а комиссия шлёт их мало по определению), и
-	// изъятые шары зачитываются в десятки раз дешевле. У нового воркера
-	// истории нет — пул не трогает сложность сессии, и комиссия остаётся
-	// полной. Деньги при этом идут на тот же аккаунт: пул берёт аккаунт из
-	// части имени до первой точки ("anton425.r1" → аккаунт "anton425").
-	CommissionWorkerRotate bool `yaml:"commission_worker_rotate"`
-
-	// CommissionSuggestDifficulty: после служебного authorize прокси
-	// просит у пула закрепить сложность сессии на уровне сложности майнера
-	// (mining.suggest_difficulty). Пул, не знающий метода, ответит ошибкой
-	// (или проигнорирует) — поэтому включать только для проверенных пулов.
-	CommissionSuggestDifficulty bool `yaml:"commission_suggest_difficulty"`
-
 	// CommissionBTCOnly брать комиссию только с добычи BTC (по договору).
 	// Соединения, где пул раздаёт задания другой монеты (BCH, LTC/DOGE,
 	// Kaspa…), проходят через прокси прозрачно: без служебных authorize, и
@@ -150,9 +121,48 @@ type Config struct {
 	// поле (не читается из файла).
 	CommissionSessionEvery time.Duration `yaml:"-"`
 
-	// UpstreamPort порт UpstreamPool — производное поле для DNAT-фильтра
-	// (--dport). Тег yaml:"-" — не читается из файла.
-	UpstreamPort string `yaml:"-"`
+	// Deprecated устаревшие ключи, найденные в файле: их значение теперь
+	// зашито в код, а сами ключи игнорируются. Для предупреждения в логе.
+	Deprecated []string `yaml:"-"`
+}
+
+// deprecatedKeys — ключи, убранные из конфига, и поведение, которое теперь
+// действует всегда.
+var deprecatedKeys = []struct{ key, behavior string }{
+	{"upstream_ssl", "прямых подключений к прокси мимо iptables больше нет"},
+	{"nat_masquerade", "MASQUERADE ставится всегда"},
+	{"commission_suggest_difficulty", "сложность у пула запрашивается всегда"},
+	{"commission_worker_rotate", "ротации имени воркера комиссии нет"},
+}
+
+// HostPortList — список адресов host:port. В YAML принимает и строку
+// (один адрес, обратная совместимость со старым upstream_pool), и список.
+type HostPortList []string
+
+// UnmarshalYAML разбирает скаляр или последовательность строк.
+func (l *HostPortList) UnmarshalYAML(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.ScalarNode:
+		var s string
+		if err := n.Decode(&s); err != nil {
+			return err
+		}
+		if strings.TrimSpace(s) == "" {
+			*l = nil
+		} else {
+			*l = HostPortList{s}
+		}
+		return nil
+	case yaml.SequenceNode:
+		var items []string
+		if err := n.Decode(&items); err != nil {
+			return err
+		}
+		*l = HostPortList(items)
+		return nil
+	default:
+		return fmt.Errorf("строка или список host:port, а не %s", n.Tag)
+	}
 }
 
 // Load читает YAML-файл, применяет дефолты и валидирует поля.
@@ -165,6 +175,14 @@ func Load(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	var keys map[string]interface{}
+	if err := yaml.Unmarshal(data, &keys); err == nil {
+		for _, d := range deprecatedKeys {
+			if _, ok := keys[d.key]; ok {
+				cfg.Deprecated = append(cfg.Deprecated, d.key+": устарел и игнорируется — "+d.behavior)
+			}
+		}
 	}
 
 	if cfg.ListenAddr == "" {
@@ -180,8 +198,6 @@ func Load(path string) (*Config, error) {
 	if err := validHostPort(cfg.MonitorAddr, "monitor_addr"); err != nil {
 		return nil, err
 	}
-
-	cfg.NATMasquerade = cfg.SetupIPTables && (cfg.NATMasqueradeRaw == nil || *cfg.NATMasqueradeRaw)
 
 	// Перехват по диапазону портов: дефолт включён, 25..9999.
 	cfg.CaptureAllTCP = cfg.CaptureAllTCPRaw == nil || *cfg.CaptureAllTCPRaw
@@ -204,6 +220,12 @@ func Load(path string) (*Config, error) {
 		if p < 1 || p > 65535 {
 			return nil, fmt.Errorf("capture_ports: порт %d вне диапазона 1..65535", p)
 		}
+	}
+	// Без диапазона и без отдельных портов фильтра --dport нет вовсе, и
+	// перехватывался бы весь TCP подсетей (SSH, веб-интерфейсы ASIC).
+	if cfg.SetupIPTables && !cfg.CaptureAllTCP && len(cfg.CapturePortsExtra) == 0 {
+		return nil, fmt.Errorf("capture_all_tcp: false без capture_ports — перехватывать нечего; " +
+			"укажите порты пулов в capture_ports или включите capture_all_tcp")
 	}
 
 	if cfg.StdoutTruncateInterval == "" {
@@ -242,15 +264,26 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	if cfg.UpstreamPool != "" {
-		if err := validHostPort(cfg.UpstreamPool, "upstream_pool"); err != nil {
+	// Пулы комиссии: валидация, нормализация (регистр домена, пробелы) и
+	// удаление дублей.
+	pools := cfg.UpstreamPools
+	cfg.UpstreamPools = nil
+	seenPool := map[string]bool{}
+	for _, raw := range pools {
+		addr := strings.TrimSpace(raw)
+		if err := validHostPort(addr, "upstream_pool"); err != nil {
 			return nil, err
 		}
-		_, port, err := net.SplitHostPort(cfg.UpstreamPool)
-		if err != nil {
-			return nil, fmt.Errorf("upstream_pool: %w", err)
+		host, port, _ := net.SplitHostPort(addr)
+		if host == "" {
+			return nil, fmt.Errorf("invalid upstream_pool %q: пустой хост", raw)
 		}
-		cfg.UpstreamPort = port
+		addr = net.JoinHostPort(strings.ToLower(host), port)
+		if seenPool[addr] {
+			continue
+		}
+		seenPool[addr] = true
+		cfg.UpstreamPools = append(cfg.UpstreamPools, addr)
 	}
 
 	// Комиссия: дефолты и валидация только когда воркер задан. Пусто —
@@ -299,8 +332,6 @@ func Load(path string) (*Config, error) {
 			}
 			cfg.CommissionSessionEvery = d
 		}
-	} else if cfg.CommissionWorkerRotate || cfg.CommissionSuggestDifficulty {
-		return nil, fmt.Errorf("commission_worker_rotate и commission_suggest_difficulty требуют непустого commission_worker")
 	}
 
 	return &cfg, nil
@@ -313,9 +344,7 @@ func (c *Config) BTCOnly() bool {
 
 // CapturePorts — фильтры --dport для DNAT в формате iptables, по одному
 // правилу на элемент: при capture_all_tcp — диапазон ("25:9999" или "9999",
-// если from == to), иначе порт upstream_pool (если известен); затем порты
-// capture_ports, не попавшие в уже перечисленное. Пустой список (при
-// capture_all_tcp: false и без upstream_pool) — перехват без фильтра порта.
+// если from == to); затем порты capture_ports, не попавшие в диапазон.
 func (c *Config) CapturePorts() []string {
 	var out []string
 	seen := map[int]bool{}
@@ -327,14 +356,6 @@ func (c *Config) CapturePorts() []string {
 			out = append(out, strconv.Itoa(c.CapturePortFrom)+":"+strconv.Itoa(c.CapturePortTo))
 		}
 		inRange = func(p int) bool { return p >= c.CapturePortFrom && p <= c.CapturePortTo }
-	} else if c.UpstreamPort == "" {
-		// Без фильтра перехватывается весь TCP — доп. порты уже внутри.
-		return nil
-	} else {
-		out = append(out, c.UpstreamPort)
-		if p, err := strconv.Atoi(c.UpstreamPort); err == nil {
-			seen[p] = true
-		}
 	}
 	for _, p := range c.CapturePortsExtra {
 		if seen[p] || inRange(p) {

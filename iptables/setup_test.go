@@ -154,11 +154,10 @@ func TestDportFilters(t *testing.T) {
 		opts Options
 		want []string
 	}{
-		{Options{CaptureAllTCP: true, CapturePorts: []string{"25:9999"}, UpstreamPort: "3333"}, []string{"25:9999"}},
-		{Options{CaptureAllTCP: true, CapturePorts: []string{"25:9999", "25000", "14444"}}, []string{"25:9999", "25000", "14444"}},
-		{Options{CaptureAllTCP: true}, nil},
-		{Options{CaptureAllTCP: false, CapturePorts: []string{"3333", "25000"}, UpstreamPort: "3333"}, []string{"3333", "25000"}},
-		{Options{CaptureAllTCP: false, UpstreamPort: "3333"}, []string{"3333"}},
+		{Options{CapturePorts: []string{"25:9999"}}, []string{"25:9999"}},
+		{Options{CapturePorts: []string{"25:9999", "25000", "14444"}}, []string{"25:9999", "25000", "14444"}},
+		{Options{}, nil},
+		{Options{CapturePorts: []string{"3333", "25000"}}, []string{"3333", "25000"}},
 	}
 	for _, c := range cases {
 		if got := dportFilters(c.opts); !reflect.DeepEqual(got, c.want) {

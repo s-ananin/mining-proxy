@@ -401,7 +401,16 @@ func TestFeeDifficultyNotLeakedToMiner(t *testing.T) {
 	}
 	toPool(`{"id":"__commission_switch__","result":true,"error":null}`)
 	toPool(`{"id":null,"method":"mining.set_difficulty","params":[256]}`)
-	if s := fromPool(); !strings.Contains(s, `"fee.worker"`) {
+	s := fromPool()
+	// Сложность комиссии (256) ниже сложности майнера (512): прокси может
+	// успеть попросить пул поднять её — запрос сложности идёт всегда.
+	if strings.Contains(s, "mining.suggest_difficulty") {
+		if !strings.Contains(s, "[512]") {
+			t.Fatalf("запрос сложности не на уровне майнера: %s", s)
+		}
+		s = fromPool()
+	}
+	if !strings.Contains(s, `"fee.worker"`) {
 		t.Fatalf("ожидалась подменённая шара fee.worker: %s", s)
 	}
 
@@ -647,66 +656,15 @@ func TestCommissionBreaker(t *testing.T) {
 	}
 }
 
-// TestCommissionWorkerRotation: при включённой ротации имя воркера комиссии
-// меняется от окна к окну — у пула нет истории по новому имени, поэтому
-// vardiff не обрушивает сложность сессии и изъятые шары зачитываются
-// полностью. Без ротации имя остаётся прежним.
-func TestCommissionWorkerRotation(t *testing.T) {
+// TestPipeMinerToPoolFeeWorker: служебный authorize и подменённая шара
+// уходят под commission_worker как есть — иначе пул зачислит шары не туда.
+func TestPipeMinerToPoolFeeWorker(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("feeworker", 2, 0, 10*time.Minute, 0, stats, WithWorkerRotation())
-	if got := c.WindowWorker(); got != "feeworker" {
-		t.Errorf("до первого тика имя = %q, want feeworker", got)
-	}
-
-	accept := func(n int) {
-		for i := 0; i < n; i++ {
-			stats.Result("pool:3333", "w", 1, true, "")
-		}
-	}
-	now := c.windowStart
-	accept(200)
-	c.iterate(now.Add(10 * time.Minute))
-	if got := c.WindowWorker(); got != "feeworker.r1" {
-		t.Errorf("после 1-го тика имя = %q, want feeworker.r1", got)
-	}
-
-	accept(100)
-	c.iterate(now.Add(20 * time.Minute))
-	if got := c.WindowWorker(); got != "feeworker.r2" {
-		t.Errorf("после 2-го тика имя = %q, want feeworker.r2", got)
-	}
-
-	// Аккаунт у пула — часть имени до первой точки: деньги идут на
-	// commission_worker, а не на отдельный аккаунт.
-	if acc := strings.Split(c.WindowWorker(), ".")[0]; acc != "feeworker" {
-		t.Errorf("аккаунт = %q, want feeworker", acc)
-	}
-	rep := c.Snapshot()
-	if !rep.WorkerRotate || rep.WindowWorker != "feeworker.r2" {
-		t.Errorf("отчёт комиссии: %+v", rep)
-	}
-
-	// Без ротации имя не меняется.
-	plain := NewCommission("feeworker", 2, 0, 10*time.Minute, 0, NewStats())
-	plain.iterate(plain.windowStart.Add(10 * time.Minute))
-	if got := plain.WindowWorker(); got != "feeworker" {
-		t.Errorf("без ротации имя = %q, want feeworker", got)
-	}
-}
-
-// TestPipeMinerToPoolRotatedWorker: служебный authorize и подменённая шара
-// уходят под одним и тем же ротированным именем — иначе пул зачислит шары
-// не туда.
-func TestPipeMinerToPoolRotatedWorker(t *testing.T) {
-	stats := NewStats()
-	c := NewCommission("feeworker", 2, 0, 10*time.Minute, 0, stats, WithWorkerRotation())
+	c := NewCommission("feeworker", 2, 0, 10*time.Minute, 0, stats)
 	for i := 0; i < 200; i++ {
 		stats.Result("pool:3333", "w", 1, true, "")
 	}
 	c.iterate(c.windowStart.Add(10 * time.Minute))
-	if got := c.WindowWorker(); got != "feeworker.r1" {
-		t.Fatalf("имя воркера = %q, want feeworker.r1", got)
-	}
 
 	clientConn, minerSide := net.Pipe()
 	defer clientConn.Close()
@@ -740,16 +698,16 @@ func TestPipeMinerToPoolRotatedWorker(t *testing.T) {
 		t.Fatalf("authorize майнера проброшен неверно: %s", a)
 	}
 
-	// Шара забирается комиссией: authorize и submit — под ротированным именем.
+	// Шара забирается комиссией: authorize и submit — под commission_worker.
 	send(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
 	a := recv()
-	if !strings.Contains(a, `"feeworker.r1"`) || !strings.Contains(a, "mining.authorize") {
-		t.Fatalf("ожидался служебный authorize feeworker.r1: %s", a)
+	if !strings.Contains(a, `"feeworker"`) || !strings.Contains(a, "mining.authorize") {
+		t.Fatalf("ожидался служебный authorize feeworker: %s", a)
 	}
 	se.confirmFeeAuthorization(true)
 	se.setFeeDiff(1)
 	s := recv()
-	if !strings.Contains(s, `"feeworker.r1"`) || !strings.Contains(s, "mining.submit") {
+	if !strings.Contains(s, `"feeworker"`) || !strings.Contains(s, "mining.submit") {
 		t.Fatalf("подменённая шара неверна: %s", s)
 	}
 	if strings.Contains(s, `"client.w"`) {
@@ -757,12 +715,12 @@ func TestPipeMinerToPoolRotatedWorker(t *testing.T) {
 	}
 }
 
-// TestCommissionSuggestDifficulty: с включённой опцией прокси просит у пула
+// TestCommissionSuggestDifficulty: прокси просит у пула
 // закрепить сложность сессии на уровне сложности майнера, а ответ пула на
 // служебный запрос майнеру не передаётся.
 func TestCommissionSuggestDifficulty(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithSuggestDifficulty())
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats)
 	c.takeBudget = 16 + 16
 
 	clientConn, minerIn := net.Pipe()
@@ -868,7 +826,7 @@ func TestCommissionSuggestDifficulty(t *testing.T) {
 // ограничивает частоту таких запросов).
 func TestCommissionNoSuggestWhenPoolKeepsDifficulty(t *testing.T) {
 	stats := NewStats()
-	c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithSuggestDifficulty())
+	c := NewCommission("fee.worker", 2, 40, 0, 0, stats)
 	c.takeBudget = 1
 
 	clientConn, minerIn := net.Pipe()

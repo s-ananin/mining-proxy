@@ -11,7 +11,7 @@ func TestCommissionEntryDoesNotQueueOrdinaryShares(t *testing.T) {
 	for _, scenario := range []string{"busy_authorizer", "higher_diff_backoff", "lower_diff_backoff"} {
 		t.Run(scenario, func(t *testing.T) {
 			stats := NewStats()
-			c := NewCommission("fee.worker", 1, 40, 0, 0, stats, WithSuggestDifficulty())
+			c := NewCommission("fee.worker", 1, 40, 0, 0, stats)
 			defer c.Close()
 			c.takeBudget = 6
 			se := newSession(stats, "pool", "miner", c)

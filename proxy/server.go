@@ -17,17 +17,9 @@ type Options struct {
 	// ListenAddr адрес listener ("0.0.0.0:8443").
 	ListenAddr string
 
-	// Fallback пул (upstream_pool) для прямых подключений мимо iptables.
-	Fallback string
-
-	// FallbackSSL TLS к Fallback.
-	FallbackSSL bool
-
-	// Transparent определять адресат через SO_ORIGINAL_DST.
-	Transparent bool
-
-	// ResolveDest тестовый переопределитель адресата (nil в проде).
-	ResolveDest func(net.Conn) (string, bool)
+	// ResolveDest тестовый переопределитель адресата (nil в проде:
+	// адресат из SO_ORIGINAL_DST).
+	ResolveDest func(net.Conn) string
 
 	// Commission сборщик комиссии; nil — выключена.
 	Commission *Commission
@@ -76,14 +68,10 @@ func (s *Server) Run() error {
 	ln := s.ln
 	defer ln.Close()
 
-	log.Printf("[LISTEN] proxy on %s (fallback=%s transparent=%v)",
-		s.opts.ListenAddr, s.opts.Fallback, s.opts.Transparent)
+	log.Printf("[LISTEN] proxy on %s", s.opts.ListenAddr)
 
 	pass := ProxyPass{
 		ListenAddr:  s.opts.ListenAddr,
-		Fallback:    s.opts.Fallback,
-		FallbackSSL: s.opts.FallbackSSL,
-		Transparent: s.opts.Transparent,
 		ResolveDest: s.opts.ResolveDest,
 		Commission:  s.opts.Commission,
 	}
