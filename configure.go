@@ -125,6 +125,27 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 	if c.AllowedSubnets, err = p.askList("Подсети майнеров через запятую (allowed_subnets)", c.AllowedSubnets, c.SetupIPTables, checkCIDR); err != nil {
 		return c, err
 	}
+	if c.DNSListenAddr, err = p.askString("Адрес DNS для ASIC (dns_listen_addr, пусто — выключен)", c.DNSListenAddr, false, func(addr string) error {
+		if len(c.AllowedSubnets) == 0 {
+			return fmt.Errorf("для DNS укажите allowed_subnets или очистите dns_listen_addr")
+		}
+		return config.ValidateDNSListenAddr(addr)
+	}); err != nil {
+		return c, err
+	}
+	if c.DNSListenAddr != "" {
+		if c.DNSUpstream, err = p.askString("Адрес вышестоящего DNS (dns_upstream)", c.DNSUpstream, true, func(addr string) error {
+			if addr == c.DNSListenAddr {
+				return fmt.Errorf("dns_upstream совпадает с dns_listen_addr")
+			}
+			return checkHostPort(addr)
+		}); err != nil {
+			return c, err
+		}
+	} else {
+		c.DNSUpstream = ""
+	}
+
 	if c.SetupIPTables {
 		have := iptables.ExistingIfaces()
 		ifaceQ := "Входящие интерфейсы через запятую (пусто — автоопределение)"
@@ -521,6 +542,10 @@ listen_addr: {{q .ListenAddr}}
 
 # HTTP-мониторинг (/status, /health).
 monitor_addr: {{q .MonitorAddr}}
+
+# DNS-форвардер для определения домена пула ASIC.
+dns_listen_addr: {{q .DNSListenAddr}}
+dns_upstream: {{q .DNSUpstream}}
 
 # --- Перехват ---
 setup_iptables: {{.SetupIPTables}}

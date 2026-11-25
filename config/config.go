@@ -176,12 +176,8 @@ func Load(path string) (*Config, error) {
 		if len(cfg.AllowedSubnets) == 0 {
 			return nil, fmt.Errorf("dns_listen_addr требует allowed_subnets")
 		}
-		if err := validHostPort(cfg.DNSListenAddr, "dns_listen_addr"); err != nil {
+		if err := ValidateDNSListenAddr(cfg.DNSListenAddr); err != nil {
 			return nil, err
-		}
-		host, _, _ := net.SplitHostPort(cfg.DNSListenAddr)
-		if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
-			return nil, fmt.Errorf("dns_listen_addr требует конкретный IP Ubuntu")
 		}
 		if err := validHostPort(cfg.DNSUpstream, "dns_upstream"); err != nil {
 			return nil, err
@@ -355,6 +351,18 @@ func (c *Config) CapturePorts() []string {
 }
 
 // validHostPort проверяет формат host:port и диапазон порта 1–65535.
+// ValidateDNSListenAddr checks that the DNS forwarder binds to a specific IP.
+func ValidateDNSListenAddr(addr string) error {
+	if err := validHostPort(addr, "dns_listen_addr"); err != nil {
+		return err
+	}
+	host, _, _ := net.SplitHostPort(addr)
+	if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
+		return fmt.Errorf("dns_listen_addr требует конкретный IP Ubuntu")
+	}
+	return nil
+}
+
 func validHostPort(addr, field string) error {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
