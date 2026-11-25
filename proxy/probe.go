@@ -62,6 +62,12 @@ const (
 	probeDenied
 )
 
+// probeKey — адрес пула и воркер, с которым он проверяется: на одном IP
+// могут жить разные домены со своими воркерами комиссии.
+type probeKey struct {
+	pool, worker string
+}
+
 type poolProbe struct {
 	status  probeStatus
 	running bool
@@ -81,64 +87,69 @@ func WithPoolProbe(probe ProbeFunc) CommissionOption {
 	}
 }
 
-// poolVerifiedLocked сообщает, можно ли входить в комиссию на адресе pool.
-// Неизвестный или устаревший адрес отправляется на проверку в фоне; вызывающий
-// получает false и пропускает изъятие без задержки шары майнера.
-// Вызывается под c.mu.
-func (c *Commission) poolVerifiedLocked(pool string, now time.Time) bool {
+// poolVerifiedLocked сообщает, можно ли входить в комиссию на адресе pool
+// под воркером worker. Неизвестная или устаревшая пара отправляется на
+// проверку в фоне; вызывающий получает false и пропускает изъятие без
+// задержки шары майнера. Вызывается под c.mu.
+func (c *Commission) poolVerifiedLocked(pool, worker string, now time.Time) bool {
+	if worker == "" {
+		return false
+	}
 	if c.probe == nil {
 		return true
 	}
-	p := c.probes[pool]
+	key := probeKey{pool, worker}
+	p := c.probes[key]
 	if p == nil {
 		p = &poolProbe{}
-		c.probes[pool] = p
+		c.probes[key] = p
 	}
 	switch p.status {
 	case probeOK:
 		if !now.Before(p.until) {
-			c.startProbeLocked(pool, p)
+			c.startProbeLocked(key, p)
 		}
 		// Перепроверка в фоне не прерывает уже подтверждённый пул.
 		return true
 	case probeDenied:
 		if !now.Before(p.until) {
-			c.startProbeLocked(pool, p)
+			c.startProbeLocked(key, p)
 		}
 		return false
 	default:
-		c.startProbeLocked(pool, p)
+		c.startProbeLocked(key, p)
 		return false
 	}
 }
 
-func (c *Commission) startProbeLocked(pool string, p *poolProbe) {
-	if p.running || c.worker == "" {
+func (c *Commission) startProbeLocked(key probeKey, p *poolProbe) {
+	if p.running || key.worker == "" {
 		return
 	}
 	p.running = true
-	probe, worker := c.probe, c.worker
+	probe := c.probe
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.finishProbe(pool, probe(pool, worker))
+		c.finishProbe(key, probe(key.pool, key.worker))
 	}()
 }
 
-func (c *Commission) finishProbe(pool string, err error) {
+func (c *Commission) finishProbe(key probeKey, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	p := c.probes[pool]
+	pool := key.pool
+	p := c.probes[key]
 	if p == nil {
 		p = &poolProbe{}
-		c.probes[pool] = p
+		c.probes[key] = p
 	}
 	p.running = false
 	now := time.Now()
 	switch {
 	case err == nil:
 		if p.status != probeOK {
-			log.Printf("[COMMISSION] probe pool=%s: worker %q accepted, commission enabled", pool, c.worker)
+			log.Printf("[COMMISSION] probe pool=%s: worker %q accepted, commission enabled", pool, key.worker)
 		}
 		p.status, p.until, p.denies, p.lastErr = probeOK, now.Add(probeOKTTL), 0, ""
 	case errors.Is(err, errProbeNetwork):
@@ -152,16 +163,16 @@ func (c *Commission) finishProbe(pool string, err error) {
 		p.denies++
 		pause := backoff(probeDenyBase, probeDenyMax, p.denies)
 		p.status, p.until, p.lastErr = probeDenied, now.Add(pause), err.Error()
-		log.Printf("[COMMISSION] probe pool=%s: worker %q not accepted (%v); commission disabled for %s", pool, c.worker, err, pause)
+		log.Printf("[COMMISSION] probe pool=%s: worker %q not accepted (%v); commission disabled for %s", pool, key.worker, err, pause)
 	}
 }
 
 // probeVerdictLocked — строка для /status.
-func (c *Commission) probeVerdictLocked(pool string) string {
+func (c *Commission) probeVerdictLocked(key probeKey) string {
 	if c.probe == nil {
 		return ""
 	}
-	p := c.probes[pool]
+	p := c.probes[key]
 	if p == nil {
 		return ""
 	}

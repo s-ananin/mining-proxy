@@ -214,11 +214,13 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 
 	// feeAuth — соединение сейчас авторизовано под commission_worker.
 	feeAuth := false
-	// feeWorker — имя воркера комиссии (commission_worker): под ним идут
-	// служебный authorize и изъятые шары.
+	// feeWorker — воркер комиссии этого подключения: свой у каждого пула из
+	// commission_pools (по домену, определённому через DNS), иначе
+	// commission_worker. Под ним идут служебный authorize и изъятые шары.
+	// "" — домен не в белом списке, комиссия с подключения не берётся.
 	feeWorker := ""
 	if commission != nil {
-		feeWorker = commission.Worker()
+		feeWorker = commission.WorkerFor(se.poolDomain)
 	}
 	writeAuthorize := func(worker string) bool {
 		dst.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -311,7 +313,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 			// шара берётся, только если её задание опознано как BTC
 			// (coin.go); остальное идёт прозрачно.
 			eligible := id != "" && commission != nil && commission.Enabled() && se.coinAllowsCommission(submitJob)
-			if eligible && !commission.allowsPoolDomain(se.poolDomain) {
+			if eligible && feeWorker == "" {
 				eligible = false
 			}
 			if eligible && !se.feeDeniedNow() && !se.restoringMiner() {
@@ -324,7 +326,7 @@ func pipeMinerToPool(clientConn net.Conn, reader *bufio.Reader, dst net.Conn, se
 				if feeAuth {
 					reserved = commission.reserve(se.pool, reservedWork)
 				} else if se.feeEntryAllowed() {
-					reserved = commission.reserveEntry(se.pool, reservedWork)
+					reserved = commission.reserveEntry(se.pool, feeWorker, reservedWork)
 				}
 				if reserved {
 					// Сначала открываем служебную авторизацию: она

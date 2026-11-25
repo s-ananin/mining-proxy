@@ -210,10 +210,17 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 	}
 
 	fmt.Fprintln(p.out, "\n--- Комиссия ---")
-	if c.CommissionWorker, err = p.askString("Воркер комиссии (commission_worker, пусто — выключена)", c.CommissionWorker, false, checkNoSpace); err != nil {
+	enabled, err := p.askBool("Брать комиссию?", c.CommissionEnabled())
+	if err != nil {
 		return c, err
 	}
-	if c.CommissionWorker == "" {
+	if !enabled {
+		// Комиссия выключена, когда не задан ни один воркер; список пулов
+		// сохраняется, чтобы при повторном включении не вводить его заново.
+		c.CommissionWorker = ""
+		for i := range c.CommissionPools {
+			c.CommissionPools[i].Worker = ""
+		}
 		return c, nil
 	}
 	if c.CommissionPercent, err = p.askFloat("Процент комиссии (commission_percent)", c.CommissionPercent, 0, 100); err != nil {
@@ -247,12 +254,62 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 		return c, err
 	}
 	c.CommissionBTCOnly = &btcOnly
-	pools, err := p.askList("Домены пулов комиссии через запятую (commission_pools, напр. viabtc или ss.antpool.com; пусто — любой пул)", c.CommissionPools, false, config.ValidateCommissionDomain)
+	return askCommissionWorkers(p, c)
+}
+
+// askCommissionWorkers спрашивает белый список пулов и воркера комиссии для
+// каждого из них: некоторые пулы не дают задать имя воркера и генерируют его
+// сами, поэтому воркер у каждого пула свой. Пустой список — комиссия на
+// любом пуле под одним commission_worker.
+func askCommissionWorkers(p *prompter, c config.Config) (config.Config, error) {
+	prev := map[string]string{}
+	for _, cp := range c.CommissionPools {
+		prev[strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cp.Pool), "."))] = strings.TrimSpace(cp.Worker)
+	}
+	names, err := p.askList("Пулы комиссии через запятую (commission_pools, напр. viabtc, emcd или ss.antpool.com; пусто — любой пул)", c.CommissionPoolNames(), false, config.ValidateCommissionDomain)
 	if err != nil {
 		return c, err
 	}
+	if len(names) == 0 {
+		c.CommissionPools = nil
+		if c.CommissionWorker, err = p.askString("Воркер комиссии для любого пула (commission_worker)", c.CommissionWorker, true, checkNoSpace); err != nil {
+			return c, err
+		}
+		return c, nil
+	}
+	fmt.Fprintln(p.out, "  Воркер комиссии для каждого пула (у пула может быть своё имя, сгенерированное пулом):")
+	pools := make([]config.CommissionPool, 0, len(names))
+	for _, name := range names {
+		def := prev[strings.ToLower(strings.TrimSuffix(name, "."))]
+		if def == "" {
+			def = c.CommissionWorker
+		}
+		worker, err := p.askString(fmt.Sprintf("  Воркер для %s", name), def, true, checkNoSpace)
+		if err != nil {
+			return c, err
+		}
+		pools = append(pools, config.CommissionPool{Pool: name, Worker: worker})
+	}
 	c.CommissionPools = pools
+	// У каждого пула свой воркер: воркер по умолчанию не нужен.
+	c.CommissionWorker = ""
 	return c, nil
+}
+
+// yamlCommissionPools рендерит commission_pools блоком {pool, worker}.
+func yamlCommissionPools(pools []config.CommissionPool) string {
+	if len(pools) == 0 {
+		return " []"
+	}
+	var b strings.Builder
+	for _, cp := range pools {
+		if cp.Worker == "" {
+			fmt.Fprintf(&b, "\n  - %s", yamlScalar(cp.Pool))
+			continue
+		}
+		fmt.Fprintf(&b, "\n  - pool: %s\n    worker: %s", yamlScalar(cp.Pool), yamlScalar(cp.Worker))
+	}
+	return b.String()
 }
 
 // writeConfig рендерит конфиг, проверяет его config.Load и атомарно
@@ -539,11 +596,12 @@ func yamlInts(items []int) string {
 }
 
 var configTemplate = template.Must(template.New("config").Funcs(template.FuncMap{
-	"q":     yamlScalar,
-	"strs":  yamlStrings,
-	"ints":  yamlInts,
-	"float": func(f float64) string { return strconv.FormatFloat(f, 'f', -1, 64) },
-	"bptr":  func(b *bool) bool { return b == nil || *b },
+	"q":      yamlScalar,
+	"strs":   yamlStrings,
+	"cpools": yamlCommissionPools,
+	"ints":   yamlInts,
+	"float":  func(f float64) string { return strconv.FormatFloat(f, 'f', -1, 64) },
+	"bptr":   func(b *bool) bool { return b == nil || *b },
 }).Parse(`# mining-proxy — сгенерировано "mining-proxy configure".
 # Описание всех полей: config.example.yaml в репозитории.
 # Изменить: sudo mpctl config (или вручную, затем restart).
@@ -577,7 +635,9 @@ capture_ports: {{ints .CapturePortsExtra}}
 stdout_truncate_interval: {{q .StdoutTruncateInterval}}
 {{- end}}
 
-# --- Комиссия (пустой commission_worker — выключена) ---
+# --- Комиссия (выключена, если не задан ни commission_worker, ни worker пулов) ---
+# Воркер по умолчанию: для любого пула при пустом commission_pools и для
+# пулов без собственного worker.
 commission_worker: {{q .CommissionWorker}}
 commission_percent: {{float .CommissionPercent}}
 commission_interval: {{q .CommissionInterval}}
@@ -585,6 +645,7 @@ commission_session: {{q .CommissionSession}}
 commission_iteration: {{.CommissionIteration}}
 commission_btc_only: {{bptr .CommissionBTCOnly}}
 
-# Домены или короткие имена пулов комиссии (пусто — любой пул).
-commission_pools: {{strs .CommissionPools}}
+# Домены или короткие имена пулов комиссии со своим воркером на каждом
+# (пусто — любой пул под commission_worker).
+commission_pools:{{cpools .CommissionPools}}
 `))

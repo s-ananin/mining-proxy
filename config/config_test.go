@@ -125,8 +125,13 @@ commission_pools:
 		t.Fatalf("Load: %v", err)
 	}
 	want := []string{"btc.viabtc.world", "AntPool", "stratum+tcp://ss.antpool.com:3333"} // пробелы убраны, дубль по регистру и пустой отброшены
-	if !reflect.DeepEqual(cfg.CommissionPools, want) {
-		t.Errorf("CommissionPools = %q, want %q", cfg.CommissionPools, want)
+	if got := cfg.CommissionPoolNames(); !reflect.DeepEqual(got, want) {
+		t.Errorf("CommissionPools = %q, want %q", got, want)
+	}
+	for _, p := range cfg.CommissionPools {
+		if p.Worker != "me" {
+			t.Errorf("pool %q worker = %q, want commission_worker", p.Pool, p.Worker)
+		}
 	}
 	if len(cfg.Deprecated) != 1 || !strings.Contains(cfg.Deprecated[0], "stratum+tcp://") {
 		t.Errorf("expected warning for URL, got %q", cfg.Deprecated)
@@ -315,5 +320,71 @@ func TestLoadCaptureAllFalseRequiresPorts(t *testing.T) {
 	_, err := Load(writeTmp(t, "setup_iptables: true\nallowed_subnets: [\"10.0.0.0/9\"]\ncapture_all_tcp: false\n"))
 	if err == nil {
 		t.Fatal("capture_all_tcp: false без capture_ports должен падать")
+	}
+}
+
+func TestLoadCommissionPoolWorkers(t *testing.T) {
+	cfg, err := Load(writeTmp(t, `
+commission_pools:
+  - pool: "viabtc"
+    worker: "anton425"
+  - pool: "emcd"
+    worker: " emcd.generated01 "
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.CommissionEnabled() || cfg.CommissionPercent != 2 {
+		t.Fatalf("commission not enabled with defaults: %+v", cfg)
+	}
+	want := []CommissionPool{{"viabtc", "anton425"}, {"emcd", "emcd.generated01"}}
+	if !reflect.DeepEqual(cfg.CommissionPools, want) {
+		t.Errorf("CommissionPools = %+v, want %+v", cfg.CommissionPools, want)
+	}
+}
+
+func TestLoadCommissionPoolWorkersMixed(t *testing.T) {
+	cfg, err := Load(writeTmp(t, `
+commission_worker: "default"
+commission_pools:
+  - "viabtc"
+  - pool: "emcd"
+    worker: "emcd.gen"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []CommissionPool{{"viabtc", "default"}, {"emcd", "emcd.gen"}}
+	if !reflect.DeepEqual(cfg.CommissionPools, want) {
+		t.Errorf("CommissionPools = %+v, want %+v", cfg.CommissionPools, want)
+	}
+}
+
+func TestLoadCommissionPoolWithoutWorkerFails(t *testing.T) {
+	_, err := Load(writeTmp(t, `
+commission_pools:
+  - "viabtc"
+  - pool: "emcd"
+    worker: "emcd.gen"
+`))
+	if err == nil || !strings.Contains(err.Error(), "viabtc") {
+		t.Fatalf("expected error for pool without worker, got %v", err)
+	}
+}
+
+func TestLoadCommissionDisabledWithoutWorkers(t *testing.T) {
+	cfg, err := Load(writeTmp(t, "commission_pools: [\"viabtc\"]\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CommissionEnabled() {
+		t.Fatal("commission enabled without any worker")
+	}
+}
+
+func TestLoadCommissionPoolWorkerWithSpaceFails(t *testing.T) {
+	_, err := Load(writeTmp(t, "commission_pools:\n  - pool: emcd\n    worker: \"a b\"\n"))
+	if err == nil {
+		t.Fatal("worker with space accepted")
 	}
 }

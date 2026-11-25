@@ -75,9 +75,10 @@ type Config struct {
 	// Дефолт "127.0.0.1:9090"; наружу не выставляйте без firewall.
 	MonitorAddr string `yaml:"monitor_addr"`
 
-	// CommissionWorker воркер, на который уходит комиссия. Пусто = комиссия
-	// выключена. Шары комиссии НЕ идут в реальный пул майнера: они забираются
-	// в выделенное соединение под этим воркером (см. proxy/commission.go).
+	// CommissionWorker воркер комиссии по умолчанию: используется на любом
+	// пуле, если commission_pools пуст, и для записей commission_pools без
+	// собственного worker. Комиссия выключена, если не задан ни он, ни один
+	// worker в commission_pools (см. CommissionEnabled).
 	CommissionWorker string `yaml:"commission_worker"`
 
 	// CommissionPercent процент принятых за сутки шар, изымаемый в комиссию.
@@ -110,9 +111,11 @@ type Config struct {
 	// сложности из mining.notify (proxy/coin.go). Дефолт true.
 	CommissionBTCOnly *bool `yaml:"commission_btc_only"`
 
-	// CommissionPools — DNS-имена или короткие метки пулов, разрешённых для комиссии.
-	// Пустой список разрешает любой пул.
-	CommissionPools []string `yaml:"commission_pools"`
+	// CommissionPools — DNS-имена или короткие метки пулов, разрешённых для
+	// комиссии, у каждого может быть свой воркер (пулы, которые генерируют
+	// имя воркера сами). Элемент — строка ("viabtc") или
+	// {pool: "emcd", worker: "acc.001"}. Пустой список разрешает любой пул.
+	CommissionPools []CommissionPool `yaml:"commission_pools"`
 
 	// CommissionEvery распарсенный CommissionInterval — производное поле
 	// (не читается из файла).
@@ -125,6 +128,52 @@ type Config struct {
 	// Deprecated устаревшие ключи, найденные в файле: их значение теперь
 	// зашито в код, а сами ключи игнорируются. Для предупреждения в логе.
 	Deprecated []string `yaml:"-"`
+}
+
+// CommissionPool — запись белого списка пулов комиссии.
+type CommissionPool struct {
+	// Pool — короткое имя (viabtc) или DNS-имя пула (ss.antpool.com).
+	Pool string `yaml:"pool"`
+	// Worker — воркер комиссии для этого пула. Пусто — commission_worker.
+	Worker string `yaml:"worker,omitempty"`
+}
+
+// UnmarshalYAML принимает и строку ("viabtc"), и словарь {pool, worker}.
+func (p *CommissionPool) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		*p = CommissionPool{}
+		return n.Decode(&p.Pool)
+	}
+	type plain CommissionPool
+	var v plain
+	if err := n.Decode(&v); err != nil {
+		return err
+	}
+	*p = CommissionPool(v)
+	return nil
+}
+
+// CommissionPoolNames — имена пулов из commission_pools.
+func (c Config) CommissionPoolNames() []string {
+	out := make([]string, 0, len(c.CommissionPools))
+	for _, p := range c.CommissionPools {
+		out = append(out, p.Pool)
+	}
+	return out
+}
+
+// CommissionEnabled — комиссия включена: задан воркер по умолчанию или
+// хотя бы у одного пула свой воркер.
+func (c Config) CommissionEnabled() bool {
+	if strings.TrimSpace(c.CommissionWorker) != "" {
+		return true
+	}
+	for _, p := range c.CommissionPools {
+		if strings.TrimSpace(p.Worker) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // deprecatedKeys — ключи, убранные из конфига, и поведение, которое теперь
@@ -259,9 +308,13 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	// Комиссия: дефолты и валидация только когда воркер задан. Пусто —
-	// комиссия полностью выключена, остальные поля не читаются.
-	if cfg.CommissionWorker != "" {
+	// Комиссия: дефолты и валидация только когда задан хотя бы один воркер.
+	// Иначе комиссия полностью выключена, остальные поля не читаются.
+	cfg.CommissionWorker = strings.TrimSpace(cfg.CommissionWorker)
+	if cfg.CommissionEnabled() {
+		if strings.ContainsAny(cfg.CommissionWorker, " \t") {
+			return nil, fmt.Errorf("commission_worker %q содержит пробел", cfg.CommissionWorker)
+		}
 		if cfg.CommissionPercent == 0 {
 			cfg.CommissionPercent = 2 // дефолт по ТЗ
 		}
@@ -279,8 +332,12 @@ func Load(path string) (*Config, error) {
 		cfg.CommissionPools = nil
 		seen := map[string]bool{}
 		for _, raw := range pools {
-			domain := strings.TrimSpace(raw)
+			domain := strings.TrimSpace(raw.Pool)
+			worker := strings.TrimSpace(raw.Worker)
 			if domain == "" {
+				if worker != "" {
+					return nil, fmt.Errorf("commission_pools: worker %q без pool", worker)
+				}
 				continue
 			}
 			key := strings.ToLower(strings.TrimSuffix(domain, "."))
@@ -291,7 +348,16 @@ func Load(path string) (*Config, error) {
 			if err := ValidateCommissionDomain(domain); err != nil {
 				cfg.Deprecated = append(cfg.Deprecated, fmt.Sprintf("commission_pools: %q — укажите короткое имя или домен пула", domain))
 			}
-			cfg.CommissionPools = append(cfg.CommissionPools, domain)
+			if strings.ContainsAny(worker, " \t") {
+				return nil, fmt.Errorf("commission_pools: worker %q пула %q содержит пробел", worker, domain)
+			}
+			if worker == "" {
+				worker = cfg.CommissionWorker
+			}
+			if worker == "" {
+				return nil, fmt.Errorf("commission_pools: у пула %q нет worker, а commission_worker пуст", domain)
+			}
+			cfg.CommissionPools = append(cfg.CommissionPools, CommissionPool{Pool: domain, Worker: worker})
 		}
 		// Фиксированный интервал (если задан) имеет приоритет над
 		// commission_iteration: число изъятий выводится из интервала.

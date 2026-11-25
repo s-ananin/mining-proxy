@@ -31,7 +31,8 @@ func TestCommissionDomainFilter(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			commission := &Commission{poolDomains: tc.allowed}
+			commission := &Commission{worker: "fee"}
+			WithCommissionPools(poolRoutes(tc.allowed, ""))(commission)
 			if got := commission.allowsPoolDomain(tc.domain); got != tc.want {
 				t.Fatalf("allowsPoolDomain(%q) = %v, want %v", tc.domain, got, tc.want)
 			}
@@ -52,7 +53,8 @@ func TestCommissionDomainFilterSharedDestination(t *testing.T) {
 	now := time.Now()
 	tracker.store(poolDNSKey{first, ip}, allowed, now, 60)
 	tracker.store(poolDNSKey{second, ip}, foreign, now, 60)
-	commission := &Commission{poolDomains: []string{allowed}}
+	commission := &Commission{worker: "fee"}
+	WithCommissionPools(poolRoutes([]string{allowed}, ""))(commission)
 	if !commission.allowsPoolDomain(tracker.Domain(first, pool)) {
 		t.Fatal("allowlisted ASIC on shared endpoint denied")
 	}
@@ -62,5 +64,61 @@ func TestCommissionDomainFilterSharedDestination(t *testing.T) {
 	tracker.store(poolDNSKey{first, ip}, foreign, now, 60)
 	if commission.allowsPoolDomain(tracker.Domain(first, pool)) {
 		t.Fatal("ambiguous domain allowed")
+	}
+}
+
+// poolRoutes строит белый список пулов с одним воркером на всех.
+func poolRoutes(pools []string, worker string) []CommissionPoolRoute {
+	var out []CommissionPoolRoute
+	for _, p := range pools {
+		out = append(out, CommissionPoolRoute{Pool: p, Worker: worker})
+	}
+	return out
+}
+
+func TestCommissionWorkerPerPool(t *testing.T) {
+	c := &Commission{worker: "default.fee"}
+	WithCommissionPools([]CommissionPoolRoute{
+		{Pool: "ViaBTC", Worker: "anton425"},
+		{Pool: "emcd", Worker: "emcd.generated01"},
+		{Pool: "antpool"},
+		{Pool: "ss.antpool.com", Worker: "ant.exact"},
+	})(c)
+	for _, tc := range []struct{ domain, want string }{
+		{"btc.viabtc.io", "anton425"},
+		{"BTC.ViaBTC.World.", "anton425"},
+		{"gate.emcd.network", "emcd.generated01"},
+		{"ss.antpool.com", "ant.exact"}, // полное имя важнее короткого
+		{"stratum.antpool.com", "default.fee"},
+		{"ru.hash.care", ""},
+		{"", ""},
+	} {
+		if got := c.WorkerFor(tc.domain); got != tc.want {
+			t.Errorf("WorkerFor(%q) = %q, want %q", tc.domain, got, tc.want)
+		}
+	}
+	if !c.enabledLocked() {
+		t.Fatal("commission with pool workers disabled")
+	}
+	if got := c.workers(); len(got) != 4 {
+		t.Fatalf("workers = %q", got)
+	}
+}
+
+func TestCommissionEnabledWithoutDefaultWorker(t *testing.T) {
+	c := NewCommission("", 1, 40, 0, 0, NewStats(),
+		WithCommissionPools([]CommissionPoolRoute{{Pool: "emcd", Worker: "emcd.gen"}}))
+	if !c.Enabled() {
+		t.Fatal("pool worker must enable commission")
+	}
+	if got := c.WorkerFor("gate.emcd.network"); got != "emcd.gen" {
+		t.Fatalf("WorkerFor = %q", got)
+	}
+	rep := c.Snapshot()
+	if !rep.Enabled || rep.PoolWorkers["emcd"] != "emcd.gen" {
+		t.Fatalf("snapshot = %+v", rep)
+	}
+	if NewCommission("", 1, 40, 0, 0, NewStats(), WithCommissionPools(poolRoutes([]string{"emcd"}, ""))).Enabled() {
+		t.Fatal("commission without any worker enabled")
 	}
 }

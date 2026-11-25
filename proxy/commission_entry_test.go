@@ -97,7 +97,7 @@ func TestDifficultyDeferralPreservesBudgetAndExpires(t *testing.T) {
 	if c.takeBudget != 6 {
 		t.Fatal("unsent budget lost")
 	}
-	if c.reserveEntry("pool") || c.hasBudget("pool") {
+	if c.reserveEntry("pool", c.Worker()) || c.hasBudget("pool") {
 		t.Fatal("deferred pool kept reauthorizing")
 	}
 	c.reportAuthOK("pool")
@@ -111,7 +111,7 @@ func TestDifficultyDeferralPreservesBudgetAndExpires(t *testing.T) {
 	c.mu.Lock()
 	c.breakers["pool"].difficultyRetryAt = time.Now().Add(-time.Second)
 	c.mu.Unlock()
-	if !c.reserveEntry("pool") {
+	if !c.reserveEntry("pool", c.Worker()) {
 		t.Fatal("pool stayed disabled after pause")
 	}
 	if c.takeBudget != 5 {
