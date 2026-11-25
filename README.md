@@ -308,7 +308,9 @@ ASIC. В логах появляется `pool_domain="ltc-ru.kryptex.network"`.
 с порта 53. Он не требует изменения DNS на ASIC или в DHCP.
 `dns_listen_addr` и `dns_upstream` нужны только для режима форвардера.
 
-В `/status` поле `asic_pool_domains` показывает активные сопоставления:
+В `/status` домен отображается в `pools[].pool_domain`. Если активные
+подключения к одному IP и порту используют несколько доменов, они перечислены
+в `pools[].pool_domains`. Расшифровка по ASIC доступна в `asic_pool_domains`:
 
 ```json
 {"asic_pool_domains":[{"source":"10.122.1.3","pool":"8.209.6.11:3333","pool_domain":"ss.antpool.com"}]}

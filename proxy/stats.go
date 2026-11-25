@@ -408,19 +408,21 @@ type WorkerReport struct {
 
 // PoolReport — счётчики одного пула.
 type PoolReport struct {
-	Pool            string  `json:"pool"`
-	Connections     int     `json:"connections"`
-	Submits         int     `json:"submits"`
-	Accepted        int     `json:"accepted"`
-	Rejected        int     `json:"rejected"`
-	Lost            int     `json:"lost"`
-	AcceptedPercent float64 `json:"accepted_percent"`
-	Hashrate        int64   `json:"hashrate"`
-	Workers         int     `json:"workers"`
-	BTCAsics        int     `json:"btc_asics"`
-	Coin            string  `json:"coin,omitempty"`
-	FirstSeen       string  `json:"first_seen"`
-	LastSeen        string  `json:"last_seen"`
+	PoolDomain      string   `json:"pool_domain,omitempty"`
+	PoolDomains     []string `json:"pool_domains,omitempty"`
+	Pool            string   `json:"pool"`
+	Connections     int      `json:"connections"`
+	Submits         int      `json:"submits"`
+	Accepted        int      `json:"accepted"`
+	Rejected        int      `json:"rejected"`
+	Lost            int      `json:"lost"`
+	AcceptedPercent float64  `json:"accepted_percent"`
+	Hashrate        int64    `json:"hashrate"`
+	Workers         int      `json:"workers"`
+	BTCAsics        int      `json:"btc_asics"`
+	Coin            string   `json:"coin,omitempty"`
+	FirstSeen       string   `json:"first_seen"`
+	LastSeen        string   `json:"last_seen"`
 }
 
 // Report — полный снимок реестра для /status.
@@ -455,8 +457,15 @@ func (s *Stats) Report() Report {
 		},
 	}
 
+	domainsByPool := make(map[string]map[string]struct{})
 	for key := range s.asicPoolDomains {
 		rep.ASICPoolDomains = append(rep.ASICPoolDomains, key)
+		domains := domainsByPool[key.Pool]
+		if domains == nil {
+			domains = make(map[string]struct{})
+			domainsByPool[key.Pool] = domains
+		}
+		domains[key.Domain] = struct{}{}
 	}
 	sort.Slice(rep.ASICPoolDomains, func(i, j int) bool {
 		a, b := rep.ASICPoolDomains[i], rep.ASICPoolDomains[j]
@@ -489,6 +498,19 @@ func (s *Stats) Report() Report {
 			Coin:            p.coin,
 			FirstSeen:       p.firstSeen.Format(time.RFC3339),
 			LastSeen:        p.lastSeen.Format(time.RFC3339),
+		}
+		domains := domainsByPool[p.pool]
+		switch len(domains) {
+		case 0:
+		case 1:
+			for domain := range domains {
+				pr.PoolDomain = domain
+			}
+		default:
+			for domain := range domains {
+				pr.PoolDomains = append(pr.PoolDomains, domain)
+			}
+			sort.Strings(pr.PoolDomains)
 		}
 		rep.Pools = append(rep.Pools, pr)
 	}

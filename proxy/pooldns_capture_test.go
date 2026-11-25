@@ -60,12 +60,25 @@ func TestPoolDNSCaptureAndReport(t *testing.T) {
 		if domain != "ss.antpool.com" {
 			t.Fatalf("%s: unexpected domain %q", pool, domain)
 		}
+		stats.Connect(pool)
 		stop := stats.TrackPoolDomain("10.122.1.3", pool, domain)
-		report := stats.Report().ASICPoolDomains
+		snapshot := stats.Report()
+		report := snapshot.ASICPoolDomains
 		if len(report) != 1 || report[0].Domain != domain || report[0].Pool != pool {
 			t.Fatalf("unexpected report: %+v", report)
 		}
+		if len(snapshot.Pools) != 1 || snapshot.Pools[0].PoolDomain != domain {
+			t.Fatalf("unexpected pool report: %+v", snapshot.Pools)
+		}
+		stopOther := stats.TrackPoolDomain("10.122.1.4", pool, "other.example")
+		shared := stats.Report().Pools[0]
+		if shared.PoolDomain != "" || len(shared.PoolDomains) != 2 ||
+			shared.PoolDomains[0] != "other.example" || shared.PoolDomains[1] != domain {
+			t.Fatalf("unexpected report for shared endpoint: %+v", shared)
+		}
+		stopOther()
 		stop()
+		stats.Disconnect(pool)
 		if len(stats.Report().ASICPoolDomains) != 0 {
 			t.Fatal("closed connection still reported")
 		}
