@@ -310,10 +310,10 @@ ASIC. В логах появляется `pool_domain="ltc-ru.kryptex.network"`.
 
 В `/status` домен отображается в `pools[].pool_domain`. Если активные
 подключения к одному IP и порту используют несколько доменов, они перечислены
-в `pools[].pool_domains`. Расшифровка по ASIC доступна в `asic_pool_domains`:
+в `pools[].pool_domains`. Пример:
 
 ```json
-{"asic_pool_domains":[{"source":"10.122.1.3","pool":"8.209.6.11:3333","pool_domain":"ss.antpool.com"}]}
+{"pools":[{"pool":"8.209.6.11:3333","pool_domain":"ss.antpool.com"}]}
 ```
 
 Сопоставление появляется после DNS-ответа и нового подключения к пулу.
