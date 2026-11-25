@@ -118,6 +118,18 @@ func main() {
 		log.Printf("[DNS] %s -> %s", cfg.DNSListenAddr, cfg.DNSUpstream)
 	}
 
+	if cfg.DNSPassiveEnabled() {
+		if poolDNS == nil {
+			poolDNS = proxy.NewPoolDNS()
+		}
+		stop, err := proxy.StartPoolDNSCapture(poolDNS, cfg.AllowedSubnets)
+		if err != nil {
+			log.Printf("[DNS] passive capture unavailable: %v", err)
+		} else {
+			defer stop()
+		}
+	}
+
 	// --- 3. Параметры NAT ---
 	natOpts := iptables.Options{
 		Subnets:       cfg.AllowedSubnets,

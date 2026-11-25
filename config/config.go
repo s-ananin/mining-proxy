@@ -19,6 +19,7 @@ import (
 
 // Config — параметры приложения, читаются из YAML-файла.
 type Config struct {
+	DNSPassive    *bool  `yaml:"dns_passive"`
 	DNSListenAddr string `yaml:"dns_listen_addr,omitempty"`
 	DNSUpstream   string `yaml:"dns_upstream,omitempty"`
 
@@ -130,6 +131,11 @@ type Config struct {
 
 // deprecatedKeys — ключи, убранные из конфига, и поведение, которое теперь
 // действует всегда.
+// DNSPassiveEnabled defaults to capture when ASIC subnets are configured.
+func (c Config) DNSPassiveEnabled() bool {
+	return len(c.AllowedSubnets) > 0 && (c.DNSPassive == nil || *c.DNSPassive)
+}
+
 var deprecatedKeys = []struct{ key, behavior string }{
 	{"upstream_pool", "комиссия берётся на любом пуле, принявшем commission_worker при проверке"},
 	{"upstream_ssl", "прямых подключений к прокси мимо iptables больше нет"},
@@ -172,6 +178,9 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	if cfg.DNSPassive != nil && *cfg.DNSPassive && len(cfg.AllowedSubnets) == 0 {
+		return nil, fmt.Errorf("dns_passive требует allowed_subnets")
+	}
 	if cfg.DNSListenAddr != "" {
 		if len(cfg.AllowedSubnets) == 0 {
 			return nil, fmt.Errorf("dns_listen_addr требует allowed_subnets")

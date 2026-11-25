@@ -26,8 +26,14 @@ type PoolDNS struct {
 	nextCleanup time.Time
 }
 
+// NewPoolDNS creates a DNS correlation table shared by capture and forwarding.
+func NewPoolDNS() *PoolDNS {
+	return &PoolDNS{names: make(map[poolDNSKey]map[string]time.Time)}
+}
+
 func StartPoolDNS(listen, upstream string, subnets []string) (*PoolDNS, error) {
-	d := &PoolDNS{upstream: upstream, names: make(map[poolDNSKey]map[string]time.Time)}
+	d := NewPoolDNS()
+	d.upstream = upstream
 	for _, subnet := range subnets {
 		_, network, err := net.ParseCIDR(subnet)
 		if err != nil {

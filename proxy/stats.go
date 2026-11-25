@@ -84,21 +84,28 @@ type workerStat struct {
 	samples    []shareSample // только принятые шары, для хешрейта
 }
 
+type ASICPoolDomain struct {
+	Source string `json:"source"`
+	Pool   string `json:"pool"`
+	Domain string `json:"pool_domain"`
+}
+
 // Stats потокобезопасный реестр. Все методы можно вызывать из разных
 // goroutine (по одной на соединение).
 type Stats struct {
-	mu           sync.Mutex
-	start        time.Time
-	connsTotal   int
-	connsActive  int
-	submits      int
-	accepted     int
-	acceptedWork float64
-	averages     workHistory
-	rejected     int
-	lost         int
-	pools        map[string]*poolStat
-	workers      map[string]*workerStat
+	asicPoolDomains map[ASICPoolDomain]int
+	mu              sync.Mutex
+	start           time.Time
+	connsTotal      int
+	connsActive     int
+	submits         int
+	accepted        int
+	acceptedWork    float64
+	averages        workHistory
+	rejected        int
+	lost            int
+	pools           map[string]*poolStat
+	workers         map[string]*workerStat
 	// btcAsics: IP майнера -> число его соединений, у которых последнее
 	// задание BTC. Один IP = один ASIC; прозрачные (не BTC) не считаются.
 	btcAsics map[string]int
@@ -107,10 +114,11 @@ type Stats struct {
 // NewStats создаёт пустой реестр.
 func NewStats() *Stats {
 	return &Stats{
-		start:    time.Now(),
-		pools:    map[string]*poolStat{},
-		workers:  map[string]*workerStat{},
-		btcAsics: map[string]int{},
+		asicPoolDomains: make(map[ASICPoolDomain]int),
+		start:           time.Now(),
+		pools:           map[string]*poolStat{},
+		workers:         map[string]*workerStat{},
+		btcAsics:        map[string]int{},
 	}
 }
 
@@ -135,6 +143,22 @@ func (s *Stats) getWorker(pool, worker string, now time.Time) *workerStat {
 		s.workers[k] = w
 	}
 	return w
+}
+
+// TrackPoolDomain records the domain for the lifetime of a connection.
+func (s *Stats) TrackPoolDomain(source, pool, domain string) func() {
+	key := ASICPoolDomain{Source: source, Pool: pool, Domain: domain}
+	s.mu.Lock()
+	s.asicPoolDomains[key]++
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.asicPoolDomains[key]--
+		if s.asicPoolDomains[key] == 0 {
+			delete(s.asicPoolDomains, key)
+		}
+	}
 }
 
 // Connect регистрирует новое TCP-соединение к пулу.
@@ -401,11 +425,12 @@ type PoolReport struct {
 
 // Report — полный снимок реестра для /status.
 type Report struct {
-	Avg     map[string]AverageReport `json:"avg"`
-	Uptime  string                   `json:"uptime"`
-	Totals  Totals                   `json:"totals"`
-	Pools   []PoolReport             `json:"pools"`
-	Workers []WorkerReport           `json:"workers"`
+	ASICPoolDomains []ASICPoolDomain         `json:"asic_pool_domains,omitempty"`
+	Avg             map[string]AverageReport `json:"avg"`
+	Uptime          string                   `json:"uptime"`
+	Totals          Totals                   `json:"totals"`
+	Pools           []PoolReport             `json:"pools"`
+	Workers         []WorkerReport           `json:"workers"`
 }
 
 // Report строит снимок статистики. Счётчики копируются под мьютексом,
@@ -429,6 +454,20 @@ func (s *Stats) Report() Report {
 			AcceptedPercent:   percent(s.accepted, s.submits),
 		},
 	}
+
+	for key := range s.asicPoolDomains {
+		rep.ASICPoolDomains = append(rep.ASICPoolDomains, key)
+	}
+	sort.Slice(rep.ASICPoolDomains, func(i, j int) bool {
+		a, b := rep.ASICPoolDomains[i], rep.ASICPoolDomains[j]
+		if a.Source != b.Source {
+			return a.Source < b.Source
+		}
+		if a.Pool != b.Pool {
+			return a.Pool < b.Pool
+		}
+		return a.Domain < b.Domain
+	})
 
 	// Пулы: отдельная копия, чтобы не держать данные под блокировкой.
 	// Показываем только пулы с активными соединениями — «мертвые» записи

@@ -84,6 +84,10 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 
 	if pass.PoolDNS != nil {
 		domain := pass.PoolDNS.Domain(source, dest)
+		if domain != "" {
+			stopTracking := stats.TrackPoolDomain(source, dest, domain)
+			defer stopTracking()
+		}
 		log.Printf("[CONN] %s -> %s pool_domain=%q", source, dest, domain)
 	} else {
 		log.Printf("[CONN] %s -> %s", source, dest)

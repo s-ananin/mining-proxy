@@ -125,6 +125,15 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 	if c.AllowedSubnets, err = p.askList("Подсети майнеров через запятую (allowed_subnets)", c.AllowedSubnets, c.SetupIPTables, checkCIDR); err != nil {
 		return c, err
 	}
+	if len(c.AllowedSubnets) > 0 {
+		passive, err := p.askBool("Определять домен пула по проходящему DNS (dns_passive, нужен tcpdump)?", c.DNSPassiveEnabled())
+		if err != nil {
+			return c, err
+		}
+		c.DNSPassive = &passive
+	} else {
+		c.DNSPassive = nil
+	}
 	if c.DNSListenAddr, err = p.askString("Адрес DNS для ASIC (dns_listen_addr, пусто — выключен)", c.DNSListenAddr, false, func(addr string) error {
 		if len(c.AllowedSubnets) == 0 {
 			return fmt.Errorf("для DNS укажите allowed_subnets или очистите dns_listen_addr")
@@ -542,6 +551,9 @@ listen_addr: {{q .ListenAddr}}
 
 # HTTP-мониторинг (/status, /health).
 monitor_addr: {{q .MonitorAddr}}
+
+# Пассивное определение домена пула ASIC через tcpdump.
+dns_passive: {{.DNSPassiveEnabled}}
 
 # DNS-форвардер для определения домена пула ASIC.
 dns_listen_addr: {{q .DNSListenAddr}}
