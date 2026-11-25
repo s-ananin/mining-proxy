@@ -119,16 +119,17 @@ commission_pools:
   - "BTC.VIABTC.WORLD."
   - ""
   - "AntPool"
+  - "stratum+tcp://ss.antpool.com:3333"
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := []string{"btc.viabtc.world", "AntPool"} // пробелы убраны, дубль по регистру и пустой отброшены
+	want := []string{"btc.viabtc.world", "AntPool", "stratum+tcp://ss.antpool.com:3333"} // пробелы убраны, дубль по регистру и пустой отброшены
 	if !reflect.DeepEqual(cfg.CommissionPools, want) {
 		t.Errorf("CommissionPools = %q, want %q", cfg.CommissionPools, want)
 	}
-	if len(cfg.Deprecated) != 1 || !strings.Contains(cfg.Deprecated[0], "AntPool") {
-		t.Errorf("expected migration warning for AntPool, got %q", cfg.Deprecated)
+	if len(cfg.Deprecated) != 1 || !strings.Contains(cfg.Deprecated[0], "stratum+tcp://") {
+		t.Errorf("expected warning for URL, got %q", cfg.Deprecated)
 	}
 }
 

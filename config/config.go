@@ -110,7 +110,7 @@ type Config struct {
 	// сложности из mining.notify (proxy/coin.go). Дефолт true.
 	CommissionBTCOnly *bool `yaml:"commission_btc_only"`
 
-	// CommissionPools — полные DNS-имена пулов, разрешённых для комиссии.
+	// CommissionPools — DNS-имена или короткие метки пулов, разрешённых для комиссии.
 	// Пустой список разрешает любой пул.
 	CommissionPools []string `yaml:"commission_pools"`
 
@@ -289,7 +289,7 @@ func Load(path string) (*Config, error) {
 			}
 			seen[key] = true
 			if err := ValidateCommissionDomain(domain); err != nil {
-				cfg.Deprecated = append(cfg.Deprecated, fmt.Sprintf("commission_pools: %q — укажите полное DNS-имя пула", domain))
+				cfg.Deprecated = append(cfg.Deprecated, fmt.Sprintf("commission_pools: %q — укажите короткое имя или домен пула", domain))
 			}
 			cfg.CommissionPools = append(cfg.CommissionPools, domain)
 		}
@@ -359,16 +359,16 @@ func (c *Config) CapturePorts() []string {
 }
 
 // validHostPort проверяет формат host:port и диапазон порта 1–65535.
-// ValidateCommissionDomain checks a full DNS hostname entered in the wizard.
+// ValidateCommissionDomain checks a DNS hostname or a single label entered in the wizard.
 func ValidateCommissionDomain(input string) error {
 	domain := strings.TrimSuffix(input, ".")
 	if !commissionDomainPattern.MatchString(domain) || len(domain) > 253 || net.ParseIP(domain) != nil {
-		return fmt.Errorf("укажите полное DNS-имя пула, например ss.antpool.com")
+		return fmt.Errorf("укажите короткое имя или DNS-имя пула, например viabtc или ss.antpool.com")
 	}
 	return nil
 }
 
-var commissionDomainPattern = regexp.MustCompile(`(?i)^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+var commissionDomainPattern = regexp.MustCompile(`(?i)^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
 
 // ValidateDNSListenAddr checks that the DNS forwarder binds to a specific IP.
 func ValidateDNSListenAddr(addr string) error {

@@ -27,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // Окно комиссионного изъятия.
@@ -245,7 +247,7 @@ func WithBTCOnly() CommissionOption {
 	return func(c *Commission) { c.btcOnly = true }
 }
 
-// WithCommissionPools limits commission to the specified DNS names.
+// WithCommissionPools limits commission to the specified DNS names or registrable labels.
 func WithCommissionPools(domains []string) CommissionOption {
 	return func(c *Commission) { c.poolDomains = append([]string(nil), domains...) }
 }
@@ -254,12 +256,20 @@ func (c *Commission) allowsPoolDomain(domain string) bool {
 	if c == nil || len(c.poolDomains) == 0 {
 		return true
 	}
-	domain = strings.TrimSuffix(domain, ".")
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	if !strings.Contains(domain, ".") || net.ParseIP(domain) != nil {
 		return false
 	}
-	for _, allowed := range c.poolDomains {
-		if strings.EqualFold(domain, strings.TrimSuffix(strings.TrimSpace(allowed), ".")) {
+	var label string
+	if suffix, icann := publicsuffix.PublicSuffix(domain); icann {
+		prefix := strings.TrimSuffix(domain, "."+suffix)
+		if prefix != domain {
+			label = prefix[strings.LastIndexByte(prefix, '.')+1:]
+		}
+	}
+	for _, entry := range c.poolDomains {
+		allowed := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(entry), "."))
+		if allowed == domain || (label != "" && allowed == label) {
 			return true
 		}
 	}

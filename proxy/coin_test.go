@@ -128,7 +128,7 @@ func TestBTCOnlyCommissionGate(t *testing.T) {
 		{"ltc", 7e7, false, nil, ""},
 		{"bch", 6e11, false, nil, ""},
 		{"btc", 1.4e14, true, nil, ""},
-		{"btc allowed domain", 1.4e14, true, []string{"gate.emcd.network"}, "gate.emcd.network"},
+		{"btc allowed domain", 1.4e14, true, []string{"emcd"}, "gate.emcd.network"},
 		{"btc another domain", 1.4e14, false, []string{"gate.emcd.network"}, "ru.hash.care"},
 		{"btc unknown domain", 1.4e14, false, []string{"gate.emcd.network"}, ""},
 		{"ltc allowed domain", 7e7, false, []string{"ltc-ru.kryptex.network"}, "ltc-ru.kryptex.network"},
