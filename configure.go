@@ -134,25 +134,27 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 	} else {
 		c.DNSPassive = nil
 	}
-	if c.DNSListenAddr, err = p.askString("Адрес DNS для ASIC (dns_listen_addr, пусто — выключен)", c.DNSListenAddr, false, func(addr string) error {
-		if len(c.AllowedSubnets) == 0 {
-			return fmt.Errorf("для DNS укажите allowed_subnets или очистите dns_listen_addr")
-		}
-		return config.ValidateDNSListenAddr(addr)
-	}); err != nil {
-		return c, err
-	}
-	if c.DNSListenAddr != "" {
-		if c.DNSUpstream, err = p.askString("Адрес вышестоящего DNS (dns_upstream)", c.DNSUpstream, true, func(addr string) error {
-			if addr == c.DNSListenAddr {
-				return fmt.Errorf("dns_upstream совпадает с dns_listen_addr")
+	if !c.DNSPassiveEnabled() {
+		if c.DNSListenAddr, err = p.askString("Адрес DNS для ASIC (dns_listen_addr, пусто — выключен)", c.DNSListenAddr, false, func(addr string) error {
+			if len(c.AllowedSubnets) == 0 {
+				return fmt.Errorf("для DNS укажите allowed_subnets или очистите dns_listen_addr")
 			}
-			return checkHostPort(addr)
+			return config.ValidateDNSListenAddr(addr)
 		}); err != nil {
 			return c, err
 		}
-	} else {
-		c.DNSUpstream = ""
+		if c.DNSListenAddr != "" {
+			if c.DNSUpstream, err = p.askString("Адрес вышестоящего DNS (dns_upstream)", c.DNSUpstream, true, func(addr string) error {
+				if addr == c.DNSListenAddr {
+					return fmt.Errorf("dns_upstream совпадает с dns_listen_addr")
+				}
+				return checkHostPort(addr)
+			}); err != nil {
+				return c, err
+			}
+		} else {
+			c.DNSUpstream = ""
+		}
 	}
 
 	if c.SetupIPTables {
@@ -554,10 +556,12 @@ monitor_addr: {{q .MonitorAddr}}
 
 # Пассивное определение домена пула ASIC через tcpdump.
 dns_passive: {{.DNSPassiveEnabled}}
+{{- if .DNSListenAddr}}
 
 # DNS-форвардер для определения домена пула ASIC.
 dns_listen_addr: {{q .DNSListenAddr}}
 dns_upstream: {{q .DNSUpstream}}
+{{- end}}
 
 # --- Перехват ---
 setup_iptables: {{.SetupIPTables}}
