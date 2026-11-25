@@ -22,7 +22,9 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -187,11 +189,8 @@ type Commission struct {
 	// работа не входит в базу бюджета.
 	btcOnly bool
 
-	// poolTags: подписи пулов из coinbase, на которых разрешено изымать
-	// комиссию (commission_pools, например "ViaBTC"). Пусто — фильтр
-	// выключен, комиссия берётся на любом пуле. Задаётся опцией при
-	// создании и дальше не меняется, поэтому читается без c.mu.
-	poolTags []string
+	// poolDomains содержит неизменяемый белый список.
+	poolDomains []string
 
 	// Состояние суточного окна.
 	windowStart     time.Time
@@ -246,33 +245,37 @@ func WithBTCOnly() CommissionOption {
 	return func(c *Commission) { c.btcOnly = true }
 }
 
-// WithCommissionPools ограничивает изъятие пулами, чья подпись в coinbase
-// входит в tags (например "ViaBTC"). Пустой список — ограничения нет.
-func WithCommissionPools(tags []string) CommissionOption {
-	return func(c *Commission) { c.poolTags = tags }
+// WithCommissionPools limits commission to the specified DNS names.
+func WithCommissionPools(domains []string) CommissionOption {
+	return func(c *Commission) { c.poolDomains = append([]string(nil), domains...) }
 }
 
-// PoolTags возвращает настроенные подписи пулов комиссии (для /status и
-// логов). Список задаётся при создании и дальше не меняется.
-func (c *Commission) PoolTags() []string {
-	if c == nil {
-		return nil
+func (c *Commission) allowsPoolDomain(domain string) bool {
+	if c == nil || len(c.poolDomains) == 0 {
+		return true
 	}
-	return c.poolTags
-}
-
-// PoolFilterOn сообщает, включён ли фильтр по подписи пула.
-func (c *Commission) PoolFilterOn() bool {
-	return c != nil && len(c.poolTags) > 0
-}
-
-// MatchPoolTag возвращает подпись из списка, совпавшую с coinbase, или "".
-// Без настроенного фильтра всегда "".
-func (c *Commission) MatchPoolTag(coinbase []byte) string {
-	if c == nil {
-		return ""
+	domain = strings.TrimSuffix(domain, ".")
+	if !strings.Contains(domain, ".") || net.ParseIP(domain) != nil {
+		return false
 	}
-	return matchPoolTag(coinbase, c.poolTags)
+	for _, allowed := range c.poolDomains {
+		if strings.EqualFold(domain, strings.TrimSuffix(strings.TrimSpace(allowed), ".")) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Commission) allowsReportedPool(p PoolReport) bool {
+	if c.allowsPoolDomain(p.PoolDomain) {
+		return true
+	}
+	for _, domain := range p.PoolDomains {
+		if c.allowsPoolDomain(domain) {
+			return true
+		}
+	}
+	return false
 }
 
 // inSessionLocked — идёт ли сейчас окно изъятия (без session — всегда).
@@ -862,8 +865,7 @@ type CommissionReport struct {
 	ChargedPercent   float64           `json:"charged_percent"`
 	ForfeitedWork    float64           `json:"forfeited_work"`
 	PoolChecks       map[string]string `json:"pool_checks,omitempty"`
-	// PoolFilter — подписи пулов из commission_pools (ViaBTC и т.п.), на
-	// которых разрешено изымать комиссию. Пусто — фильтр выключен.
+	// PoolFilter — домены из commission_pools. Пусто — фильтр выключен.
 	PoolFilter []string `json:"pool_filter,omitempty"`
 	// Активность на момент снимка (по открытым соединениям):
 	// *_active — все подключённые воркеры/пулы; *_with_commission — те, что
@@ -927,7 +929,7 @@ func (c *Commission) Snapshot() CommissionReport {
 		IterationsLeft:   left,
 		NextIterationAt:  c.nextIterationAt.Format(time.RFC3339),
 		WindowEnd:        c.windowStart.Add(commissionWindow).Format(time.RFC3339),
-		PoolFilter:       c.poolTags,
+		PoolFilter:       c.poolDomains,
 	}
 	if c.nextIterationAt.IsZero() {
 		rep.NextIterationAt = ""
@@ -983,7 +985,7 @@ func (c *Commission) Snapshot() CommissionReport {
 	chargeable := map[string]bool{}
 	for _, p := range st.Pools {
 		rep.PoolsActive++
-		if c.poolChargeableLocked(p.Pool, p.Coin, now) {
+		if c.allowsReportedPool(p) && c.poolChargeableLocked(p.Pool, p.Coin, now) {
 			chargeable[p.Pool] = true
 			rep.PoolsWithCommission++
 		}

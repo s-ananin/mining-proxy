@@ -121,15 +121,21 @@ func TestBTCOnlyCommissionGate(t *testing.T) {
 		name    string
 		netDiff float64 // < 0 — notify не было
 		fee     bool
+		allowed []string
+		domain  string
 	}{
-		{"unknown", -1, false},
-		{"ltc", 7e7, false},
-		{"bch", 6e11, false},
-		{"btc", 1.4e14, true},
+		{"unknown", -1, false, nil, ""},
+		{"ltc", 7e7, false, nil, ""},
+		{"bch", 6e11, false, nil, ""},
+		{"btc", 1.4e14, true, nil, ""},
+		{"btc allowed domain", 1.4e14, true, []string{"gate.emcd.network"}, "gate.emcd.network"},
+		{"btc another domain", 1.4e14, false, []string{"gate.emcd.network"}, "ru.hash.care"},
+		{"btc unknown domain", 1.4e14, false, []string{"gate.emcd.network"}, ""},
+		{"ltc allowed domain", 7e7, false, []string{"ltc-ru.kryptex.network"}, "ltc-ru.kryptex.network"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stats := NewStats()
-			c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithBTCOnly())
+			c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithBTCOnly(), WithCommissionPools(tc.allowed))
 			c.takeBudget = 1
 
 			clientConn, minerSide := net.Pipe()
@@ -140,6 +146,7 @@ func TestBTCOnlyCommissionGate(t *testing.T) {
 			defer poolSide.Close()
 
 			se := newSession(stats, "pool:3333", "10.0.0.1", c)
+			se.poolDomain = tc.domain
 			se.setDifficulty(1)
 			if tc.netDiff >= 0 {
 				se.observeNotify("job1", tc.netDiff)
@@ -186,7 +193,7 @@ func TestBTCOnlyCommissionGate(t *testing.T) {
 				return
 			}
 			if m != "mining.submit" || w != "client.w" {
-				t.Fatalf("не-BTC: шара должна уйти без изменений, получено %s %s", m, w)
+				t.Fatalf("шара должна уйти без изменений, получено %s %s", m, w)
 			}
 		})
 	}

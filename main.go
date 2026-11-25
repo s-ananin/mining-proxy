@@ -94,11 +94,10 @@ func main() {
 		if cfg.BTCOnly() {
 			opts = append(opts, proxy.WithBTCOnly())
 		}
-		// Фильтр по подписи пула в coinbase: комиссия только на пулах из
-		// commission_pools (ViaBTC и т.п.). Пусто — на любом пуле.
+		// Белый список доменов, определённых по DNS.
 		if len(cfg.CommissionPools) > 0 {
 			opts = append(opts, proxy.WithCommissionPools(cfg.CommissionPools))
-			log.Printf("[MAIN] commission: пулы комиссии (по подписи coinbase): %v", cfg.CommissionPools)
+			log.Printf("[MAIN] commission: домены пулов комиссии: %v", cfg.CommissionPools)
 		} else {
 			log.Printf("[MAIN] commission: commission_pools пуст — комиссия берётся на любом пуле, принявшем воркера")
 		}

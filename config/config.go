@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -109,11 +110,8 @@ type Config struct {
 	// сложности из mining.notify (proxy/coin.go). Дефолт true.
 	CommissionBTCOnly *bool `yaml:"commission_btc_only"`
 
-	// CommissionPools подписи пулов из coinbase, на которых разрешено
-	// изымать комиссию (например "ViaBTC"). Воркер шары подменяется на
-	// commission_worker только если пул соединения опознан по подписи в
-	// coinbase задания. Пусто — фильтр выключен, комиссия берётся на любом
-	// пуле. Применяется только если CommissionWorker задан.
+	// CommissionPools — полные DNS-имена пулов, разрешённых для комиссии.
+	// Пустой список разрешает любой пул.
 	CommissionPools []string `yaml:"commission_pools"`
 
 	// CommissionEvery распарсенный CommissionInterval — производное поле
@@ -277,22 +275,23 @@ func Load(path string) (*Config, error) {
 			btcOnly := true // дефолт: по договору комиссия только с BTC
 			cfg.CommissionBTCOnly = &btcOnly
 		}
-		// Подписи пулов комиссии: убираем пробелы, пустые и дубли (без
-		// учёта регистра: сравнение с coinbase регистронезависимо).
 		pools := cfg.CommissionPools
 		cfg.CommissionPools = nil
-		seenTag := map[string]bool{}
+		seen := map[string]bool{}
 		for _, raw := range pools {
-			tag := strings.TrimSpace(raw)
-			if tag == "" {
+			domain := strings.TrimSpace(raw)
+			if domain == "" {
 				continue
 			}
-			key := strings.ToLower(tag)
-			if seenTag[key] {
+			key := strings.ToLower(strings.TrimSuffix(domain, "."))
+			if seen[key] {
 				continue
 			}
-			seenTag[key] = true
-			cfg.CommissionPools = append(cfg.CommissionPools, tag)
+			seen[key] = true
+			if err := ValidateCommissionDomain(domain); err != nil {
+				cfg.Deprecated = append(cfg.Deprecated, fmt.Sprintf("commission_pools: %q — укажите полное DNS-имя пула", domain))
+			}
+			cfg.CommissionPools = append(cfg.CommissionPools, domain)
 		}
 		// Фиксированный интервал (если задан) имеет приоритет над
 		// commission_iteration: число изъятий выводится из интервала.
@@ -360,6 +359,17 @@ func (c *Config) CapturePorts() []string {
 }
 
 // validHostPort проверяет формат host:port и диапазон порта 1–65535.
+// ValidateCommissionDomain checks a full DNS hostname entered in the wizard.
+func ValidateCommissionDomain(input string) error {
+	domain := strings.TrimSuffix(input, ".")
+	if !commissionDomainPattern.MatchString(domain) || len(domain) > 253 || net.ParseIP(domain) != nil {
+		return fmt.Errorf("укажите полное DNS-имя пула, например ss.antpool.com")
+	}
+	return nil
+}
+
+var commissionDomainPattern = regexp.MustCompile(`(?i)^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+
 // ValidateDNSListenAddr checks that the DNS forwarder binds to a specific IP.
 func ValidateDNSListenAddr(addr string) error {
 	if err := validHostPort(addr, "dns_listen_addr"); err != nil {

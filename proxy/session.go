@@ -62,10 +62,7 @@ type session struct {
 	jobCoin  map[string]coinKind
 	jobOrder []string
 
-	// poolTag — подпись пула из coinbase, совпавшая с commission_pools
-	// ("ViaBTC" и т.п.); "" — не совпала или фильтр выключен. Пока пусто,
-	// комиссия на соединении не берётся (если фильтр включён).
-	poolTag string
+	poolDomain string
 }
 
 // maxTrackedJobs — сколько последних заданий помнить для определения
@@ -309,41 +306,6 @@ func (s *session) observeNotify(jobID string, netDiff float64) {
 			log.Printf("[COIN] miner=%s pool=%s: задание не BTC (сеть diff %.3g) — прозрачно, без комиссии", s.source, s.pool, netDiff)
 		}
 	}
-}
-
-// observeCoinbase определяет пул соединения по подписи в coinbase задания и
-// запоминает совпадение с commission_pools. Фильтр выключен — ничего не
-// делает. Пул может смениться на лету (smart mining), поэтому подпись
-// пересчитывается на каждом задании; первое совпадение логируется.
-func (s *session) observeCoinbase(coinbase []byte) {
-	if s.commission == nil || !s.commission.PoolFilterOn() {
-		return
-	}
-	tag := s.commission.MatchPoolTag(coinbase)
-	s.mu.Lock()
-	prev := s.poolTag
-	s.poolTag = tag
-	s.mu.Unlock()
-	if tag != prev {
-		if tag != "" {
-			log.Printf("[COMMISSION] miner=%s pool=%s: подпись %q — комиссия разрешена", s.source, s.pool, tag)
-		} else if prev != "" {
-			log.Printf("[COMMISSION] miner=%s pool=%s: подпись пула сменилась (%q, не из списка) — комиссия остановлена (coinbase: %q)",
-				s.source, s.pool, coinbaseText(coinbase), prev)
-		}
-	}
-}
-
-// poolTagAllowsCommission сообщает, разрешает ли подпись пула изъятие:
-// фильтр выключен — да; включён — только если coinbase соединения совпал с
-// одной из commission_pools.
-func (s *session) poolTagAllowsCommission() bool {
-	if s.commission == nil || !s.commission.PoolFilterOn() {
-		return true
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.poolTag != ""
 }
 
 // coinAllowsCommission сообщает, можно ли изъять в комиссию шару по

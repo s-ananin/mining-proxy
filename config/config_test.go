@@ -115,17 +115,20 @@ func TestLoadCommissionPools(t *testing.T) {
 	cfg, err := Load(writeTmp(t, `
 commission_worker: "me"
 commission_pools:
-  - " ViaBTC "
-  - "viabtc"
+  - " btc.viabtc.world "
+  - "BTC.VIABTC.WORLD."
   - ""
   - "AntPool"
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := []string{"ViaBTC", "AntPool"} // пробелы убраны, дубль по регистру и пустой отброшены
+	want := []string{"btc.viabtc.world", "AntPool"} // пробелы убраны, дубль по регистру и пустой отброшены
 	if !reflect.DeepEqual(cfg.CommissionPools, want) {
 		t.Errorf("CommissionPools = %q, want %q", cfg.CommissionPools, want)
+	}
+	if len(cfg.Deprecated) != 1 || !strings.Contains(cfg.Deprecated[0], "AntPool") {
+		t.Errorf("expected migration warning for AntPool, got %q", cfg.Deprecated)
 	}
 }
 

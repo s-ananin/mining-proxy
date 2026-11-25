@@ -245,7 +245,7 @@ func askConfig(p *prompter, path string) (config.Config, error) {
 		return c, err
 	}
 	c.CommissionBTCOnly = &btcOnly
-	pools, err := p.askList("Подписи пулов комиссии через запятую (commission_pools, напр. ViaBTC; пусто — любой пул)", c.CommissionPools, false, nil)
+	pools, err := p.askList("Домены пулов комиссии через запятую (commission_pools, напр. ss.antpool.com; пусто — любой пул)", c.CommissionPools, false, config.ValidateCommissionDomain)
 	if err != nil {
 		return c, err
 	}
@@ -581,6 +581,6 @@ commission_session: {{q .CommissionSession}}
 commission_iteration: {{.CommissionIteration}}
 commission_btc_only: {{bptr .CommissionBTCOnly}}
 
-# Пулы комиссии по подписи в coinbase (пусто — любой пул).
+# Полные DNS-имена пулов комиссии (пусто — любой пул).
 commission_pools: {{strs .CommissionPools}}
 `))
