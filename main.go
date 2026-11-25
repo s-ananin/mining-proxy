@@ -107,18 +107,31 @@ func main() {
 		defer commission.Close()
 	}
 
+	var poolDNS *proxy.PoolDNS
+	if cfg.DNSListenAddr != "" {
+		var err error
+		poolDNS, err = proxy.StartPoolDNS(cfg.DNSListenAddr, cfg.DNSUpstream, cfg.AllowedSubnets)
+		if err != nil {
+			log.Fatalf("[FATAL] DNS %s: %v", cfg.DNSListenAddr, err)
+		}
+		defer poolDNS.Close()
+		log.Printf("[DNS] %s -> %s", cfg.DNSListenAddr, cfg.DNSUpstream)
+	}
+
 	// --- 3. Параметры NAT ---
 	natOpts := iptables.Options{
 		Subnets:       cfg.AllowedSubnets,
 		ListenAddr:    cfg.ListenAddr,
 		CapturePorts:  cfg.CapturePorts(),
 		IngressIfaces: cfg.NATIngressIfaces,
+		DNSListenAddr: cfg.DNSListenAddr,
 	}
 
 	// --- 4. Listener ДО перехвата (см. doc пакета) ---
 	srv := proxy.NewServer(proxy.Options{
 		ListenAddr: cfg.ListenAddr,
 		Commission: commission,
+		PoolDNS:    poolDNS,
 	}, stats)
 	if err := srv.Listen(); err != nil {
 		log.Fatalf("[FATAL] listen %s: %v", cfg.ListenAddr, err)

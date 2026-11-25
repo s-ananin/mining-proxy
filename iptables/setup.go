@@ -46,6 +46,8 @@ const sysctlConf = "/etc/sysctl.d/99-mining-proxy.conf"
 
 // Options — параметры настройки NAT, собранные из конфигурации.
 type Options struct {
+	DNSListenAddr string
+
 	// Subnets — подсети ASIC (CIDR), трафик которых перенаправляется.
 	// ПУСТОЙ СПИСОК — ошибка, а не «перехват всего»: см. Setup.
 	Subnets []string
@@ -163,6 +165,18 @@ func Setup(opts Options) error {
 	if err := runCmd("iptables", "-t", "nat", "-C", "PREROUTING", "-j", chainName); err != nil {
 		if err := runCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-j", chainName); err != nil {
 			return fmt.Errorf("добавить jump из PREROUTING: %w", err)
+		}
+	}
+
+	if opts.DNSListenAddr != "" {
+		host, port, err := net.SplitHostPort(opts.DNSListenAddr)
+		if err != nil {
+			return err
+		}
+		if net.ParseIP(host).To4() != nil {
+			if err := runCmd("iptables", "-t", "nat", "-A", chainName, "-p", "tcp", "-d", host, "--dport", port, "-j", "RETURN"); err != nil {
+				return fmt.Errorf("исключить DNS из DNAT: %w", err)
+			}
 		}
 	}
 

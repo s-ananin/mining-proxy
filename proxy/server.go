@@ -23,6 +23,7 @@ type Options struct {
 
 	// Commission сборщик комиссии; nil — выключена.
 	Commission *Commission
+	PoolDNS    *PoolDNS
 }
 
 // Server TCP-прокси: принимает соединения и отдаёт их в HandleConnection.
@@ -74,6 +75,7 @@ func (s *Server) Run() error {
 		ListenAddr:  s.opts.ListenAddr,
 		ResolveDest: s.opts.ResolveDest,
 		Commission:  s.opts.Commission,
+		PoolDNS:     s.opts.PoolDNS,
 	}
 
 	for {

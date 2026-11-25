@@ -19,6 +19,9 @@ import (
 
 // Config — параметры приложения, читаются из YAML-файла.
 type Config struct {
+	DNSListenAddr string `yaml:"dns_listen_addr,omitempty"`
+	DNSUpstream   string `yaml:"dns_upstream,omitempty"`
+
 	// ListenAddr адрес и порт прокси, сюда приходит трафик после DNAT.
 	// Дефолт "0.0.0.0:8443".
 	ListenAddr string `yaml:"listen_addr"`
@@ -167,6 +170,25 @@ func Load(path string) (*Config, error) {
 	}
 	if err := validHostPort(cfg.MonitorAddr, "monitor_addr"); err != nil {
 		return nil, err
+	}
+
+	if cfg.DNSListenAddr != "" {
+		if len(cfg.AllowedSubnets) == 0 {
+			return nil, fmt.Errorf("dns_listen_addr требует allowed_subnets")
+		}
+		if err := validHostPort(cfg.DNSListenAddr, "dns_listen_addr"); err != nil {
+			return nil, err
+		}
+		host, _, _ := net.SplitHostPort(cfg.DNSListenAddr)
+		if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
+			return nil, fmt.Errorf("dns_listen_addr требует конкретный IP Ubuntu")
+		}
+		if err := validHostPort(cfg.DNSUpstream, "dns_upstream"); err != nil {
+			return nil, err
+		}
+		if cfg.DNSUpstream == cfg.DNSListenAddr {
+			return nil, fmt.Errorf("dns_upstream совпадает с dns_listen_addr")
+		}
 	}
 
 	// Перехват по диапазону портов: дефолт включён, 25..9999.

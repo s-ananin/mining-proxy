@@ -57,6 +57,7 @@ type ProxyPass struct {
 
 	// Commission сборщик комиссии; nil — комиссия выключена.
 	Commission *Commission
+	PoolDNS    *PoolDNS
 }
 
 // HandleConnection обслуживает одно соединение от майнера до самого конца:
@@ -81,6 +82,13 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 	se := newSession(stats, dest, source, pass.Commission)
 	defer se.close()
 
+	if pass.PoolDNS != nil {
+		domain := pass.PoolDNS.Domain(source, dest)
+		log.Printf("[CONN] %s -> %s pool_domain=%q", source, dest, domain)
+	} else {
+		log.Printf("[CONN] %s -> %s", source, dest)
+	}
+
 	// --- 2. Подключаемся к реальному пулу ---
 	upstream, err := net.DialTimeout("tcp", dest, upstreamDialTimeout)
 	if err != nil {
@@ -88,8 +96,6 @@ func HandleConnection(clientConn net.Conn, pass ProxyPass, stats *Stats) {
 		return
 	}
 	defer upstream.Close()
-
-	log.Printf("[CONN] %s -> %s", source, dest)
 
 	// --- 3. Определяем протокол по первым байтам ---
 	// Stratum начинается с JSON-строки ('{'), всё остальное (TLS-хендшейк,
