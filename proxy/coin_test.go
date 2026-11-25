@@ -123,26 +123,19 @@ func TestBTCOnlyCommissionGate(t *testing.T) {
 		fee     bool
 		allowed []string
 		domain  string
-		// poolWorker — свой воркер пулов из allowed; пусто — fee.worker.
-		poolWorker string
 	}{
-		{"unknown", -1, false, nil, "", ""},
-		{"ltc", 7e7, false, nil, "", ""},
-		{"bch", 6e11, false, nil, "", ""},
-		{"btc", 1.4e14, true, nil, "", ""},
-		{"btc allowed domain", 1.4e14, true, []string{"emcd"}, "gate.emcd.network", ""},
-		{"btc another domain", 1.4e14, false, []string{"gate.emcd.network"}, "ru.hash.care", ""},
-		{"btc unknown domain", 1.4e14, false, []string{"gate.emcd.network"}, "", ""},
-		{"ltc allowed domain", 7e7, false, []string{"ltc-ru.kryptex.network"}, "ltc-ru.kryptex.network", ""},
-		{"btc pool own worker", 1.4e14, true, []string{"emcd"}, "gate.emcd.network", "emcd.generated01"},
+		{"unknown", -1, false, nil, ""},
+		{"ltc", 7e7, false, nil, ""},
+		{"bch", 6e11, false, nil, ""},
+		{"btc", 1.4e14, true, nil, ""},
+		{"btc allowed domain", 1.4e14, true, []string{"emcd"}, "gate.emcd.network"},
+		{"btc another domain", 1.4e14, false, []string{"gate.emcd.network"}, "ru.hash.care"},
+		{"btc unknown domain", 1.4e14, false, []string{"gate.emcd.network"}, ""},
+		{"ltc allowed domain", 7e7, false, []string{"ltc-ru.kryptex.network"}, "ltc-ru.kryptex.network"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stats := NewStats()
-			c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithBTCOnly(), WithCommissionPools(poolRoutes(tc.allowed, tc.poolWorker)))
-			feeWorker := "fee.worker"
-			if tc.poolWorker != "" {
-				feeWorker = tc.poolWorker
-			}
+			c := NewCommission("fee.worker", 2, 40, 0, 0, stats, WithBTCOnly(), WithCommissionPools(tc.allowed))
 			c.takeBudget = 1
 
 			clientConn, minerSide := net.Pipe()
@@ -189,11 +182,11 @@ func TestBTCOnlyCommissionGate(t *testing.T) {
 			send(`{"id":2,"method":"mining.submit","params":["client.w","job1","n2","nt","nc"]}`)
 			m, w := recv()
 			if tc.fee {
-				if m != "mining.authorize" || w != feeWorker {
-					t.Fatalf("BTC: ожидался служебный authorize %s, получено %s %s", feeWorker, m, w)
+				if m != "mining.authorize" || w != "fee.worker" {
+					t.Fatalf("BTC: ожидался служебный authorize fee.worker, получено %s %s", m, w)
 				}
-				if m, w := recv(); m != "mining.submit" || w != feeWorker {
-					t.Fatalf("BTC: ожидалась шара под %s, получено %s %s", feeWorker, m, w)
+				if m, w := recv(); m != "mining.submit" || w != "fee.worker" {
+					t.Fatalf("BTC: ожидалась шара под fee.worker, получено %s %s", m, w)
 				}
 				// Дождаться регистрации шары до закрытия сессии.
 				se.resolve(PoolResponse{ID: `2`, Accepted: true})

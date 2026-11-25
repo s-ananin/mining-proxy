@@ -31,7 +31,7 @@ func TestSnapshotActivity(t *testing.T) {
 
 	c.mu.Lock()
 	for _, p := range []string{"btc-ok", "btc-open", "bch", "gone"} {
-		c.probes[probeKey{p, c.Worker()}] = &poolProbe{status: probeOK, until: time.Now().Add(time.Hour)}
+		c.probes[p] = &poolProbe{status: probeOK, until: time.Now().Add(time.Hour)}
 	}
 	c.breakers["btc-open"] = &poolBreaker{openTill: time.Now().Add(time.Hour)}
 	c.mu.Unlock()

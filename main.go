@@ -60,7 +60,7 @@ func main() {
 	for _, d := range cfg.Deprecated {
 		log.Printf("[MAIN] config: %s", d)
 	}
-	if cfg.CommissionEnabled() {
+	if cfg.CommissionWorker != "" {
 		extra := ""
 		if cfg.BTCOnly() {
 			extra += " btc_only"
@@ -82,9 +82,9 @@ func main() {
 	// --- 2. Реестр статистики шар ---
 	stats := proxy.NewStats()
 
-	// --- 2.1. Комиссия (если задан commission_worker или воркеры пулов) ---
+	// --- 2.1. Комиссия (если задан commission_worker) ---
 	var commission *proxy.Commission
-	if cfg.CommissionEnabled() {
+	if cfg.CommissionWorker != "" {
 		var opts []proxy.CommissionOption
 		// Комиссия на адресе пула — только после того, как пул принял
 		// commission_worker в отдельном проверочном соединении (пул комиссии
@@ -96,12 +96,8 @@ func main() {
 		}
 		// Белый список доменов, определённых по DNS.
 		if len(cfg.CommissionPools) > 0 {
-			routes := make([]proxy.CommissionPoolRoute, 0, len(cfg.CommissionPools))
-			for _, p := range cfg.CommissionPools {
-				routes = append(routes, proxy.CommissionPoolRoute{Pool: p.Pool, Worker: p.Worker})
-				log.Printf("[MAIN] commission: пул %q -> воркер %q", p.Pool, p.Worker)
-			}
-			opts = append(opts, proxy.WithCommissionPools(routes))
+			opts = append(opts, proxy.WithCommissionPools(cfg.CommissionPools))
+			log.Printf("[MAIN] commission: домены пулов комиссии: %v", cfg.CommissionPools)
 		} else {
 			log.Printf("[MAIN] commission: commission_pools пуст — комиссия берётся на любом пуле, принявшем воркера")
 		}

@@ -12,12 +12,12 @@ import (
 )
 
 // waitProbe ждёт завершения фоновой проверки пула.
-func waitProbe(t *testing.T, c *Commission, pool, worker string) {
+func waitProbe(t *testing.T, c *Commission, pool string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		c.mu.Lock()
-		p := c.probes[probeKey{pool, worker}]
+		p := c.probes[pool]
 		done := p != nil && !p.running && p.status != probeUnknown
 		c.mu.Unlock()
 		if done {
@@ -55,25 +55,25 @@ func TestProbeGatesEntryUntilPoolAcceptsWorker(t *testing.T) {
 	c.takeBudget = 1000
 
 	// Unknown address: no entry, budget untouched, probe started in background.
-	if c.reserveEntry("fee-pool:3333", "fee", 16) {
+	if c.reserveEntry("fee-pool:3333", 16) {
 		t.Fatal("entry allowed before probe")
 	}
 	if c.takeBudget != 1000 {
 		t.Fatalf("budget spent on unverified pool: %v", c.takeBudget)
 	}
-	waitProbe(t, c, "fee-pool:3333", "fee")
-	if !c.reserveEntry("fee-pool:3333", "fee", 16) {
+	waitProbe(t, c, "fee-pool:3333")
+	if !c.reserveEntry("fee-pool:3333", 16) {
 		t.Fatal("verified pool refused")
 	}
 
 	// A pool that drops the commission worker is never entered on miner links.
 	allowEntry(c)
-	if c.reserveEntry("foreign:3333", "fee", 16) {
+	if c.reserveEntry("foreign:3333", 16) {
 		t.Fatal("entry allowed before probe")
 	}
-	waitProbe(t, c, "foreign:3333", "fee")
+	waitProbe(t, c, "foreign:3333")
 	allowEntry(c)
-	if c.reserveEntry("foreign:3333", "fee", 16) {
+	if c.reserveEntry("foreign:3333", 16) {
 		t.Fatal("foreign pool entered after failed probe")
 	}
 	if got := c.Snapshot().PoolChecks["foreign:3333"]; !strings.HasPrefix(got, "denied until") {
@@ -82,10 +82,10 @@ func TestProbeGatesEntryUntilPoolAcceptsWorker(t *testing.T) {
 
 	// The fee pool moved to a new IP: it is verified there without config.
 	allowEntry(c)
-	c.reserveEntry("fee-pool-new-ip:3333", "fee", 16)
-	waitProbe(t, c, "fee-pool-new-ip:3333", "fee")
+	c.reserveEntry("fee-pool-new-ip:3333", 16)
+	waitProbe(t, c, "fee-pool-new-ip:3333")
 	allowEntry(c)
-	if !c.reserveEntry("fee-pool-new-ip:3333", "fee", 16) {
+	if !c.reserveEntry("fee-pool-new-ip:3333", 16) {
 		t.Fatal("new address of the fee pool refused")
 	}
 
@@ -102,29 +102,29 @@ func TestProbeBackoffAndNetworkErrors(t *testing.T) {
 	c := NewCommission("fee", 1, 0, time.Minute, 0, NewStats(), WithPoolProbe(func(string, string) error { return nil }))
 	defer c.Close()
 
-	c.finishProbe(probeKey{"p", "fee"}, errors.New("unauthorized"))
-	first := c.probes[probeKey{"p", "fee"}].until
-	c.finishProbe(probeKey{"p", "fee"}, errors.New("unauthorized"))
-	second := c.probes[probeKey{"p", "fee"}].until
+	c.finishProbe("p", errors.New("unauthorized"))
+	first := c.probes["p"].until
+	c.finishProbe("p", errors.New("unauthorized"))
+	second := c.probes["p"].until
 	if d := second.Sub(first); d < probeDenyBase-time.Second {
 		t.Fatalf("deny pause did not double: +%s", d)
 	}
 	for i := 0; i < 10; i++ {
-		c.finishProbe(probeKey{"p", "fee"}, errors.New("unauthorized"))
+		c.finishProbe("p", errors.New("unauthorized"))
 	}
-	if d := time.Until(c.probes[probeKey{"p", "fee"}].until); d > probeDenyMax {
+	if d := time.Until(c.probes["p"].until); d > probeDenyMax {
 		t.Fatalf("deny pause %s above cap", d)
 	}
 
 	// A verified pool keeps its verdict across a transient network failure.
-	c.finishProbe(probeKey{"ok", "fee"}, nil)
-	c.finishProbe(probeKey{"ok", "fee"}, fmt.Errorf("%w: dial timeout", errProbeNetwork))
+	c.finishProbe("ok", nil)
+	c.finishProbe("ok", fmt.Errorf("%w: dial timeout", errProbeNetwork))
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.poolVerifiedLocked("ok", "fee", time.Now()) {
+	if !c.poolVerifiedLocked("ok", time.Now()) {
 		t.Fatal("network error revoked a verified pool")
 	}
-	if p := c.probes[probeKey{"ok", "fee"}]; p.denies != 0 {
+	if p := c.probes["ok"]; p.denies != 0 {
 		t.Fatal("network error counted as a deny")
 	}
 }
@@ -228,36 +228,4 @@ func TestCarryCapKeepsDebtAndNoCatchUpBurst(t *testing.T) {
 	accept(100)
 	c.iterate(now.Add(25 * time.Minute))
 	nearWork(t, c.takeBudget, 0.6)
-}
-
-// На одном адресе пула воркеры разных доменов проверяются раздельно: отказ
-// одного воркера не открывает и не закрывает комиссию для другого.
-func TestProbePerWorkerOnSharedAddress(t *testing.T) {
-	probe := func(addr, worker string) error {
-		if worker == "bad" {
-			return errors.New("unauthorized")
-		}
-		return nil
-	}
-	c := NewCommission("", 1, 0, time.Minute, 0, NewStats(), WithPoolProbe(probe),
-		WithCommissionPools([]CommissionPoolRoute{{Pool: "emcd", Worker: "good"}, {Pool: "hash.care", Worker: "bad"}}))
-	defer c.Close()
-	c.takeBudget = 1000
-	const pool = "130.193.56.79:3333"
-	c.reserveEntry(pool, "good", 1)
-	c.reserveEntry(pool, "bad", 1)
-	waitProbe(t, c, pool, "good")
-	waitProbe(t, c, pool, "bad")
-	allowEntry(c)
-	if !c.reserveEntry(pool, "good", 1) {
-		t.Fatal("verified worker refused")
-	}
-	allowEntry(c)
-	if c.reserveEntry(pool, "bad", 1) {
-		t.Fatal("denied worker entered")
-	}
-	checks := c.Snapshot().PoolChecks
-	if checks[pool+" good"] != "ok" || !strings.HasPrefix(checks[pool+" bad"], "denied until") {
-		t.Fatalf("pool checks = %q", checks)
-	}
 }

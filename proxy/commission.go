@@ -191,9 +191,8 @@ type Commission struct {
 	// работа не входит в базу бюджета.
 	btcOnly bool
 
-	// poolRoutes — неизменяемый белый список пулов с воркером каждого.
-	// Пусто — фильтр выключен, везде используется worker.
-	poolRoutes []CommissionPoolRoute
+	// poolDomains содержит неизменяемый белый список.
+	poolDomains []string
 
 	// Состояние суточного окна.
 	windowStart     time.Time
@@ -228,7 +227,7 @@ type Commission struct {
 
 	// Проверка пулов отдельным соединением (probe.go); probe == nil — выкл.
 	probe  ProbeFunc
-	probes map[probeKey]*poolProbe
+	probes map[string]*poolProbe
 
 	// Разбивка по пулам и предохранители (мультипул).
 	perPool     map[string]*poolCommission
@@ -248,43 +247,18 @@ func WithBTCOnly() CommissionOption {
 	return func(c *Commission) { c.btcOnly = true }
 }
 
-// CommissionPoolRoute — запись белого списка: пул (короткое имя или
-// DNS-имя) и воркер комиссии на нём. Пустой Worker — воркер по умолчанию.
-type CommissionPoolRoute struct {
-	Pool   string
-	Worker string
+// WithCommissionPools limits commission to the specified DNS names or registrable labels.
+func WithCommissionPools(domains []string) CommissionOption {
+	return func(c *Commission) { c.poolDomains = append([]string(nil), domains...) }
 }
 
-// WithCommissionPools limits commission to the specified DNS names or
-// registrable labels; each pool takes commission under its own worker.
-func WithCommissionPools(routes []CommissionPoolRoute) CommissionOption {
-	return func(c *Commission) {
-		c.poolRoutes = nil
-		for _, r := range routes {
-			r.Pool = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(r.Pool), "."))
-			r.Worker = strings.TrimSpace(r.Worker)
-			if r.Pool != "" {
-				c.poolRoutes = append(c.poolRoutes, r)
-			}
-		}
-	}
-}
-
-// WorkerFor возвращает воркера комиссии для подключения к пулу с доменом
-// domain. "" — комиссия на этом подключении не берётся (домен не в белом
-// списке, не определён или комиссия выключена). Полное DNS-имя в списке
-// имеет приоритет над коротким: так ss.antpool.com может иметь своего
-// воркера отдельно от antpool.
-func (c *Commission) WorkerFor(domain string) string {
-	if c == nil {
-		return ""
-	}
-	if len(c.poolRoutes) == 0 {
-		return c.worker
+func (c *Commission) allowsPoolDomain(domain string) bool {
+	if c == nil || len(c.poolDomains) == 0 {
+		return true
 	}
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	if !strings.Contains(domain, ".") || net.ParseIP(domain) != nil {
-		return ""
+		return false
 	}
 	var label string
 	if suffix, icann := publicsuffix.PublicSuffix(domain); icann {
@@ -293,79 +267,25 @@ func (c *Commission) WorkerFor(domain string) string {
 			label = prefix[strings.LastIndexByte(prefix, '.')+1:]
 		}
 	}
-	route := func(r CommissionPoolRoute) string {
-		if r.Worker != "" {
-			return r.Worker
-		}
-		return c.worker
-	}
-	for _, r := range c.poolRoutes {
-		if r.Pool == domain {
-			return route(r)
-		}
-	}
-	if label != "" {
-		for _, r := range c.poolRoutes {
-			if r.Pool == label {
-				return route(r)
-			}
-		}
-	}
-	return ""
-}
-
-func (c *Commission) allowsPoolDomain(domain string) bool {
-	return c.WorkerFor(domain) != ""
-}
-
-// reportedPoolWorker — воркер комиссии для пула из отчёта статистики (по
-// любому из наблюдаемых на нём доменов).
-func (c *Commission) reportedPoolWorker(p PoolReport) string {
-	if w := c.WorkerFor(p.PoolDomain); w != "" {
-		return w
-	}
-	for _, domain := range p.PoolDomains {
-		if w := c.WorkerFor(domain); w != "" {
-			return w
-		}
-	}
-	return ""
-}
-
-// enabledLocked — задан хотя бы один воркер комиссии.
-func (c *Commission) enabledLocked() bool {
-	if c.worker != "" {
-		return true
-	}
-	for _, r := range c.poolRoutes {
-		if r.Worker != "" {
+	for _, entry := range c.poolDomains {
+		allowed := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(entry), "."))
+		if allowed == domain || (label != "" && allowed == label) {
 			return true
 		}
 	}
 	return false
 }
 
-// workers — все воркеры комиссии без повторов, в порядке настройки.
-func (c *Commission) workers() []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(w string) {
-		if w != "" && !seen[w] {
-			seen[w] = true
-			out = append(out, w)
+func (c *Commission) allowsReportedPool(p PoolReport) bool {
+	if c.allowsPoolDomain(p.PoolDomain) {
+		return true
+	}
+	for _, domain := range p.PoolDomains {
+		if c.allowsPoolDomain(domain) {
+			return true
 		}
 	}
-	if len(c.poolRoutes) == 0 {
-		add(c.worker)
-	}
-	for _, r := range c.poolRoutes {
-		if r.Worker != "" {
-			add(r.Worker)
-		} else {
-			add(c.worker)
-		}
-	}
-	return out
+	return false
 }
 
 // inSessionLocked — идёт ли сейчас окно изъятия (без session — всегда).
@@ -380,9 +300,8 @@ func (c *Commission) BTCOnly() bool {
 	return c != nil && c.btcOnly
 }
 
-// NewCommission создаёт сборщик комиссии. worker — воркер по умолчанию
-// (для пулов без своего воркера в WithCommissionPools). Если не задан ни он,
-// ни воркеры пулов — комиссия выключена: Start ничего не планирует.
+// NewCommission создаёт сборщик комиссии. worker == "" — комиссия
+// выключена: Redirect всегда вернёт false, Start ничего не планирует.
 //
 // interval > 0 включает режим фиксированного интервала: изъятие идёт каждые
 // interval, а iterationsPerDay выводится из интервала и аргумент
@@ -415,7 +334,7 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 		perPool:          map[string]*poolCommission{},
 		breakers:         map[string]*poolBreaker{},
 		breakerLogs:      map[string]time.Time{},
-		probes:           map[probeKey]*poolProbe{},
+		probes:           map[string]*poolProbe{},
 		rng:              rand.New(rand.NewSource(now.UnixNano())),
 	}
 	for _, opt := range opts {
@@ -426,22 +345,22 @@ func NewCommission(worker string, percent float64, iterationsPerDay int, interva
 	return c
 }
 
-// Worker — воркер комиссии по умолчанию (commission_worker). Задаётся при
-// создании и дальше не меняется. Воркер конкретного подключения — WorkerFor.
+// Worker — имя воркера комиссии (commission_worker). Задаётся при создании
+// и дальше не меняется.
 func (c *Commission) Worker() string {
 	return c.worker
 }
 
-// Enabled true, если комиссия сконфигурирована (задан хотя бы один воркер).
+// Enabled true, если комиссия сконфигурирована (worker задан).
 func (c *Commission) Enabled() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.enabledLocked()
+	return c.worker != ""
 }
 
 // Start запускает планировщик итераций изъятия (неблокирующая).
 func (c *Commission) Start() {
-	if !c.Enabled() {
+	if c.worker == "" {
 		return
 	}
 	c.wg.Add(1)
@@ -694,7 +613,7 @@ func (c *Commission) reserveLocked(pool string, difficulty ...float64) bool {
 	if work <= 0 || math.IsNaN(work) || math.IsInf(work, 0) {
 		return false
 	}
-	if !c.enabledLocked() || c.takeBudget <= 0 {
+	if c.worker == "" || c.takeBudget <= 0 {
 		return false
 	}
 	if c.poolOpenLocked(pool, time.Now()) {
@@ -708,8 +627,7 @@ func (c *Commission) reserveLocked(pool string, difficulty ...float64) bool {
 }
 
 // A busy authorization gate skips entry; it never sleeps in a submit pipe.
-// worker — воркер комиссии этого подключения: пул проверяется именно с ним.
-func (c *Commission) reserveEntry(pool, worker string, difficulty ...float64) bool {
+func (c *Commission) reserveEntry(pool string, difficulty ...float64) bool {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
 	now := time.Now()
@@ -718,7 +636,7 @@ func (c *Commission) reserveEntry(pool, worker string, difficulty ...float64) bo
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.poolVerifiedLocked(pool, worker, now) {
+	if !c.poolVerifiedLocked(pool, now) {
 		return false
 	}
 	if !c.reserveLocked(pool, difficulty...) {
@@ -758,7 +676,7 @@ func (c *Commission) hasBudget(pool string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
-	return c.enabledLocked() && c.takeBudget > 0 &&
+	return c.worker != "" && c.takeBudget > 0 &&
 		!c.poolOpenLocked(pool, now) && c.inSessionLocked(now)
 }
 
@@ -940,8 +858,6 @@ type PoolCommissionReport struct {
 type CommissionReport struct {
 	Enabled          bool              `json:"enabled"`
 	Worker           string            `json:"worker,omitempty"`
-	Workers          []string          `json:"workers,omitempty"`      // все воркеры комиссии
-	PoolWorkers      map[string]string `json:"pool_workers,omitempty"` // пул из commission_pools → воркер
 	Percent          float64           `json:"percent,omitempty"`
 	Interval         string            `json:"interval,omitempty"`
 	Session          string            `json:"session,omitempty"`
@@ -990,7 +906,7 @@ func intervalString(d time.Duration) string {
 func (c *Commission) Snapshot() CommissionReport {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.enabledLocked() {
+	if c.worker == "" {
 		return CommissionReport{Enabled: false}
 	}
 	acceptedToday := c.stats.Accepted() - c.baseAccepted
@@ -1023,18 +939,7 @@ func (c *Commission) Snapshot() CommissionReport {
 		IterationsLeft:   left,
 		NextIterationAt:  c.nextIterationAt.Format(time.RFC3339),
 		WindowEnd:        c.windowStart.Add(commissionWindow).Format(time.RFC3339),
-		Workers:          c.workers(),
-	}
-	for _, r := range c.poolRoutes {
-		rep.PoolFilter = append(rep.PoolFilter, r.Pool)
-		if rep.PoolWorkers == nil {
-			rep.PoolWorkers = map[string]string{}
-		}
-		w := r.Worker
-		if w == "" {
-			w = c.worker
-		}
-		rep.PoolWorkers[r.Pool] = w
+		PoolFilter:       c.poolDomains,
 	}
 	if c.nextIterationAt.IsZero() {
 		rep.NextIterationAt = ""
@@ -1074,15 +979,10 @@ func (c *Commission) Snapshot() CommissionReport {
 			DifficultyRetryAt: c.difficultyRetryStringLocked(name, now),
 		})
 	}
-	multi := len(rep.Workers) > 1
-	for key := range c.probes {
-		if v := c.probeVerdictLocked(key); v != "" {
+	for name := range c.probes {
+		if v := c.probeVerdictLocked(name); v != "" {
 			if rep.PoolChecks == nil {
 				rep.PoolChecks = map[string]string{}
-			}
-			name := key.pool
-			if multi {
-				name += " " + key.worker
 			}
 			rep.PoolChecks[name] = v
 		}
@@ -1095,7 +995,7 @@ func (c *Commission) Snapshot() CommissionReport {
 	chargeable := map[string]bool{}
 	for _, p := range st.Pools {
 		rep.PoolsActive++
-		if w := c.reportedPoolWorker(p); w != "" && c.poolChargeableLocked(p.Pool, w, p.Coin, now) {
+		if c.allowsReportedPool(p) && c.poolChargeableLocked(p.Pool, p.Coin, now) {
 			chargeable[p.Pool] = true
 			rep.PoolsWithCommission++
 		}
@@ -1114,12 +1014,12 @@ func (c *Commission) Snapshot() CommissionReport {
 // проверкой commission_worker и предохранитель закрыт. Окно сессии не учитывается: пул остаётся
 // «с комиссией», даже если текущий момент вне окна. В отличие от
 // poolVerifiedLocked, проверку не запускает. Вызывается под c.mu.
-func (c *Commission) poolChargeableLocked(pool, worker, coin string, now time.Time) bool {
+func (c *Commission) poolChargeableLocked(pool, coin string, now time.Time) bool {
 	if c.btcOnly && coin != coinBTC.String() {
 		return false
 	}
 	if c.probe != nil {
-		if p := c.probes[probeKey{pool, worker}]; p == nil || p.status != probeOK {
+		if p := c.probes[pool]; p == nil || p.status != probeOK {
 			return false
 		}
 	}
